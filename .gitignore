@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.idea/
+cache/
+config/
+output/image_prescan_*
+output/*_offline/
+output/*_live/
+output/*_round*/
+.superpowers/
