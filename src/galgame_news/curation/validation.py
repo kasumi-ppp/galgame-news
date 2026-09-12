@@ -29,7 +29,7 @@ def meaningless_asset_reason(candidate: ImageCandidate) -> str | None:
     if path.endswith(".svg") or "profile_images" in path or "placeholder" in path:
         return "invalid_material"
     tokens = set(filter(None, re.split(r"[^a-z0-9]+", path)))
-    meaningless = {"logo", "favicon", "icon", "icons", "sprite", "button", "btn", "banner", "header", "footer", "thumbnail", "thumb", "capsule"}
+    meaningless = {"logo", "favicon", "icon", "icons", "sprite", "button", "btn", "banner", "header", "footer", "thumbnail", "thumb", "capsule", "fonts", "editorui", "parastorage"}
     return "meaningless_asset" if tokens & meaningless else None
 
 

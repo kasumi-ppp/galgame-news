@@ -132,6 +132,7 @@ def test_semantic_filter_rejects_logo_banner_and_thumbnail_urls():
     assert meaningless_asset_reason(candidate("https://site.example/assets/logo.png")) == "meaningless_asset"
     assert meaningless_asset_reason(candidate("https://site.example/header/banner.jpg")) == "meaningless_asset"
     assert meaningless_asset_reason(candidate("https://site.example/cg/event01.jpg")) is None
+    assert meaningless_asset_reason(candidate("https://static.parastorage.com/services/santa-resources/resources/viewer/editorUI/fonts.v19.png")) == "meaningless_asset"
 
 
 def test_downloader_fetches_same_news_image_url_only_once(tmp_path):
