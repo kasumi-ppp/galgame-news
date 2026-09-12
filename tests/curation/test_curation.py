@@ -152,3 +152,31 @@ def test_downloader_fetches_same_news_image_url_only_once(tmp_path):
     assert not failures
     assert len(accepted) == 1
     assert calls == [duplicate_url]
+
+
+def test_downloader_filters_invalid_material_before_request(tmp_path):
+    from galgame_news.curation.download import ImageDownloader
+    calls = []
+    def transport(url, **_):
+        calls.append(url)
+        raise AssertionError("invalid asset should not be requested")
+    values = [candidate(f"https://site.example/assets/{token}.jpg") for token in ["logo", "icon", "sprite", "button", "banner", "thumbnail", "profile_images/avatar"]]
+    values.append(candidate("https://site.example/assets/vector.svg"))
+    accepted, failures = ImageDownloader(load_config(), transport=transport).download(values, tmp_path)
+    assert accepted == []
+    assert calls == []
+    assert len(failures) == len(values)
+    assert all(f.code == "filtered_invalid_material" for f in failures)
+
+
+def test_curator_uses_known_image_method_without_image_hashes_attribute():
+    from galgame_news.curation.curator import ImageCurator
+    from galgame_news.domain import HistoricalImage, Issue
+    item = news("n1")
+    value = candidate("https://cdn/repeated.jpg", news_id=item.id, sha256="a" * 64, phash="beef", signals={"game_match": 1.0})
+    class History:
+        def known_image(self, sha256, perceptual_hash):
+            assert sha256 == "a" * 64
+            return HistoricalImage(image_id="old", sha256=sha256, perceptual_hash=perceptual_hash, first_seen_issue="258", last_seen_issue="258")
+    result = ImageCurator().curate(Issue(issue_id="259", input_path="x", news_items=[item]), [value], History())
+    assert ReviewReason.HISTORICAL_DUPLICATE in result.candidates[0].review_reasons

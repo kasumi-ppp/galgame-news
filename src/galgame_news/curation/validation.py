@@ -26,6 +26,8 @@ MAGIC_MIME = {"jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "web
 
 def meaningless_asset_reason(candidate: ImageCandidate) -> str | None:
     path = urlsplit(candidate.image_url).path.casefold()
+    if path.endswith(".svg") or "profile_images" in path or "placeholder" in path:
+        return "invalid_material"
     tokens = set(filter(None, re.split(r"[^a-z0-9]+", path)))
     meaningless = {"logo", "favicon", "icon", "icons", "sprite", "button", "btn", "banner", "header", "footer", "thumbnail", "thumb", "capsule"}
     return "meaningless_asset" if tokens & meaningless else None

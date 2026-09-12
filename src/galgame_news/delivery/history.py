@@ -251,8 +251,12 @@ class MemoryHistoryStore:
         self._source_records: list[tuple[NewsItem, SourceRef]] = []
 
     def known_image(self, sha256: str | None, perceptual_hash: str | None) -> HistoricalImage | None:
+        if sha256:
+            for image in self._images.values():
+                if image.sha256 == sha256:
+                    return image
         for image in self._images.values():
-            if (sha256 and image.sha256 == sha256) or (perceptual_hash and image.perceptual_hash == perceptual_hash):
+            if perceptual_hash and image.perceptual_hash == perceptual_hash:
                 return image
         return None
 

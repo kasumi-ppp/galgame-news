@@ -30,7 +30,11 @@ def _candidate(news: NewsItem, image_url: str, source: SourceRef, context: Colle
     )
 
 
-def _upgrade_wix(url: str) -> str:
+def _upgrade_wix(url: str) -> str | None:
+    parsed = urlsplit(url)
+    if parsed.hostname and parsed.hostname.casefold().endswith(".wixsite.com"):
+        if re.search(r"/(?:q_90|quality_auto)(?:/|$)", parsed.path.casefold()):
+            return None
     if url.startswith("wix:image://v1/"):
         media_id = url.split("wix:image://v1/", 1)[1].split("/", 1)[0]
         return f"https://static.wixstatic.com/media/{media_id}"
@@ -63,6 +67,13 @@ def _image_priority(url: str) -> int:
     if "/screenshot" in path or "/sample" in path or "/points/" in path:
         return 1
     return 2
+
+
+def _is_public_x_media(url: str) -> bool:
+    parts = urlsplit(url)
+    host = (parts.hostname or "").casefold()
+    path = parts.path.casefold()
+    return host == "pbs.twimg.com" and (path.startswith("/media/") or path.startswith("/card_img/"))
 
 
 class DirectImageAdapter:
@@ -109,6 +120,11 @@ class OfficialHtmlAdapter:
                 if tag.get("srcset"):
                     largest = _srcset_largest(tag["srcset"])
                     if largest: urls.append(largest)
+            for tag in soup.find_all(style=True):
+                urls.extend(re.findall(r"url\(\s*['\"]?([^'\")]+)", tag.get("style", ""), flags=re.I))
+            for tag in soup.find_all(True):
+                for attr in ("data-background", "data-bg", "data-image"):
+                    if tag.get(attr): urls.append(tag[attr])
             for script in soup.find_all("script", type="application/ld+json"):
                 try:
                     data = json.loads(script.string or script.get_text())
@@ -116,6 +132,19 @@ class OfficialHtmlAdapter:
                     urls.extend(values if isinstance(values, list) else [values])
                 except (TypeError, ValueError, json.JSONDecodeError):
                     continue
+            def collect_json_images(value: Any) -> None:
+                if isinstance(value, str):
+                    if value.startswith(("http://", "https://", "/", "wix:image://v1/")):
+                        urls.append(value)
+                elif isinstance(value, dict):
+                    for child in value.values(): collect_json_images(child)
+                elif isinstance(value, list):
+                    for child in value: collect_json_images(child)
+            for script in soup.find_all("script"):
+                text = script.string or script.get_text()
+                if script.get("type") == "application/json" or script.get("id") == "__NEXT_DATA__" or "wix-warmup" in (script.get("id") or "").casefold() or "wix-viewer" in (script.get("id") or "").casefold():
+                    try: collect_json_images(json.loads(text))
+                    except (TypeError, ValueError, json.JSONDecodeError): pass
             embedded = html.replace(r"\/", "/")
             urls.extend(re.findall(r"https://static\.wixstatic\.com/media/[^\"'<>\\\s]+", embedded))
             urls.extend(re.findall(r"wix:image://v1/[^\"'<>\\\s]+", embedded))
@@ -124,7 +153,9 @@ class OfficialHtmlAdapter:
             for value in urls:
                 if not isinstance(value, str): continue
                 image_url = _upgrade_wix(urljoin(page_url, value))
-                if image_url in seen or urlsplit(image_url).scheme not in {"http", "https"}: continue
+                if not image_url or image_url in seen or urlsplit(image_url).scheme not in {"http", "https"}: continue
+                if not urlsplit(image_url).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+                    continue
                 seen.add(image_url)
                 candidate = _candidate(news_item, image_url, source_ref, context)
                 if _image_priority(image_url) <= 1 or "/gallery" in urlsplit(source_ref.url).path.casefold():
@@ -181,7 +212,8 @@ class XAdapter:
                     if key in {"og:image", "og:image:url", "twitter:image", "twitter:image:src"} and tag.get("content"):
                         image_url = urljoin(source_ref.url, tag["content"])
                         image_host = (urlsplit(image_url).hostname or "").casefold()
-                        if image_host == "pbs.twimg.com":
+                        image_path = urlsplit(image_url).path.casefold()
+                        if image_host == "pbs.twimg.com" and (image_path.startswith("/media/") or image_path.startswith("/card_img/")):
                             urls.append(image_url)
                 return CollectionResult(candidates=[_candidate(news_item, url, source_ref, context) for url in dict.fromkeys(urls)], manual_review_reasons=[ReviewReason.X_SOURCE])
             except Exception as exc:
@@ -193,6 +225,6 @@ class XAdapter:
             response = self.transport(source_ref.url, token=self.token, timeout=context.timeout_seconds)
             data = response if isinstance(response, dict) else getattr(response, "json", lambda: {})()
             urls = data.get("image_urls", []) if isinstance(data, dict) else []
-            return CollectionResult(candidates=[_candidate(news_item, url, source_ref, context) for url in urls if isinstance(url, str)], manual_review_reasons=[ReviewReason.X_SOURCE])
+            return CollectionResult(candidates=[_candidate(news_item, url, source_ref, context) for url in urls if isinstance(url, str) and _is_public_x_media(url)], manual_review_reasons=[ReviewReason.X_SOURCE])
         except Exception as exc:
             return CollectionResult(failures=[FailureRecord(stage=FailureStage.COLLECT, news_id=news_item.id, code="x_api_error", message=str(exc), source_url=source_ref.url, retryable=True)], manual_review_reasons=[ReviewReason.X_SOURCE])

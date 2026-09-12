@@ -257,3 +257,54 @@ def test_x_without_token_extracts_public_meta_image_and_still_requires_review():
     result = adapter.collect(item(), source, CollectionContext())
     assert [candidate.image_url for candidate in result.candidates] == ["https://pbs.twimg.com/media/cg.jpg"]
     assert ReviewReason.X_SOURCE in result.manual_review_reasons
+
+
+def test_x_public_metadata_rejects_avatar_and_accepts_only_post_media_paths():
+    from galgame_news.discovery.adapters import XAdapter
+    html = "".join([
+        '<meta property="og:image" content="https://pbs.twimg.com/profile_images/123/avatar.jpg">',
+        '<meta property="twitter:image" content="https://pbs.twimg.com/media/post.jpg?name=orig">',
+        '<meta property="og:image:url" content="https://pbs.twimg.com/card_img/456/card.jpg">',
+        '<meta property="og:image" content="https://abs.twimg.com/icons/favicon.ico">',
+    ])
+    source = SourceRef(url="https://x.com/studio/status/1", domain="x.com", source_type=SourceType.OFFICIAL_X)
+    result = XAdapter(token=None, public_transport=lambda url, **_: FakeResponse(text=html, url=url)).collect(item(), source, CollectionContext())
+    assert {candidate.image_url for candidate in result.candidates} == {
+        "https://pbs.twimg.com/media/post.jpg?name=orig",
+        "https://pbs.twimg.com/card_img/456/card.jpg",
+    }
+
+
+def test_wix_pseudo_quality_url_is_ignored_when_original_media_exists():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+    html = '''<img src="https://site.wixsite.com/q_90/image.jpg"><img src="https://static.wixstatic.com/media/abc~mv2.jpg/v1/fill/w_400,h_300,q_90/abc.jpg">'''
+    adapter = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url))
+    result = adapter.collect(item(), SourceRef(url="https://site.wixsite.com/gallery", domain="site.wixsite.com", source_type=SourceType.OFFICIAL_SITE), CollectionContext())
+    assert [candidate.image_url for candidate in result.candidates] == ["https://static.wixstatic.com/media/abc~mv2.jpg"]
+
+
+def test_html_discovers_background_data_iframe_and_json_images():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+    html = '''
+    <div style="background-image: url('/gallery/bg01.jpg')" data-background="/gallery/bg02.jpg" data-bg="/gallery/bg03.jpg" data-image="/gallery/bg04.jpg"></div>
+    <iframe src="/gallery/frame.html"></iframe><div data-iframe="/gallery/embed.html" data-src="/gallery/data.html"></div>
+    <script type="application/json">{"image":"https://official.example/gallery/json.jpg"}</script>
+    <script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"image":"/gallery/next.jpg"}}}</script>
+    '''
+    adapter = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url))
+    result = adapter.collect(item(), SourceRef(url="https://official.example/gallery", domain="official.example", source_type=SourceType.OFFICIAL_SITE), CollectionContext(max_candidates=20))
+    urls = {candidate.image_url for candidate in result.candidates}
+    assert {"https://official.example/gallery/bg01.jpg", "https://official.example/gallery/bg02.jpg", "https://official.example/gallery/bg03.jpg", "https://official.example/gallery/bg04.jpg", "https://official.example/gallery/json.jpg", "https://official.example/gallery/next.jpg"} <= urls
+    assert "https://official.example/gallery/frame.html" not in urls
+
+
+def test_search_official_result_triggers_same_domain_gallery_discovery():
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+    pages = {"https://official.example/home": '<a href="/gallery">Gallery</a>'}
+    resolver = DefaultSourceResolver(
+        same_domain_depth=1,
+        same_domain_transport=lambda url, **_: FakeResponse(text=pages[url], url=url),
+        search_provider=lambda _news: [SourceRef(url="https://official.example/home", domain="official.example", source_type=SourceType.OFFICIAL_SITE, officiality=0.9, discovered_via=DiscoveryMethod.DDGS)],
+    )
+    result = resolver.resolve(item(source_urls=[]))
+    assert [source.url for source in result] == ["https://official.example/home", "https://official.example/gallery"]

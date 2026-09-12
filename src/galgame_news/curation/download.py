@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 from PIL import Image
 
@@ -56,44 +58,65 @@ class ImageDownloader:
     def download(self, candidates: Iterable[ImageCandidate], directory: Path | str) -> tuple[list[ImageCandidate], list[FailureRecord]]:
         root = Path(directory)
         root.mkdir(parents=True, exist_ok=True)
-        accepted: list[ImageCandidate] = []
-        failures: list[FailureRecord] = []
         seen_urls: set[tuple[str, str]] = set()
+        pending: list[ImageCandidate] = []
+        filtered: list[FailureRecord] = []
         for candidate in candidates:
-            key = (candidate.news_id, candidate.image_url)
+            parts = urlsplit(candidate.image_url.strip())
+            normalized = urlunsplit((parts.scheme.casefold(), parts.netloc.casefold(), parts.path, parts.query, ""))
+            key = (candidate.news_id, normalized)
             if key in seen_urls:
                 continue
             seen_urls.add(key)
-            semantic_reason = meaningless_asset_reason(candidate)
-            if semantic_reason:
-                failures.append(self._failure(candidate, semantic_reason, "filtered non-content image", False))
+            reason = meaningless_asset_reason(candidate)
+            if reason or parts.scheme not in {"http", "https"}:
+                filtered.append(self._failure(candidate, "filtered_invalid_material", reason or "invalid_scheme", False))
                 continue
+            pending.append(candidate)
+
+        def fetch(candidate: ImageCandidate):
             try:
                 response = self.client.get(candidate.image_url)
                 status = int(getattr(response, "status_code", 200))
                 if status < 200 or status >= 300:
-                    failures.append(self._failure(candidate, "http_error", f"image request returned HTTP {status}", status >= 500 or status in {408, 429}))
-                    continue
+                    return None, self._failure(candidate, "http_error", f"image request returned HTTP {status}", status >= 500 or status in {408, 429}), None
                 data = getattr(response, "content", b"") or b""
                 declared_mime = getattr(response, "headers", {}).get("content-type")
                 validation = self.validator.validate(data, declared_mime)
                 if not validation.valid:
-                    failures.append(self._failure(candidate, validation.reason or "invalid_image", "downloaded image failed validation", False))
-                    continue
+                    return None, self._failure(candidate, validation.reason or "invalid_image", "downloaded image failed validation", False), None
                 suffix = _EXTENSIONS.get(validation.mime_type or "", ".img")
                 target = root / f"{candidate.id}{suffix}"
                 target.write_bytes(data)
-                candidate.width = validation.width
-                candidate.height = validation.height
-                candidate.mime_type = validation.mime_type
-                candidate.byte_size = len(data)
-                candidate.sha256 = hashlib.sha256(data).hexdigest()
-                candidate.perceptual_hash = _perceptual_hash(data)
-                candidate.local_path = str(target)
-                candidate.downloadable = True
-                accepted.append(candidate)
+                candidate.width, candidate.height = validation.width, validation.height
+                candidate.mime_type, candidate.byte_size = validation.mime_type, len(data)
+                candidate.sha256, candidate.perceptual_hash = hashlib.sha256(data).hexdigest(), _perceptual_hash(data)
+                candidate.local_path, candidate.downloadable = str(target), True
+                return candidate, None, str(getattr(response, "url", candidate.image_url) or candidate.image_url)
             except Exception as exc:
-                failures.append(self._failure(candidate, "download_error", str(exc), True))
+                return None, self._failure(candidate, "download_error", str(exc), True), None
+
+        accepted: list[ImageCandidate] = []
+        failures: list[FailureRecord] = list(filtered)
+        with ThreadPoolExecutor(max_workers=min(8, max(4, len(pending)))) as pool:
+            outcomes = list(pool.map(fetch, pending))
+        final_seen: set[tuple[str, str]] = set()
+        root_resolved = root.resolve()
+        for candidate, failure, final_url in outcomes:
+            if failure is not None:
+                failures.append(failure)
+                continue
+            if candidate is None:
+                continue
+            parts = urlsplit(final_url or candidate.image_url)
+            final_key = (candidate.news_id, urlunsplit((parts.scheme.casefold(), parts.netloc.casefold(), parts.path, parts.query, "")))
+            if final_key in final_seen:
+                target = Path(candidate.local_path) if candidate.local_path else None
+                if target and target.resolve().parent == root_resolved:
+                    target.unlink(missing_ok=True)
+                continue
+            final_seen.add(final_key)
+            accepted.append(candidate)
         return accepted, failures
 
     @staticmethod

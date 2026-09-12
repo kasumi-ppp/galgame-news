@@ -41,6 +41,14 @@ class OutputManager:
         root.mkdir(parents=True, exist_ok=True)
         image_root = root / "images"
         image_root.mkdir(exist_ok=True)
+        # Only remove files managed beneath this run's images directory.
+        for child in list(image_root.iterdir()):
+            if child.is_symlink():
+                child.unlink()
+            elif child.is_dir():
+                shutil.rmtree(child)
+            elif child.is_file():
+                child.unlink()
         files: list[str] = []
         item_names = {item.id: f"{self._section_label(item)}{item.sequence}" for item in result.issue.news_items}
         per_news_rank: dict[str, int] = {}
@@ -54,7 +62,9 @@ class OutputManager:
             target_dir.mkdir(parents=True, exist_ok=True)
             ext = (candidate.mime_type or "image/jpeg").split("/")[-1].replace("jpeg", "jpg")
             target = target_dir / f"{rank:02d}.{ext}"
-            shutil.copyfile(candidate.local_path, target)
+            source_path = Path(candidate.local_path)
+            if source_path.resolve() != target.resolve():
+                shutil.copyfile(source_path, target)
             candidate.local_path = str(target)
             files.append(str(target.relative_to(root)))
         for candidate in result.candidates:

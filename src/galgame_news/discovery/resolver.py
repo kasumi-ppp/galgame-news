@@ -88,6 +88,11 @@ class DefaultSourceResolver:
                 for tag in soup.find_all(attrs={"data-izimodal-iframeurl": True})
             )
             links.extend((tag["src"], "gallery iframe") for tag in soup.find_all("iframe", src=True))
+            for tag in soup.find_all(True):
+                for attr in ("data-iframe", "data-iframe-src", "data-src"):
+                    value = tag.get(attr)
+                    if value and not urlsplit(value).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+                        links.append((value, "gallery data link"))
             for href, label in links:
                 child = self._gallery_link(effective_page_url, href, label)
                 if not child or child in visited:
@@ -118,5 +123,11 @@ class DefaultSourceResolver:
         for source in list(ordered):
             children = self.same_domain_lookup(source, news_item) if self.same_domain_lookup else self._crawl_same_domain(source, news_item)
             for child in children: add(child.model_copy(update={"discovered_via": DiscoveryMethod.SAME_DOMAIN}))
-        for source in self.search_provider(news_item): add(source)
+        for source in self.search_provider(news_item):
+            add(source)
+            # A trusted official search hit is an entry point, so perform the
+            # same bounded gallery discovery as document/history sources.
+            if source.source_type is SourceType.OFFICIAL_SITE and source.officiality >= 0.75:
+                for child in self._crawl_same_domain(source, news_item):
+                    add(child.model_copy(update={"discovered_via": DiscoveryMethod.SAME_DOMAIN}))
         return ordered
