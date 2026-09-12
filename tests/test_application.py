@@ -64,7 +64,8 @@ def test_application_downloads_validates_hashes_and_saves_selected_images(tmp_pa
     selected = result.candidates[0]
     assert selected.sha256 and selected.width == 800 and selected.height == 600
     assert selected.local_path and Path(selected.local_path).is_file()
-    assert Path(selected.local_path).parent.name == "新作1"
+    assert Path(selected.local_path).parent.name == "x1"
+    assert Path(selected.local_path).name == "x1.01.jpg"
 
 
 def test_application_does_not_truncate_gallery_before_filtering_page_assets(tmp_path):

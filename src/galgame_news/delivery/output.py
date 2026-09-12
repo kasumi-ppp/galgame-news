@@ -22,6 +22,25 @@ class OutputManager:
             section = "新作" if item.sequence <= 10 else "其他"
         return section or "news"
 
+    @classmethod
+    def _item_names(cls, items) -> dict[str, str]:
+        counters = {"x": 0, "h": 0, "z": 0}
+        names: dict[str, str] = {}
+        for item in sorted(items, key=lambda value: value.sequence):
+            section = cls._section_label(item)
+            if "新作" in section:
+                prefix = "x"
+            elif "汉化" in section:
+                prefix = "h"
+            elif "周边" in section or "周报" in section:
+                prefix = "z"
+            else:
+                names[item.id] = f"{section}{item.sequence}"
+                continue
+            counters[prefix] += 1
+            names[item.id] = f"{prefix}{counters[prefix]}"
+        return names
+
     def _atomic_json(self, path: Path, payload) -> None:
         fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
@@ -50,7 +69,7 @@ class OutputManager:
             elif child.is_file():
                 child.unlink()
         files: list[str] = []
-        item_names = {item.id: f"{self._section_label(item)}{item.sequence}" for item in result.issue.news_items}
+        item_names = self._item_names(result.issue.news_items)
         per_news_rank: dict[str, int] = {}
         for candidate in [c for c in result.candidates if c.selected]:
             if not candidate.local_path or not Path(candidate.local_path).is_file():
@@ -61,7 +80,7 @@ class OutputManager:
             target_dir = image_root / readable
             target_dir.mkdir(parents=True, exist_ok=True)
             ext = (candidate.mime_type or "image/jpeg").split("/")[-1].replace("jpeg", "jpg")
-            target = target_dir / f"{rank:02d}.{ext}"
+            target = target_dir / f"{readable}.{rank:02d}.{ext}"
             source_path = Path(candidate.local_path)
             if source_path.resolve() != target.resolve():
                 shutil.copyfile(source_path, target)
