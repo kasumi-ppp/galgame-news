@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterable
-from urllib.parse import urlsplit, urlunsplit
+from typing import Any
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from ..domain import DiscoveryMethod, NewsItem, SourceRef, SourceType
+from bs4 import BeautifulSoup
+
+from ..domain import DiscoveryMethod, NewsItem, ReviewReason, SourceRef, SourceType
 from .search import FallbackSearchProvider
+from .http import SafeHttpClient
 
 
 def _normalize(url: str) -> str:
@@ -15,10 +20,75 @@ def _normalize(url: str) -> str:
 
 
 class DefaultSourceResolver:
-    def __init__(self, *, history_lookup: Callable[[NewsItem], Iterable[SourceRef]] | None = None, same_domain_lookup: Callable[[SourceRef, NewsItem], Iterable[SourceRef]] | None = None, search_provider: Callable[[NewsItem], Iterable[SourceRef]] | None = None):
+    def __init__(self, *, history_lookup: Callable[[NewsItem], Iterable[SourceRef]] | None = None, same_domain_lookup: Callable[[SourceRef, NewsItem], Iterable[SourceRef]] | None = None, same_domain_depth: int = 1, same_domain_transport: Callable[..., Any] | None = None, search_provider: Callable[[NewsItem], Iterable[SourceRef]] | None = None):
         self.history_lookup = history_lookup or (lambda news: [])
-        self.same_domain_lookup = same_domain_lookup or (lambda source, news: [])
+        self.same_domain_lookup = same_domain_lookup
+        self.same_domain_depth = max(0, min(3, same_domain_depth))
+        self.same_domain_client = SafeHttpClient(transport=same_domain_transport)
         self.search_provider = search_provider or FallbackSearchProvider().search
+
+    @staticmethod
+    def _document_source(url: str) -> SourceRef:
+        parts = urlsplit(url)
+        host = (parts.hostname or "unknown").casefold()
+        path = parts.path.casefold()
+        image_suffixes = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")
+        if path.endswith(image_suffixes):
+            source_type, officiality = SourceType.DIRECT_IMAGE, 0.8
+        elif host in {"x.com", "twitter.com", "www.x.com", "www.twitter.com"}:
+            source_type, officiality = SourceType.OFFICIAL_X, 0.9
+        elif host in {"store.steampowered.com", "steamcommunity.com"}:
+            source_type, officiality = SourceType.STEAM, 0.85
+        elif host in {"youtube.com", "www.youtube.com", "youtu.be", "bilibili.com", "www.bilibili.com"}:
+            source_type, officiality = SourceType.VIDEO, 0.5
+        elif host == "vndb.org" or host.endswith(".vndb.org"):
+            source_type, officiality = SourceType.UNVERIFIED, 0.25
+        else:
+            source_type, officiality = SourceType.OFFICIAL_SITE, 0.75
+        review = source_type in {SourceType.UNVERIFIED, SourceType.VIDEO}
+        return SourceRef(
+            url=url,
+            domain=parts.hostname or "unknown",
+            source_type=source_type,
+            discovered_via=DiscoveryMethod.DOCUMENT,
+            officiality=officiality,
+            requires_review=review,
+            review_reasons=[ReviewReason.UNCERTAIN_MATCH] if review else [],
+        )
+
+    @staticmethod
+    def _gallery_link(base_url: str, href: str, label: str) -> str | None:
+        target = _normalize(urljoin(base_url, href))
+        base_host = (urlsplit(base_url).hostname or "").casefold()
+        if (urlsplit(target).hostname or "").casefold() != base_host:
+            return None
+        evidence = f"{urlsplit(target).path} {label}".casefold()
+        tokens = ("gallery", "/cg", "cg/", "special", "image", "visual", "news")
+        return target if any(token in evidence for token in tokens) else None
+
+    def _crawl_same_domain(self, source: SourceRef, news: NewsItem) -> list[SourceRef]:
+        if self.same_domain_depth <= 0 or source.source_type is not SourceType.OFFICIAL_SITE:
+            return []
+        found: list[SourceRef] = []
+        queue = deque([(source.url, 0)])
+        visited = {_normalize(source.url)}
+        while queue:
+            page_url, depth = queue.popleft()
+            if depth >= self.same_domain_depth:
+                continue
+            try:
+                response = self.same_domain_client.get(page_url)
+                soup = BeautifulSoup(getattr(response, "text", "") or "", "html.parser")
+            except Exception:
+                continue
+            for anchor in soup.find_all("a", href=True):
+                child = self._gallery_link(page_url, anchor["href"], anchor.get_text(" ", strip=True))
+                if not child or child in visited:
+                    continue
+                visited.add(child)
+                found.append(SourceRef(url=child, domain=urlsplit(child).hostname or source.domain, source_type=SourceType.OFFICIAL_SITE, discovered_via=DiscoveryMethod.SAME_DOMAIN, officiality=source.officiality))
+                queue.append((child, depth + 1))
+        return found
 
     def resolve(self, news_item: NewsItem) -> list[SourceRef]:
         ordered: list[SourceRef] = []
@@ -35,12 +105,11 @@ class DefaultSourceResolver:
         for url in news_item.source_urls:
             parts = urlsplit(url)
             if parts.scheme in {"http", "https"}:
-                path = parts.path.casefold()
-                source_type = SourceType.DIRECT_IMAGE if path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")) else (SourceType.OFFICIAL_X if parts.hostname and parts.hostname.casefold() in {"x.com", "twitter.com"} else SourceType.OFFICIAL_SITE)
-                add(SourceRef(url=url, domain=parts.hostname or "unknown", source_type=source_type, discovered_via=DiscoveryMethod.DOCUMENT, officiality=1.0))
+                add(self._document_source(url))
         historical = list(self.history_lookup(news_item))
         for source in historical: add(source.model_copy(update={"discovered_via": DiscoveryMethod.HISTORY}))
         for source in list(ordered):
-            for child in self.same_domain_lookup(source, news_item): add(child.model_copy(update={"discovered_via": DiscoveryMethod.SAME_DOMAIN}))
+            children = self.same_domain_lookup(source, news_item) if self.same_domain_lookup else self._crawl_same_domain(source, news_item)
+            for child in children: add(child.model_copy(update={"discovered_via": DiscoveryMethod.SAME_DOMAIN}))
         for source in self.search_provider(news_item): add(source)
         return ordered

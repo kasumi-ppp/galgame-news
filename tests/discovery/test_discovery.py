@@ -7,6 +7,7 @@ from galgame_news.domain import (
     DiscoveryMethod,
     ImageNeed,
     NewsItem,
+    ReviewReason,
     SourceRef,
     SourceType,
 )
@@ -70,6 +71,24 @@ def test_gallery_anchor_prefers_full_image_over_thumbnail_and_picture_source():
     assert "https://official.example/hero.webp" in urls
 
 
+def test_gallery_page_collects_more_than_five_original_images():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+
+    html = "".join(
+        f'<a href="/gallery/cg{index:02d}.jpg"><img src="/gallery/thumb/cg{index:02d}s.jpg"></a>'
+        for index in range(1, 7)
+    )
+    adapter = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url))
+    result = adapter.collect(
+        item(),
+        SourceRef(url="https://official.example/gallery", domain="official.example", source_type=SourceType.OFFICIAL_SITE),
+        CollectionContext(max_candidates=20),
+    )
+    assert [candidate.image_url for candidate in result.candidates] == [
+        f"https://official.example/gallery/cg{index:02d}.jpg" for index in range(1, 7)
+    ]
+
+
 def test_wix_transformed_thumbnail_is_upgraded_to_original_media_url():
     from galgame_news.discovery.adapters import OfficialHtmlAdapter
 
@@ -91,7 +110,7 @@ def test_x_without_token_keeps_source_and_requires_manual_review():
     from galgame_news.discovery.adapters import XAdapter
 
     source = SourceRef(url="https://x.com/AirVelo2026/status/1", domain="x.com", source_type=SourceType.OFFICIAL_X)
-    result = XAdapter(token=None).collect(item(), source, CollectionContext())
+    result = XAdapter(token=None, public_transport=lambda url, **_: FakeResponse(text="", url=url)).collect(item(), source, CollectionContext())
     assert not result.candidates
     assert result.manual_review_reasons
     assert source.requires_review is True
@@ -146,3 +165,59 @@ def test_dynamic_and_age_gate_sources_are_reviewable():
     result = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url)).collect(item(), source, CollectionContext())
     assert not result.candidates
     assert source.requires_review
+
+
+def test_default_resolver_discovers_same_domain_gallery_using_configured_depth():
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    pages = {
+        "https://official.example/product": '<a href="/gallery">Gallery</a><a href="https://other.example/gallery">other</a>',
+        "https://official.example/gallery": '<a href="/special/cg">CG Special</a>',
+    }
+    resolver = DefaultSourceResolver(same_domain_depth=2, same_domain_transport=lambda url, **_: FakeResponse(text=pages[url], url=url), search_provider=lambda _news: [])
+    result = resolver.resolve(item(source_urls=["https://official.example/product"]))
+    assert [source.url for source in result] == ["https://official.example/product", "https://official.example/gallery", "https://official.example/special/cg"]
+
+
+def test_document_link_trust_does_not_mark_known_third_party_as_official():
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    resolver = DefaultSourceResolver(search_provider=lambda _news: [])
+    result = resolver.resolve(item(source_urls=["https://vndb.org/v123", "https://store.steampowered.com/app/1"]))
+    assert result[0].source_type is SourceType.UNVERIFIED
+    assert result[0].officiality < 0.5
+    assert result[1].source_type is SourceType.STEAM
+    assert result[1].officiality < 1.0
+
+
+def test_ddgs_provider_accepts_current_href_and_body_field_names():
+    from galgame_news.discovery.search import DDGSSearchProvider
+
+    provider = DDGSSearchProvider(
+        search_fn=lambda query, **_: [
+            {"title": "Official game site", "href": "https://official.example/game", "body": "Gallery and news"}
+        ]
+    )
+    result = provider.search(item())
+    assert [source.url for source in result] == ["https://official.example/game"]
+    assert result[0].source_type is SourceType.UNVERIFIED
+
+
+def test_wix_embedded_dynamic_data_yields_original_media_images():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+
+    html = r'''<script id="wix-warmup-data" type="application/json">{"gallery":{"items":[{"src":"https:\/\/static.wixstatic.com\/media\/one~mv2.jpg\/v1\/fill\/w_400,h_200\/one.jpg"},{"src":"wix:image://v1/two~mv2.png/two.png#originWidth=1600&originHeight=900"}]}}</script>'''
+    adapter = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url))
+    result = adapter.collect(item(), SourceRef(url="https://site.wixsite.com/game", domain="site.wixsite.com", source_type=SourceType.OFFICIAL_SITE), CollectionContext())
+    assert {candidate.image_url for candidate in result.candidates} == {"https://static.wixstatic.com/media/one~mv2.jpg", "https://static.wixstatic.com/media/two~mv2.png"}
+
+
+def test_x_without_token_extracts_public_meta_image_and_still_requires_review():
+    from galgame_news.discovery.adapters import XAdapter
+
+    html = '<meta property="og:image" content="https://pbs.twimg.com/media/cg.jpg">'
+    source = SourceRef(url="https://x.com/studio/status/1", domain="x.com", source_type=SourceType.OFFICIAL_X)
+    adapter = XAdapter(token=None, public_transport=lambda url, **_: FakeResponse(text=html, url=url))
+    result = adapter.collect(item(), source, CollectionContext())
+    assert [candidate.image_url for candidate in result.candidates] == ["https://pbs.twimg.com/media/cg.jpg"]
+    assert ReviewReason.X_SOURCE in result.manual_review_reasons

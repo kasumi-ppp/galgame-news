@@ -57,6 +57,9 @@ class OutputManager:
             shutil.copyfile(candidate.local_path, target)
             candidate.local_path = str(target)
             files.append(str(target.relative_to(root)))
+        for candidate in result.candidates:
+            if not candidate.selected:
+                candidate.local_path = None
         candidate_payload = [candidate.model_dump(mode="json") for candidate in result.candidates]
         news_payload = []
         for item in result.issue.news_items:

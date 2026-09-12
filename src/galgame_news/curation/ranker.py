@@ -27,7 +27,9 @@ class ImageRanker:
             else:
                 age_days = max(0.0, (now - candidate.published_at).total_seconds() / 86400)
                 freshness = max(0.0, min(1.0, 1.0 - age_days / 365.0))
-            trust = {SourceType.OFFICIAL_SITE: 1.0, SourceType.OFFICIAL_X: 0.9, SourceType.STEAM: 0.85, SourceType.DIRECT_IMAGE: 0.65, SourceType.UNVERIFIED: 0.25}.get(candidate.source_type, 0.0)
+            default_trust = {SourceType.OFFICIAL_SITE: 1.0, SourceType.OFFICIAL_X: 0.9, SourceType.STEAM: 0.85, SourceType.DIRECT_IMAGE: 0.65, SourceType.UNVERIFIED: 0.25}.get(candidate.source_type, 0.0)
+            raw_trust = candidate.signals.get("source_officiality", default_trust)
+            trust = max(0.0, min(1.0, float(raw_trust))) if isinstance(raw_trust, (int, float)) else default_trust
             pixels = (candidate.width or 0) * (candidate.height or 0)
             quality = min(1.0, pixels / 1_000_000) if pixels else 0.5
             duplicate_penalty = 1.0 if ReviewReason.HISTORICAL_DUPLICATE in candidate.review_reasons else 0.0

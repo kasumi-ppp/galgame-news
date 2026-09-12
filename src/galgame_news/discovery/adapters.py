@@ -15,10 +15,22 @@ from .http import SafeHttpClient
 
 
 def _candidate(news: NewsItem, image_url: str, source: SourceRef, context: CollectionContext) -> ImageCandidate:
-    return ImageCandidate(news_id=news.id or "", image_url=image_url, source_url=source.url, source_type=source.source_type, fetched_at=context.now, downloadable=True)
+    return ImageCandidate(
+        news_id=news.id or "",
+        image_url=image_url,
+        source_url=source.url,
+        source_type=source.source_type,
+        fetched_at=context.now,
+        downloadable=True,
+        review_reasons=list(source.review_reasons),
+        signals={"source_officiality": source.officiality},
+    )
 
 
 def _upgrade_wix(url: str) -> str:
+    if url.startswith("wix:image://v1/"):
+        media_id = url.split("wix:image://v1/", 1)[1].split("/", 1)[0]
+        return f"https://static.wixstatic.com/media/{media_id}"
     parts = urlsplit(url)
     if parts.hostname and parts.hostname.casefold() == "static.wixstatic.com" and "/v1/" in parts.path and "/media/" in parts.path:
         media_id = parts.path.split("/media/", 1)[1].split("/v1/", 1)[0]
@@ -63,7 +75,7 @@ class OfficialHtmlAdapter:
             thumbnail_values: set[str] = set()
             for anchor in soup.find_all("a", href=True):
                 href = anchor["href"]
-                if urlsplit(href).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+                if urlsplit(href).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
                     urls.append(href)
                     for image in anchor.find_all("img"):
                         for attr in ("src", "data-src", "data-lazy-src", "data-original"):
@@ -90,6 +102,9 @@ class OfficialHtmlAdapter:
                     urls.extend(values if isinstance(values, list) else [values])
                 except (TypeError, ValueError, json.JSONDecodeError):
                     continue
+            embedded = html.replace(r"\/", "/")
+            urls.extend(re.findall(r"https://static\.wixstatic\.com/media/[^\"'<>\\\s]+", embedded))
+            urls.extend(re.findall(r"wix:image://v1/[^\"'<>\\\s]+", embedded))
             candidates = []
             seen = set()
             for value in urls:
@@ -130,15 +145,29 @@ class VideoAdapter:
 
 
 class XAdapter:
-    def __init__(self, *, token: str | None = None, transport: Callable[..., Any] | None = None):
+    def __init__(self, *, token: str | None = None, transport: Callable[..., Any] | None = None, public_transport: Callable[..., Any] | None = None):
         self.token = token
         self.transport = transport
+        self.public_client = SafeHttpClient(transport=public_transport)
 
     def collect(self, news_item: NewsItem, source_ref: SourceRef, context: CollectionContext) -> CollectionResult:
         source_ref.requires_review = True
         source_ref.review_reasons = list(dict.fromkeys([*source_ref.review_reasons, ReviewReason.X_SOURCE]))
         if not self.token:
-            return CollectionResult(manual_review_reasons=[ReviewReason.X_SOURCE])
+            try:
+                response = self.public_client.get(source_ref.url)
+                soup = BeautifulSoup(getattr(response, "text", "") or "", "html.parser")
+                urls = []
+                for tag in soup.find_all("meta"):
+                    key = (tag.get("property") or tag.get("name") or "").casefold()
+                    if key in {"og:image", "og:image:url", "twitter:image", "twitter:image:src"} and tag.get("content"):
+                        image_url = urljoin(source_ref.url, tag["content"])
+                        image_host = (urlsplit(image_url).hostname or "").casefold()
+                        if image_host == "pbs.twimg.com":
+                            urls.append(image_url)
+                return CollectionResult(candidates=[_candidate(news_item, url, source_ref, context) for url in dict.fromkeys(urls)], manual_review_reasons=[ReviewReason.X_SOURCE])
+            except Exception as exc:
+                return CollectionResult(failures=[FailureRecord(stage=FailureStage.COLLECT, news_id=news_item.id, code="x_public_metadata_error", message=str(exc), source_url=source_ref.url, retryable=True)], manual_review_reasons=[ReviewReason.X_SOURCE, ReviewReason.NETWORK_RESTRICTED])
         # API integration is deliberately injectable; no login or scraping fallback.
         if self.transport is None:
             return CollectionResult(manual_review_reasons=[ReviewReason.X_SOURCE])

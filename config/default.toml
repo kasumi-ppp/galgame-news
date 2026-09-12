@@ -21,7 +21,7 @@ user_agent = "WeeklyGalgameImagePrescan/2.0"
 [selection]
 min_images = 5
 max_images = 20
-per_news_max = 3
+per_news_max = 20
 minimum_score = 0.0
 
 [search]

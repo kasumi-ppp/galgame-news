@@ -55,6 +55,14 @@ def test_ranker_uses_config_weights_unknown_date_review_and_deterministic_ties(t
     assert ReviewReason.UNKNOWN_PUBLISH_TIME in ranked[1].review_reasons
 
 
+def test_ranker_honors_resolver_officiality_instead_of_trusting_every_document_site():
+    from galgame_news.curation.ranker import ImageRanker
+
+    value = candidate("https://third-party.example/image.jpg", signals={"source_officiality": 0.25})
+    ranked = ImageRanker(load_config().scoring).rank(news(), [value])
+    assert ranked[0].score.source_trust == 0.25
+
+
 def test_allocator_limits_per_news_and_total_and_reports_shortfall():
     from galgame_news.curation.allocator import ImageAllocator
 
@@ -79,3 +87,30 @@ def test_allocator_targets_five_to_twenty_per_news_without_issue_cap():
     assert sum(c.selected for c in result if c.news_id == ids[0]) == 8
     assert sum(c.selected for c in result if c.news_id == ids[1]) == 8
     assert result.selection_shortfall == 0
+
+
+def test_curator_default_does_not_truncate_a_news_item_to_three_candidates():
+    from galgame_news.curation.curator import ImageCurator
+    from galgame_news.domain import Issue
+
+    item = news("n1")
+    values = [candidate(f"https://cdn/{index}.jpg", news_id=item.id, signals={"game_match": 1.0}) for index in range(8)]
+    result = ImageCurator().curate(Issue(issue_id="259", input_path="259.docx", news_items=[item]), values)
+    assert sum(value.selected for value in result.candidates) == 8
+
+
+def test_validator_keeps_avif_magic_when_decoder_is_unavailable():
+    from galgame_news.curation.validation import ImageValidator
+
+    avif = b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1" + b"payload"
+    result = ImageValidator().validate(avif, "image/avif")
+    assert result.valid
+    assert result.mime_type == "image/avif"
+
+
+def test_semantic_filter_rejects_logo_banner_and_thumbnail_urls():
+    from galgame_news.curation.validation import meaningless_asset_reason
+
+    assert meaningless_asset_reason(candidate("https://site.example/assets/logo.png")) == "meaningless_asset"
+    assert meaningless_asset_reason(candidate("https://site.example/header/banner.jpg")) == "meaningless_asset"
+    assert meaningless_asset_reason(candidate("https://site.example/cg/event01.jpg")) is None

@@ -13,12 +13,21 @@ from ..domain import DiscoveryMethod, NewsItem, SearchResult, SourceRef, SourceT
 def _to_sources(results: Iterable[Any], method: DiscoveryMethod) -> list[SourceRef]:
     sources = []
     for result in results:
-        if isinstance(result, SearchResult):
-            value = result
-        elif isinstance(result, dict):
-            value = SearchResult(**result)
-        else:
-            value = SearchResult(url=str(getattr(result, "url", result)), title=str(getattr(result, "title", "")), snippet=str(getattr(result, "snippet", "")))
+        try:
+            if isinstance(result, SearchResult):
+                value = result
+            elif isinstance(result, dict):
+                value = SearchResult(
+                    url=str(result.get("url") or result.get("href") or ""),
+                    title=str(result.get("title") or ""),
+                    snippet=str(result.get("snippet") or result.get("body") or ""),
+                )
+            else:
+                value = SearchResult(url=str(getattr(result, "url", result)), title=str(getattr(result, "title", "")), snippet=str(getattr(result, "snippet", "")))
+        except (TypeError, ValueError):
+            continue
+        if urlsplit(value.url).scheme not in {"http", "https"}:
+            continue
         host = urlsplit(value.url).hostname or "unknown"
         sources.append(SourceRef(url=value.url, domain=host, source_type=SourceType.UNVERIFIED, discovered_via=method, officiality=0.0))
     return sources

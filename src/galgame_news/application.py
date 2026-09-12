@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import load_config
-from .curation import ImageCurator
+from .curation import ImageCurator, ImageDownloader
 from .discovery.adapters import DirectImageAdapter, OfficialHtmlAdapter, SteamAdapter, XAdapter
 from .discovery.resolver import DefaultSourceResolver
 from .domain import CollectionContext, FailureRecord, FailureStage, Issue, PipelineResult, SourceType
@@ -16,7 +19,7 @@ from .delivery.history import SQLiteHistoryStore
 
 
 class Application:
-    def __init__(self, *, offline: bool = False, config_path=None, resolver=None, parser=None, analyzer=None, history=None, history_db=None, max_images=None, llm_provider=None, llm_model=None):
+    def __init__(self, *, offline: bool = False, config_path=None, resolver=None, parser=None, analyzer=None, history=None, history_db=None, max_images=None, llm_provider=None, llm_model=None, source_transport=None, image_transport=None):
         self.offline = offline
         self.config = load_config(config_path)
         self.parser = parser or DocxDocumentParser()
@@ -25,8 +28,12 @@ class Application:
         self.resolver = resolver or DefaultSourceResolver(
             history_lookup=(self.history.sources_for if self.history else None),
             search_provider=(lambda _news: []) if offline else None,
+            same_domain_depth=self.config.search.same_domain_depth,
+            same_domain_transport=source_transport,
         )
         self.max_images = max_images
+        self.source_transport = source_transport
+        self.image_transport = image_transport
 
     def run(self, input_path: Path | str, *, issue_id: str, output_dir: Path | str) -> PipelineResult:
         failures: list[FailureRecord] = []
@@ -41,21 +48,31 @@ class Application:
             try:
                 sources = self.resolver.resolve(news)
                 if self.offline:
-                    sources = [source for source in sources if source.source_type is SourceType.DIRECT_IMAGE or urlsplit(source.url).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp"))]
+                    sources = [source for source in sources if source.source_type is SourceType.DIRECT_IMAGE or urlsplit(source.url).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"))]
                 for source in sources:
-                    if source.source_type is SourceType.DIRECT_IMAGE or urlsplit(source.url).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    if source.source_type is SourceType.DIRECT_IMAGE or urlsplit(source.url).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
                         adapter = DirectImageAdapter()
                     elif source.source_type is SourceType.STEAM:
-                        adapter = SteamAdapter()
+                        adapter = SteamAdapter(transport=self.source_transport)
                     elif source.source_type is SourceType.OFFICIAL_X:
-                        adapter = XAdapter()
+                        adapter = XAdapter(token=os.getenv("X_BEARER_TOKEN"), public_transport=self.source_transport)
                     else:
-                        adapter = OfficialHtmlAdapter()
-                    collection = adapter.collect(news, source, CollectionContext(now=__import__("datetime").datetime.now(__import__("datetime").timezone.utc)))
+                        adapter = OfficialHtmlAdapter(transport=self.source_transport)
+                    collection = adapter.collect(news, source, CollectionContext(timeout_seconds=self.config.network.timeout_seconds, max_candidates=self.config.selection.per_news_max, now=datetime.now(timezone.utc)))
                     candidates.extend(collection.candidates)
                     failures.extend(collection.failures)
             except Exception as exc:
                 failures.append(FailureRecord(stage=FailureStage.RESOLVE, news_id=news.id, code="news_failed", message=str(exc), retryable=True))
+        root = Path(output_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        if self.offline:
+            return self._curate_and_write(issue, candidates, failures, root)
+        with tempfile.TemporaryDirectory(prefix=".image-stage-", dir=root) as staging:
+            candidates, download_failures = ImageDownloader(self.config, transport=self.image_transport).download(candidates, staging)
+            failures.extend(download_failures)
+            return self._curate_and_write(issue, candidates, failures, root)
+
+    def _curate_and_write(self, issue, candidates, failures, output_dir):
         curated = ImageCurator(self.config).curate(issue, candidates, self.history)
         if self.max_images is not None:
             for news_id in {candidate.news_id for candidate in curated.candidates}:

@@ -28,8 +28,8 @@ class ImageCurator:
             item = by_news.get(news_id)
             group = [candidate for candidate in deduped.unique if candidate.news_id == news_id]
             if item is not None:
-                ranked.extend(ImageRanker(self.config.scoring).rank(item, group)[: self.config.selection.per_news_max])
+                ranked.extend(ImageRanker(self.config.scoring).rank(item, group))
             else:
                 ranked.extend(group)
-        allocated = ImageAllocator(min_images=self.config.selection.min_images, max_images=None, per_news_max=self.config.selection.max_images, minimum_score=self.config.selection.minimum_score).allocate(issue.news_items, ranked)
+        allocated = ImageAllocator(min_images=self.config.selection.min_images, max_images=None, per_news_max=self.config.selection.per_news_max, minimum_score=self.config.selection.minimum_score).allocate(issue.news_items, ranked)
         return CurationResult(candidates=list(allocated), selection_shortfall=allocated.selection_shortfall)
