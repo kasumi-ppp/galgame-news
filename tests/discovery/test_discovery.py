@@ -55,6 +55,31 @@ def test_official_html_extracts_meta_lazy_srcset_links_and_jsonld():
     assert {"https://official.example/og.jpg", "https://official.example/tw.jpg", "https://official.example/jsonld.jpg", "https://official.example/normal.jpg", "https://official.example/lazy.jpg", "https://official.example/large.jpg", "https://official.example/linked.png"} <= urls
 
 
+def test_gallery_anchor_prefers_full_image_over_thumbnail_and_picture_source():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+
+    html = """
+    <picture><source srcset="/hero.webp" type="image/webp"><img src="/hero-thumb.jpg"></picture>
+    <a href="/gallery06.jpg" data-lightbox="simple-group"><img src="/gallery06s.jpg"></a>
+    """
+    adapter = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url))
+    result = adapter.collect(item(), SourceRef(url="https://official.example/gallery", domain="official.example", source_type=SourceType.OFFICIAL_SITE), CollectionContext())
+    urls = [candidate.image_url for candidate in result.candidates]
+    assert "https://official.example/gallery06.jpg" in urls
+    assert "https://official.example/gallery06s.jpg" not in urls
+    assert "https://official.example/hero.webp" in urls
+
+
+def test_wix_transformed_thumbnail_is_upgraded_to_original_media_url():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+
+    transformed = "https://static.wixstatic.com/media/abc123~mv2.png/v1/fill/w_485,h_273,q_90/abc123~mv2.png"
+    html = f"<img src=\"{transformed}\">"
+    adapter = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url))
+    result = adapter.collect(item(), SourceRef(url="https://reterial.wixsite.com/gallery", domain="reterial.wixsite.com", source_type=SourceType.OFFICIAL_SITE), CollectionContext())
+    assert result.candidates[0].image_url == "https://static.wixstatic.com/media/abc123~mv2.png"
+
+
 def test_direct_image_adapter_returns_candidate_without_fetching_html():
     from galgame_news.discovery.adapters import DirectImageAdapter
 
