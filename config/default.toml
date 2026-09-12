@@ -1,0 +1,30 @@
+[scoring]
+relevance = 0.50
+freshness = 0.20
+source_trust = 0.20
+quality = 0.10
+duplicate_penalty = 0.0
+risk_penalty = 0.0
+
+[filters]
+min_width = 300
+min_height = 300
+min_pixels = 120000
+max_response_bytes = 5242880
+max_image_bytes = 12582912
+
+[network]
+timeout_seconds = 12.0
+max_retries = 3
+user_agent = "WeeklyGalgameImagePrescan/2.0"
+
+[selection]
+min_images = 5
+max_images = 20
+per_news_max = 20
+minimum_score = 0.0
+
+[search]
+max_results = 10
+same_domain_depth = 1
+max_candidates_per_source = 500
