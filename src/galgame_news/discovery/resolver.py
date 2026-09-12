@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
 from ..domain import DiscoveryMethod, NewsItem, SourceRef, SourceType
+from .search import FallbackSearchProvider
 
 
 def _normalize(url: str) -> str:
@@ -17,7 +18,7 @@ class DefaultSourceResolver:
     def __init__(self, *, history_lookup: Callable[[NewsItem], Iterable[SourceRef]] | None = None, same_domain_lookup: Callable[[SourceRef, NewsItem], Iterable[SourceRef]] | None = None, search_provider: Callable[[NewsItem], Iterable[SourceRef]] | None = None):
         self.history_lookup = history_lookup or (lambda news: [])
         self.same_domain_lookup = same_domain_lookup or (lambda source, news: [])
-        self.search_provider = search_provider or (lambda news: [])
+        self.search_provider = search_provider or FallbackSearchProvider().search
 
     def resolve(self, news_item: NewsItem) -> list[SourceRef]:
         ordered: list[SourceRef] = []
