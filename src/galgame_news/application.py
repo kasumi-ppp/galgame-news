@@ -22,7 +22,10 @@ class Application:
         self.parser = parser or DocxDocumentParser()
         self.analyzer = analyzer or (OpenAINewsAnalyzer(provider=llm_provider, model=llm_model, api_key=__import__("os").getenv("OPENAI_API_KEY")) if llm_provider and llm_model else RuleBasedNewsAnalyzer())
         self.history = history or (SQLiteHistoryStore(history_db) if history_db else None)
-        self.resolver = resolver or DefaultSourceResolver(history_lookup=(self.history.sources_for if self.history else None))
+        self.resolver = resolver or DefaultSourceResolver(
+            history_lookup=(self.history.sources_for if self.history else None),
+            search_provider=(lambda _news: []) if offline else None,
+        )
         self.max_images = max_images
 
     def run(self, input_path: Path | str, *, issue_id: str, output_dir: Path | str) -> PipelineResult:
