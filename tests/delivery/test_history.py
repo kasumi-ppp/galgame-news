@@ -92,6 +92,51 @@ def test_sqlite_store_records_sources_images_and_supports_history_queries(tmp_pa
     store.close()
 
 
+def test_sources_for_finds_same_game_source_across_issue_and_news_ids(tmp_path):
+    store = SQLiteHistoryStore(tmp_path / "history.sqlite3")
+    historical = make_result()
+    store.record_news_result(historical)
+
+    current = NewsItem(
+        issue_id="260",
+        sequence=7,
+        section="新作",
+        title="Happy Weekend 新情报",
+        body="新情报",
+        game_names=["Happy Weekend"],
+        organizations=["HOOKSOFT"],
+        event_type=EventType.UPDATE,
+        image_need=ImageNeed.EXPLICIT_NEW_IMAGE,
+    )
+    sources = store.sources_for(current)
+
+    assert current.id != historical.news_item.id
+    assert sources and sources[0].url == "https://official.example/news/1"
+    store.close()
+
+
+def test_sources_for_uses_normalized_title_only_after_entity_matching(tmp_path):
+    store = SQLiteHistoryStore(tmp_path / "history.sqlite3")
+    historical = make_result()
+    store.record_news_result(historical)
+
+    current = NewsItem(
+        issue_id="260",
+        sequence=7,
+        section="新作",
+        title="  HAPPY   WEEKEND  ",
+        body="正文",
+        game_names=[],
+        organizations=[],
+        event_type=EventType.UNKNOWN,
+        image_need=ImageNeed.UNKNOWN,
+    )
+    sources = store.sources_for(current)
+
+    assert sources and sources[0].url == "https://official.example/news/1"
+    store.close()
+
+
 def test_sqlite_store_matches_perceptual_hash_when_exact_hash_is_unknown(tmp_path):
     store = SQLiteHistoryStore(tmp_path / "history.sqlite3")
     result = make_result()
@@ -101,6 +146,46 @@ def test_sqlite_store_matches_perceptual_hash_when_exact_hash_is_unknown(tmp_pat
     assert known is not None
     assert known.sha256 == "a" * 64
     store.close()
+
+
+def test_known_image_prefers_exact_sha256_when_both_hashes_match(tmp_path):
+    store = SQLiteHistoryStore(tmp_path / "history.sqlite3")
+    result = make_result()
+    exact = result.candidates[0]
+    perceptual_only = ImageCandidate(
+        news_id=exact.news_id,
+        image_url="https://cdn.official.example/cg/15.jpg",
+        source_url=exact.source_url,
+        source_type=exact.source_type,
+        published_at=exact.published_at,
+        fetched_at=exact.fetched_at,
+        width=exact.width,
+        height=exact.height,
+        mime_type=exact.mime_type,
+        byte_size=exact.byte_size,
+        sha256="b" * 64,
+        perceptual_hash=exact.perceptual_hash,
+        downloadable=exact.downloadable,
+        local_path="images/news-1/02.jpg",
+    )
+    store.record_news_result(result.model_copy(update={"candidates": [exact, perceptual_only]}))
+
+    known = store.known_image("a" * 64, exact.perceptual_hash)
+
+    assert known is not None
+    assert known.sha256 == "a" * 64
+    store.close()
+
+
+def test_sqlite_store_rejects_database_schema_newer_than_supported(tmp_path):
+    path = tmp_path / "future.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version = 99")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="unsupported schema version"):
+        SQLiteHistoryStore(path)
 
 
 def test_sqlite_record_is_atomic_when_a_later_insert_fails(tmp_path):

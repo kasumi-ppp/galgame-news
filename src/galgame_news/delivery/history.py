@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +29,24 @@ def _enum_values(values) -> list[str]:
     return [value.value for value in values]
 
 
+def _match_text(value: str) -> str:
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value)).strip().casefold()
+
+
+def _match_rank(current: NewsItem, historical: dict) -> int:
+    current_games = {_match_text(value) for value in current.game_names if value.strip()}
+    current_orgs = {_match_text(value) for value in current.organizations if value.strip()}
+    historical_games = {_match_text(value) for value in historical.get("game_names", []) if isinstance(value, str) and value.strip()}
+    historical_orgs = {_match_text(value) for value in historical.get("organizations", []) if isinstance(value, str) and value.strip()}
+    if current_games & historical_games:
+        return 3
+    if current_orgs & historical_orgs:
+        return 2
+    if _match_text(current.title) == _match_text(str(historical.get("title", ""))):
+        return 1
+    return 0
+
+
 class SQLiteHistoryStore:
     """Durable history store with one transaction per news result."""
 
@@ -36,6 +56,10 @@ class SQLiteHistoryStore:
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            self.connection.close()
+            raise RuntimeError(f"unsupported schema version {version}; maximum supported is {SCHEMA_VERSION}")
         self._initialize()
 
     def _initialize(self) -> None:
@@ -102,39 +126,55 @@ class SQLiteHistoryStore:
         self.connection.commit()
 
     def known_image(self, sha256: str | None, perceptual_hash: str | None) -> HistoricalImage | None:
-        clauses = []
-        params: list[str] = []
         if sha256:
-            clauses.append("sha256 = ?")
-            params.append(sha256)
-        if perceptual_hash:
-            clauses.append("perceptual_hash = ?")
-            params.append(perceptual_hash)
-        if not clauses:
+            row = self.connection.execute(
+                "SELECT image_id, sha256, perceptual_hash, first_seen_issue, last_seen_issue, local_path FROM images WHERE sha256 = ? ORDER BY image_id LIMIT 1",
+                (sha256,),
+            ).fetchone()
+            if row:
+                return HistoricalImage(**dict(row))
+        if not perceptual_hash:
             return None
         row = self.connection.execute(
-            f"SELECT image_id, sha256, perceptual_hash, first_seen_issue, last_seen_issue, local_path FROM images WHERE {' OR '.join(clauses)} ORDER BY image_id LIMIT 1",
-            params,
+            "SELECT image_id, sha256, perceptual_hash, first_seen_issue, last_seen_issue, local_path FROM images WHERE perceptual_hash = ? ORDER BY image_id LIMIT 1",
+            (perceptual_hash,),
         ).fetchone()
         return HistoricalImage(**dict(row)) if row else None
 
     def sources_for(self, news_item: NewsItem) -> list[SourceRef]:
         rows = self.connection.execute(
-            "SELECT url, source_type, domain, discovered_via, officiality, requires_review, review_reasons_json FROM sources WHERE news_id = ? ORDER BY source_id",
-            (news_item.id,),
+            """SELECT s.source_id, s.url, s.source_type, s.domain, s.discovered_via,
+                      s.officiality, s.requires_review, s.review_reasons_json, n.payload_json
+               FROM sources AS s JOIN news_items AS n ON n.news_id = s.news_id
+               ORDER BY s.source_id"""
         ).fetchall()
-        return [
-            SourceRef(
-                url=row["url"],
-                source_type=row["source_type"],
-                domain=row["domain"],
-                discovered_via=row["discovered_via"],
-                officiality=row["officiality"],
-                requires_review=bool(row["requires_review"]),
-                review_reasons=json.loads(row["review_reasons_json"]),
-            )
-            for row in rows
-        ]
+        ranked: list[tuple[int, int, SourceRef]] = []
+        for row in rows:
+            rank = _match_rank(news_item, json.loads(row["payload_json"]))
+            if rank:
+                ranked.append(
+                    (
+                        rank,
+                        row["source_id"],
+                        SourceRef(
+                            url=row["url"],
+                            source_type=row["source_type"],
+                            domain=row["domain"],
+                            discovered_via=row["discovered_via"],
+                            officiality=row["officiality"],
+                            requires_review=bool(row["requires_review"]),
+                            review_reasons=json.loads(row["review_reasons_json"]),
+                        ),
+                    )
+                )
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        result: list[SourceRef] = []
+        seen_urls: set[str] = set()
+        for _, _, source in ranked:
+            if source.url not in seen_urls:
+                result.append(source)
+                seen_urls.add(source.url)
+        return result
 
     def record_news_result(self, result: NewsResult) -> None:
         news = result.news_item
@@ -208,7 +248,7 @@ class MemoryHistoryStore:
 
     def __init__(self):
         self._images: dict[str, HistoricalImage] = {}
-        self._sources: dict[str, list[SourceRef]] = {}
+        self._source_records: list[tuple[NewsItem, SourceRef]] = []
 
     def known_image(self, sha256: str | None, perceptual_hash: str | None) -> HistoricalImage | None:
         for image in self._images.values():
@@ -217,10 +257,20 @@ class MemoryHistoryStore:
         return None
 
     def sources_for(self, news_item: NewsItem) -> list[SourceRef]:
-        return list(self._sources.get(news_item.id, []))
+        ranked = [(_match_rank(news_item, item.model_dump()), index, source) for index, (item, source) in enumerate(self._source_records)]
+        ranked = [item for item in ranked if item[0]]
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        result: list[SourceRef] = []
+        seen_urls: set[str] = set()
+        for _, _, source in ranked:
+            if source.url not in seen_urls:
+                result.append(source)
+                seen_urls.add(source.url)
+        return result
 
     def record_news_result(self, result: NewsResult) -> None:
-        self._sources[result.news_item.id] = list(result.sources)
+        self._source_records = [record for record in self._source_records if record[0].id != result.news_item.id]
+        self._source_records.extend((result.news_item, source) for source in result.sources)
         for candidate in result.candidates:
             existing = self._images.get(candidate.id)
             self._images[candidate.id] = HistoricalImage(

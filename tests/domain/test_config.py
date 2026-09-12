@@ -65,3 +65,13 @@ per_news_max=2
     assert config.filters.min_width == 640
     assert config.selection.max_images == 12
     assert config.selection.per_news_max == 2
+
+
+def test_config_reports_missing_default_file_explicitly(monkeypatch, tmp_path: Path):
+    import galgame_news.config as config_module
+
+    missing = tmp_path / "missing-default.toml"
+    monkeypatch.setattr(config_module, "_default_path", lambda: missing)
+
+    with pytest.raises(FileNotFoundError, match="default configuration"):
+        load_config()
