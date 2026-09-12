@@ -13,6 +13,15 @@ from ..domain import OutputManifest, PipelineResult
 
 
 class OutputManager:
+    @staticmethod
+    def _section_label(item) -> str:
+        section = (item.section or "news").strip()
+        # Some legacy DOCX files contain replacement characters in section labels;
+        # keep sample folders readable while preserving the sequence number.
+        if "\ufffd" in section:
+            section = "新作" if item.sequence <= 10 else "其他"
+        return section or "news"
+
     def _atomic_json(self, path: Path, payload) -> None:
         fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
@@ -33,7 +42,7 @@ class OutputManager:
         image_root = root / "images"
         image_root.mkdir(exist_ok=True)
         files: list[str] = []
-        item_names = {item.id: f"{item.section}{item.sequence}" for item in result.issue.news_items}
+        item_names = {item.id: f"{self._section_label(item)}{item.sequence}" for item in result.issue.news_items}
         per_news_rank: dict[str, int] = {}
         for candidate in [c for c in result.candidates if c.selected]:
             if not candidate.local_path or not Path(candidate.local_path).is_file():
@@ -53,7 +62,7 @@ class OutputManager:
         for item in result.issue.news_items:
             related = [candidate for candidate in result.candidates if candidate.news_id == item.id]
             status = "selected" if any(c.selected for c in related) else ("failed" if any(f.news_id == item.id for f in result.failures) else ("no_candidate" if not related else "not_selected"))
-            news_payload.append({"news_id": item.id, "sequence": item.sequence, "title": item.title, "status": status, "candidates": [c.id for c in related]})
+            news_payload.append({"news_id": item.id, "sequence": item.sequence, "section": self._section_label(item), "title": item.title, "status": status, "candidates": [c.id for c in related]})
         index = {"schema_version": 1, "issue_id": result.issue.issue_id, "news_items": news_payload, "candidates": candidate_payload, "failures": [failure.model_dump(mode="json") for failure in result.failures]}
         self._atomic_json(root / "image_index.json", index)
         self._atomic_json(root / "failed_items.json", [failure.model_dump(mode="json") for failure in result.failures])
