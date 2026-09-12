@@ -35,7 +35,9 @@ class DefaultSourceResolver:
         for url in news_item.source_urls:
             parts = urlsplit(url)
             if parts.scheme in {"http", "https"}:
-                add(SourceRef(url=url, domain=parts.hostname or "unknown", source_type=SourceType.OFFICIAL_X if parts.hostname and parts.hostname.casefold() in {"x.com", "twitter.com"} else SourceType.OFFICIAL_SITE, discovered_via=DiscoveryMethod.DOCUMENT, officiality=1.0))
+                path = parts.path.casefold()
+                source_type = SourceType.DIRECT_IMAGE if path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")) else (SourceType.OFFICIAL_X if parts.hostname and parts.hostname.casefold() in {"x.com", "twitter.com"} else SourceType.OFFICIAL_SITE)
+                add(SourceRef(url=url, domain=parts.hostname or "unknown", source_type=source_type, discovered_via=DiscoveryMethod.DOCUMENT, officiality=1.0))
         historical = list(self.history_lookup(news_item))
         for source in historical: add(source.model_copy(update={"discovered_via": DiscoveryMethod.HISTORY}))
         for source in list(ordered):
