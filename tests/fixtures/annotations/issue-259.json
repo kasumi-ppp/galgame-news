@@ -1,0 +1,13 @@
+{
+  "issue_id": "259",
+  "expected": [
+    {"news_id": "n1", "candidate_id": "c1"},
+    {"news_id": "n2", "candidate_id": "c2"}
+  ],
+  "selected": [
+    {"news_id": "n1", "candidate_id": "c1"},
+    {"news_id": "n2", "candidate_id": "c2"}
+  ],
+  "candidate_count": 2,
+  "review_count": 1
+}
