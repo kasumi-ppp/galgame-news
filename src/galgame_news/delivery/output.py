@@ -1,0 +1,60 @@
+"""Atomic JSON/Markdown delivery for pipeline results."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
+from ..domain import OutputManifest, PipelineResult
+
+
+class OutputManager:
+    def _atomic_json(self, path: Path, payload) -> None:
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+                handle.write("\n")
+            os.replace(name, path)
+        except Exception:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+            raise
+
+    def write(self, result: PipelineResult, output_dir: Path | str) -> OutputManifest:
+        root = Path(output_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        image_root = root / "images"
+        image_root.mkdir(exist_ok=True)
+        files: list[str] = []
+        for rank, candidate in enumerate([c for c in result.candidates if c.selected], 1):
+            if not candidate.local_path or not Path(candidate.local_path).is_file():
+                continue
+            target_dir = image_root / candidate.news_id
+            target_dir.mkdir(parents=True, exist_ok=True)
+            ext = (candidate.mime_type or "image/jpeg").split("/")[-1].replace("jpeg", "jpg")
+            target = target_dir / f"{rank}_{candidate.id}.{ext}"
+            shutil.copyfile(candidate.local_path, target)
+            candidate.local_path = str(target)
+            files.append(str(target.relative_to(root)))
+        candidate_payload = [candidate.model_dump(mode="json") for candidate in result.candidates]
+        news_payload = []
+        for item in result.issue.news_items:
+            related = [candidate for candidate in result.candidates if candidate.news_id == item.id]
+            status = "selected" if any(c.selected for c in related) else ("failed" if any(f.news_id == item.id for f in result.failures) else ("no_candidate" if not related else "not_selected"))
+            news_payload.append({"news_id": item.id, "sequence": item.sequence, "title": item.title, "status": status, "candidates": [c.id for c in related]})
+        index = {"schema_version": 1, "issue_id": result.issue.issue_id, "news_items": news_payload, "candidates": candidate_payload, "failures": [failure.model_dump(mode="json") for failure in result.failures]}
+        self._atomic_json(root / "image_index.json", index)
+        self._atomic_json(root / "failed_items.json", [failure.model_dump(mode="json") for failure in result.failures])
+        reviews = result.review_required or [c for c in result.candidates if c.review_reasons]
+        self._atomic_json(root / "review_required.json", [candidate.model_dump(mode="json") for candidate in reviews])
+        lines = [f"# Issue {result.issue.issue_id}", "", f"候选图片：{len(result.candidates)} 张", ""]
+        for item in news_payload:
+            lines.append(f"- {item['sequence']}. {item['title']} — {item['status']} ({len(item['candidates'])} candidates)")
+        (root / "image_index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return OutputManifest(issue_id=result.issue.issue_id, output_dir=str(root), image_count=sum(c.selected for c in result.candidates), files=files)
