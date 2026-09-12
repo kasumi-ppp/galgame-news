@@ -28,3 +28,15 @@ def test_output_is_repeatable_and_does_not_duplicate_candidate_files(tmp_path):
     manager.write(result, tmp_path)
     manager.write(result, tmp_path)
     assert len(list(tmp_path.glob("*.json"))) == 3
+
+
+def test_output_uses_human_readable_section_sequence_names(tmp_path):
+    from galgame_news.delivery.output import OutputManager
+
+    item = NewsItem(issue_id="1", sequence=2, section="新作", title="《Game》更新", body="", image_need=ImageNeed.UNKNOWN)
+    issue = Issue(issue_id="1", input_path="fixture.docx", news_items=[item])
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"sample")
+    candidate = ImageCandidate(news_id=item.id, image_url="https://cdn.example/a.jpg", source_url="https://official.example", source_type=SourceType.OFFICIAL_SITE, fetched_at=datetime.now(timezone.utc), local_path=str(source), selected=True)
+    OutputManager().write(PipelineResult(issue=issue, candidates=[candidate]), tmp_path / "out")
+    assert (tmp_path / "out" / "images" / "新作2" / "01.jpg").exists()

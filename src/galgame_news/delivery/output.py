@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import tempfile
+import re
 from pathlib import Path
 
 from ..domain import OutputManifest, PipelineResult
@@ -32,13 +33,18 @@ class OutputManager:
         image_root = root / "images"
         image_root.mkdir(exist_ok=True)
         files: list[str] = []
-        for rank, candidate in enumerate([c for c in result.candidates if c.selected], 1):
+        item_names = {item.id: f"{item.section}{item.sequence}" for item in result.issue.news_items}
+        per_news_rank: dict[str, int] = {}
+        for candidate in [c for c in result.candidates if c.selected]:
             if not candidate.local_path or not Path(candidate.local_path).is_file():
                 continue
-            target_dir = image_root / candidate.news_id
+            per_news_rank[candidate.news_id] = per_news_rank.get(candidate.news_id, 0) + 1
+            rank = per_news_rank[candidate.news_id]
+            readable = re.sub(r"[\\/:*?\"<>|]", "_", item_names.get(candidate.news_id, candidate.news_id))
+            target_dir = image_root / readable
             target_dir.mkdir(parents=True, exist_ok=True)
             ext = (candidate.mime_type or "image/jpeg").split("/")[-1].replace("jpeg", "jpg")
-            target = target_dir / f"{rank}_{candidate.id}.{ext}"
+            target = target_dir / f"{rank:02d}.{ext}"
             shutil.copyfile(candidate.local_path, target)
             candidate.local_path = str(target)
             files.append(str(target.relative_to(root)))
