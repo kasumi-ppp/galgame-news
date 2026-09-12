@@ -13,7 +13,7 @@ class CandidateSelection(list[ImageCandidate]):
 
 
 class ImageAllocator:
-    def __init__(self, *, min_images: int = 5, max_images: int = 20, per_news_max: int = 3, minimum_score: float = 0.0):
+    def __init__(self, *, min_images: int = 5, max_images: int | None = 20, per_news_max: int = 20, minimum_score: float = 0.0):
         self.min_images, self.max_images, self.per_news_max, self.minimum_score = min_images, max_images, per_news_max, minimum_score
 
     def allocate(self, news_items: Iterable[NewsItem], candidates: Iterable[ImageCandidate]) -> CandidateSelection:
@@ -34,9 +34,9 @@ class ImageAllocator:
         # Second pass fills remaining slots while honoring per-news caps.
         for item in sorted(items, key=lambda value: (-value.importance, value.id or "")):
             for candidate in groups.get(item.id or "", [])[1:self.per_news_max]:
-                if len(selected) >= self.max_images: break
+                if self.max_images is not None and len(selected) >= self.max_images: break
                 if not candidate.selected:
                     candidate.selected = True
                     selected.append(candidate)
-        shortfall = max(0, self.min_images - len(selected))
+        shortfall = sum(max(0, self.min_images - sum(candidate.selected for candidate in groups.get(item.id or "", []))) for item in items)
         return CandidateSelection(all_candidates, selection_shortfall=shortfall)

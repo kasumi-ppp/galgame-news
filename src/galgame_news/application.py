@@ -58,9 +58,10 @@ class Application:
                 failures.append(FailureRecord(stage=FailureStage.RESOLVE, news_id=news.id, code="news_failed", message=str(exc), retryable=True))
         curated = ImageCurator(self.config).curate(issue, candidates, self.history)
         if self.max_images is not None:
-            selected = [candidate for candidate in curated.candidates if candidate.selected]
-            for candidate in selected[self.max_images:]:
-                candidate.selected = False
+            for news_id in {candidate.news_id for candidate in curated.candidates}:
+                selected = [candidate for candidate in curated.candidates if candidate.news_id == news_id and candidate.selected]
+                for candidate in selected[self.max_images:]:
+                    candidate.selected = False
         result = PipelineResult(issue=issue, candidates=curated.candidates, failures=failures)
         result.review_required = [candidate for candidate in result.candidates if candidate.review_reasons]
         OutputManager().write(result, output_dir)

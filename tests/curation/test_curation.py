@@ -67,3 +67,15 @@ def test_allocator_limits_per_news_and_total_and_reports_shortfall():
     short = ImageAllocator(min_images=5, max_images=20).allocate(items[:1], candidates[:2])
     assert sum(c.selected for c in short) == 2
     assert getattr(short, "selection_shortfall", 3) >= 3
+
+
+def test_allocator_targets_five_to_twenty_per_news_without_issue_cap():
+    from galgame_news.curation.allocator import ImageAllocator
+
+    items = [news("n1", 0.9), news("n2", 0.8)]
+    ids = [item.id for item in items]
+    candidates = [candidate(f"https://cdn/all-{i}.jpg", news_id=ids[0] if i < 8 else ids[1], signals={"game_match": 1.0}) for i in range(16)]
+    result = ImageAllocator(min_images=5, max_images=None, per_news_max=20).allocate(items, candidates)
+    assert sum(c.selected for c in result if c.news_id == ids[0]) == 8
+    assert sum(c.selected for c in result if c.news_id == ids[1]) == 8
+    assert result.selection_shortfall == 0
