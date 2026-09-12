@@ -58,7 +58,15 @@ class Application:
                         adapter = XAdapter(token=os.getenv("X_BEARER_TOKEN"), public_transport=self.source_transport)
                     else:
                         adapter = OfficialHtmlAdapter(transport=self.source_transport)
-                    collection = adapter.collect(news, source, CollectionContext(timeout_seconds=self.config.network.timeout_seconds, max_candidates=self.config.selection.per_news_max, now=datetime.now(timezone.utc)))
+                    collection = adapter.collect(
+                        news,
+                        source,
+                        CollectionContext(
+                            timeout_seconds=self.config.network.timeout_seconds,
+                            max_candidates=self.config.search.max_candidates_per_source,
+                            now=datetime.now(timezone.utc),
+                        ),
+                    )
                     candidates.extend(collection.candidates)
                     failures.extend(collection.failures)
             except Exception as exc:

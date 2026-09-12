@@ -58,7 +58,12 @@ class ImageDownloader:
         root.mkdir(parents=True, exist_ok=True)
         accepted: list[ImageCandidate] = []
         failures: list[FailureRecord] = []
+        seen_urls: set[tuple[str, str]] = set()
         for candidate in candidates:
+            key = (candidate.news_id, candidate.image_url)
+            if key in seen_urls:
+                continue
+            seen_urls.add(key)
             semantic_reason = meaningless_asset_reason(candidate)
             if semantic_reason:
                 failures.append(self._failure(candidate, semantic_reason, "filtered non-content image", False))

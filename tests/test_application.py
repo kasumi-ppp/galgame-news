@@ -1,7 +1,7 @@
 from pathlib import Path
 from io import BytesIO
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from galgame_news.domain import Issue, IssueDraft, NewsDraft, NewsItem, SourceRef, SourceType
 
@@ -64,3 +64,42 @@ def test_application_downloads_validates_hashes_and_saves_selected_images(tmp_pa
     assert selected.sha256 and selected.width == 800 and selected.height == 600
     assert selected.local_path and Path(selected.local_path).is_file()
     assert Path(selected.local_path).parent.name == "新作1"
+
+
+def test_application_does_not_truncate_gallery_before_filtering_page_assets(tmp_path):
+    from galgame_news.application import Application
+
+    class Parser:
+        def parse(self, path, issue_id):
+            return IssueDraft(issue_id=issue_id, input_path=str(path), entries=[NewsDraft(sequence=1, section="新作", title="Gallery Game", body="CG")])
+
+    class Analyzer:
+        def analyze(self, draft):
+            return Issue(issue_id=draft.issue_id, input_path=draft.input_path, news_items=[NewsItem(issue_id=draft.issue_id, sequence=1, section="新作", title="Gallery Game", body="CG")])
+
+    class Resolver:
+        def resolve(self, news):
+            return [SourceRef(url="https://official.example/game", domain="official.example", source_type=SourceType.OFFICIAL_SITE)]
+
+    html = "".join(f'<img src="/assets/logo/logo{index}.png">' for index in range(25))
+    html += "".join(f'<img src="/gallery/cg{index}.jpg">' for index in range(6))
+
+    def source_transport(url, **_):
+        return type("Response", (), {"text": html, "content": html.encode(), "headers": {"content-type": "text/html"}, "status_code": 200, "url": url})()
+
+    def image_transport(url, **_):
+        index = int(url.rsplit("cg", 1)[1].split(".", 1)[0])
+        stream = BytesIO()
+        image = Image.new("RGB", (800, 600), "black")
+        ImageDraw.Draw(image).rectangle((index * 100, 0, index * 100 + 40, 599), fill="white")
+        image.save(stream, format="JPEG")
+        return type("Response", (), {"content": stream.getvalue(), "headers": {"content-type": "image/jpeg"}, "status_code": 200, "url": url})()
+
+    fixture = tmp_path / "sample.docx"
+    fixture.write_bytes(b"fixture")
+    result = Application(parser=Parser(), analyzer=Analyzer(), resolver=Resolver(), source_transport=source_transport, image_transport=image_transport).run(
+        fixture, issue_id="259", output_dir=tmp_path / "out"
+    )
+    assert len(result.candidates) == 6
+    assert all("/gallery/cg" in candidate.image_url for candidate in result.candidates)
+    assert sum(candidate.selected for candidate in result.candidates) == 6

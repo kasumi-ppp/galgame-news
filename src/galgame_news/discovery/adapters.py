@@ -15,6 +15,9 @@ from .http import SafeHttpClient
 
 
 def _candidate(news: NewsItem, image_url: str, source: SourceRef, context: CollectionContext) -> ImageCandidate:
+    signals: dict[str, float | str | bool] = {"source_officiality": source.officiality}
+    if source.source_type in {SourceType.OFFICIAL_X, SourceType.DIRECT_IMAGE}:
+        signals["event_match"] = 1.0
     return ImageCandidate(
         news_id=news.id or "",
         image_url=image_url,
@@ -23,7 +26,7 @@ def _candidate(news: NewsItem, image_url: str, source: SourceRef, context: Colle
         fetched_at=context.now,
         downloadable=True,
         review_reasons=list(source.review_reasons),
-        signals={"source_officiality": source.officiality},
+        signals=signals,
     )
 
 
@@ -52,6 +55,16 @@ def _srcset_largest(value: str) -> str | None:
     return max(entries, key=lambda pair: pair[0])[1] if entries else None
 
 
+def _image_priority(url: str) -> int:
+    path = urlsplit(url).path.casefold()
+    filename = path.rsplit("/", 1)[-1]
+    if "/gallery/" in path or "/cg/" in path or re.match(r"(?:cg|gallery|ss[_-]?)\d+", filename):
+        return 0
+    if "/screenshot" in path or "/sample" in path or "/points/" in path:
+        return 1
+    return 2
+
+
 class DirectImageAdapter:
     def collect(self, news_item: NewsItem, source_ref: SourceRef, context: CollectionContext) -> CollectionResult:
         return CollectionResult(candidates=[_candidate(news_item, source_ref.url, source_ref, context)])
@@ -64,6 +77,7 @@ class OfficialHtmlAdapter:
     def collect(self, news_item: NewsItem, source_ref: SourceRef, context: CollectionContext) -> CollectionResult:
         try:
             response = self.client.get(source_ref.url)
+            page_url = str(getattr(response, "url", source_ref.url) or source_ref.url)
             html = getattr(response, "text", "") or ""
             soup = BeautifulSoup(html, "html.parser")
             lowered = html.casefold()
@@ -109,14 +123,18 @@ class OfficialHtmlAdapter:
             seen = set()
             for value in urls:
                 if not isinstance(value, str): continue
-                image_url = _upgrade_wix(urljoin(source_ref.url, value))
+                image_url = _upgrade_wix(urljoin(page_url, value))
                 if image_url in seen or urlsplit(image_url).scheme not in {"http", "https"}: continue
                 seen.add(image_url)
-                candidates.append(_candidate(news_item, image_url, source_ref, context))
+                candidate = _candidate(news_item, image_url, source_ref, context)
+                if _image_priority(image_url) <= 1 or "/gallery" in urlsplit(source_ref.url).path.casefold():
+                    candidate.signals["cg_match"] = 1.0
+                candidates.append(candidate)
             if not candidates and soup.find("script"):
                 source_ref.requires_review = True
                 source_ref.review_reasons = list(dict.fromkeys([*source_ref.review_reasons, ReviewReason.DYNAMIC_PAGE]))
                 return CollectionResult(manual_review_reasons=[ReviewReason.DYNAMIC_PAGE])
+            candidates.sort(key=lambda candidate: _image_priority(candidate.image_url))
             return CollectionResult(candidates=candidates[:context.max_candidates])
         except Exception as exc:
             return CollectionResult(failures=[FailureRecord(stage=FailureStage.COLLECT, news_id=news_item.id, code="adapter_error", message=str(exc), source_url=source_ref.url, retryable=True)])

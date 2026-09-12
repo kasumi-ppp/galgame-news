@@ -63,6 +63,24 @@ def test_ranker_honors_resolver_officiality_instead_of_trusting_every_document_s
     assert ranked[0].score.source_trust == 0.25
 
 
+def test_ranker_prefers_gallery_cg_over_larger_generic_asset_for_cg_news():
+    from galgame_news.curation.ranker import ImageRanker
+
+    item = news()
+    gallery = candidate(
+        "https://official.example/gallery/cg01_a.jpg",
+        signals={"cg_match": 1.0, "source_officiality": 1.0},
+    )
+    gallery.width, gallery.height = 1000, 563
+    generic = candidate(
+        "https://official.example/story/background.png",
+        signals={"source_officiality": 1.0},
+    )
+    generic.width, generic.height = 2000, 1200
+    ranked = ImageRanker(load_config().scoring).rank(item, [generic, gallery])
+    assert ranked[0] is gallery
+
+
 def test_allocator_limits_per_news_and_total_and_reports_shortfall():
     from galgame_news.curation.allocator import ImageAllocator
 
@@ -114,3 +132,23 @@ def test_semantic_filter_rejects_logo_banner_and_thumbnail_urls():
     assert meaningless_asset_reason(candidate("https://site.example/assets/logo.png")) == "meaningless_asset"
     assert meaningless_asset_reason(candidate("https://site.example/header/banner.jpg")) == "meaningless_asset"
     assert meaningless_asset_reason(candidate("https://site.example/cg/event01.jpg")) is None
+
+
+def test_downloader_fetches_same_news_image_url_only_once(tmp_path):
+    from galgame_news.curation.download import ImageDownloader
+
+    calls = []
+    payload = jpeg_bytes((800, 600))
+
+    def transport(url, **_):
+        calls.append(url)
+        return type("Response", (), {"content": payload, "headers": {"content-type": "image/jpeg"}, "status_code": 200, "url": url})()
+
+    duplicate_url = "https://official.example/gallery/cg01.jpg"
+    accepted, failures = ImageDownloader(load_config(), transport=transport).download(
+        [candidate(duplicate_url), candidate(duplicate_url)],
+        tmp_path,
+    )
+    assert not failures
+    assert len(accepted) == 1
+    assert calls == [duplicate_url]

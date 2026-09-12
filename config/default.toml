@@ -27,3 +27,4 @@ minimum_score = 0.0
 [search]
 max_results = 10
 same_domain_depth = 1
+max_candidates_per_source = 500

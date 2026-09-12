@@ -11,6 +11,7 @@ def test_load_config_reads_repository_defaults():
     assert config.scoring.freshness == pytest.approx(0.20)
     assert config.filters.min_width == 300
     assert config.selection.max_images == 20
+    assert config.search.max_candidates_per_source >= 100
 
 
 def test_config_rejects_weights_that_do_not_sum_to_one(tmp_path: Path):

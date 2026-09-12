@@ -140,6 +140,22 @@ def test_http_client_retries_429_then_succeeds():
     assert len(calls) == 3
 
 
+def test_http_client_retries_www_when_certificate_hostname_mismatches():
+    from galgame_news.discovery.http import SafeHttpClient
+
+    calls = []
+
+    def transport(url, **kwargs):
+        calls.append(url)
+        if url == "https://official.example/game":
+            raise RuntimeError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch")
+        return FakeResponse(url=url, text="<html>ok</html>")
+
+    response = SafeHttpClient(transport=transport, max_retries=1).get("https://official.example/game")
+    assert response.url == "https://www.official.example/game"
+    assert calls == ["https://official.example/game", "https://www.official.example/game"]
+
+
 def test_source_resolver_order_document_history_same_domain_then_search():
     from galgame_news.discovery.resolver import DefaultSourceResolver
 
@@ -177,6 +193,26 @@ def test_default_resolver_discovers_same_domain_gallery_using_configured_depth()
     resolver = DefaultSourceResolver(same_domain_depth=2, same_domain_transport=lambda url, **_: FakeResponse(text=pages[url], url=url), search_provider=lambda _news: [])
     result = resolver.resolve(item(source_urls=["https://official.example/product"]))
     assert [source.url for source in result] == ["https://official.example/product", "https://official.example/gallery", "https://official.example/special/cg"]
+
+
+def test_resolver_discovers_gallery_modal_iframe_pages():
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    html = '''
+    <div class="cgwindow cg00" data-izimodal-iframeurl="/pages/gallery/00.html"></div>
+    <iframe src="/pages/gallery/01.html"></iframe>
+    '''
+    resolver = DefaultSourceResolver(
+        same_domain_depth=1,
+        same_domain_transport=lambda url, **_: FakeResponse(text=html, url=url),
+        search_provider=lambda _news: [],
+    )
+    result = resolver.resolve(item(source_urls=["https://official.example/game"]))
+    assert [source.url for source in result] == [
+        "https://official.example/game",
+        "https://official.example/pages/gallery/00.html",
+        "https://official.example/pages/gallery/01.html",
+    ]
 
 
 def test_document_link_trust_does_not_mark_known_third_party_as_official():

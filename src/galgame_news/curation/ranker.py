@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 from ..config import ScoringConfig
-from ..domain import ImageCandidate, NewsItem, ReviewReason, ScoreBreakdown, SourceType
+from ..domain import ImageCandidate, ImageNeed, NewsItem, ReviewReason, ScoreBreakdown, SourceType
 
 
 class ImageRanker:
@@ -13,8 +13,12 @@ class ImageRanker:
 
     def _relevance(self, candidate: ImageCandidate, news: NewsItem) -> float:
         signals = candidate.signals
-        values = [float(signals[key]) for key in ("game_match", "organization_match", "page_match", "event_match", "character_match") if key in signals and isinstance(signals[key], (int, float))]
-        return max(0.0, min(1.0, (sum(values) / len(values)) if values else (1.0 if candidate.source_type in {SourceType.OFFICIAL_SITE, SourceType.OFFICIAL_X} else 0.25)))
+        values = [float(signals[key]) for key in ("game_match", "organization_match", "page_match", "event_match", "character_match", "cg_match") if key in signals and isinstance(signals[key], (int, float))]
+        if values:
+            return max(0.0, min(1.0, sum(values) / len(values)))
+        if news.image_need is ImageNeed.EXPLICIT_NEW_IMAGE and candidate.source_type is SourceType.OFFICIAL_SITE:
+            return 0.65
+        return 1.0 if candidate.source_type in {SourceType.OFFICIAL_SITE, SourceType.OFFICIAL_X} else 0.25
 
     def rank(self, news: NewsItem, candidates: Iterable[ImageCandidate]) -> list[ImageCandidate]:
         now = datetime.now(timezone.utc)

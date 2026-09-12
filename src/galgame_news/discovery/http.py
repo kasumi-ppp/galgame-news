@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import socket
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from typing import Any, Callable
 
 import httpx
@@ -17,6 +17,20 @@ class UnsafeUrlError(ValueError):
 
 class ResponseTooLarge(ValueError):
     pass
+
+
+def _verified_www_fallback(url: str, error: Exception) -> str | None:
+    message = str(error).casefold()
+    if "hostname mismatch" not in message and "wrong_principal" not in message:
+        return None
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if not host or host.startswith("www."):
+        return None
+    netloc = f"www.{host}"
+    if parts.port:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def _public_url(url: str) -> None:
@@ -48,7 +62,10 @@ class SafeHttpClient:
 
     def get(self, url: str) -> Any:
         current = url
-        for attempt in range(self.max_retries):
+        attempt = 0
+        attempt_limit = self.max_retries
+        while attempt < attempt_limit:
+            attempt += 1
             _public_url(current)
             try:
                 if self.transport is not None:
@@ -65,14 +82,19 @@ class SafeHttpClient:
                     raise ResponseTooLarge(f"response exceeds {self.max_response_bytes} bytes")
                 status = int(getattr(response, "status_code", 200))
                 if status in {408, 429} or status >= 500:
-                    if attempt + 1 < self.max_retries:
-                        time.sleep(min(0.05 * (2**attempt), 0.2))
+                    if attempt < attempt_limit:
+                        time.sleep(min(0.05 * (2 ** (attempt - 1)), 0.2))
                         continue
                 return response
             except (UnsafeUrlError, ResponseTooLarge):
                 raise
-            except Exception:
-                if attempt + 1 >= self.max_retries:
+            except Exception as exc:
+                fallback = _verified_www_fallback(current, exc)
+                if fallback is not None:
+                    current = fallback
+                    attempt_limit += 1
+                    continue
+                if attempt >= attempt_limit:
                     raise
-                time.sleep(min(0.05 * (2**attempt), 0.2))
+                time.sleep(min(0.05 * (2 ** (attempt - 1)), 0.2))
         raise RuntimeError("HTTP retry loop exhausted")

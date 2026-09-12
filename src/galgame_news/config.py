@@ -58,6 +58,7 @@ class SelectionConfig(_ConfigModel):
 class SearchConfig(_ConfigModel):
     max_results: int = Field(ge=1)
     same_domain_depth: int = Field(ge=0, le=3)
+    max_candidates_per_source: int = Field(ge=20, le=2000)
 
 
 class PrescanConfig(_ConfigModel):

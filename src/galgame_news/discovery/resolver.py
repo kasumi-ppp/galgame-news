@@ -78,11 +78,18 @@ class DefaultSourceResolver:
                 continue
             try:
                 response = self.same_domain_client.get(page_url)
+                effective_page_url = str(getattr(response, "url", page_url) or page_url)
                 soup = BeautifulSoup(getattr(response, "text", "") or "", "html.parser")
             except Exception:
                 continue
-            for anchor in soup.find_all("a", href=True):
-                child = self._gallery_link(page_url, anchor["href"], anchor.get_text(" ", strip=True))
+            links = [(anchor["href"], anchor.get_text(" ", strip=True)) for anchor in soup.find_all("a", href=True)]
+            links.extend(
+                (tag["data-izimodal-iframeurl"], "gallery modal")
+                for tag in soup.find_all(attrs={"data-izimodal-iframeurl": True})
+            )
+            links.extend((tag["src"], "gallery iframe") for tag in soup.find_all("iframe", src=True))
+            for href, label in links:
+                child = self._gallery_link(effective_page_url, href, label)
                 if not child or child in visited:
                     continue
                 visited.add(child)
