@@ -25,5 +25,5 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "run":
-        Application(offline=args.offline, config_path=args.config).run(args.input, issue_id=args.issue, output_dir=args.output)
+        Application(offline=args.offline, config_path=args.config, history_db=args.history_db, max_images=args.max_images, llm_provider=args.llm_provider, llm_model=args.llm_model).run(args.input, issue_id=args.issue, output_dir=args.output)
     return 0

@@ -12,16 +12,18 @@ from .discovery.resolver import DefaultSourceResolver
 from .domain import CollectionContext, FailureRecord, FailureStage, Issue, PipelineResult, SourceType
 from .ingestion import DocxDocumentParser, OpenAINewsAnalyzer, RuleBasedNewsAnalyzer
 from .delivery.output import OutputManager
+from .delivery.history import SQLiteHistoryStore
 
 
 class Application:
-    def __init__(self, *, offline: bool = False, config_path=None, resolver=None, parser=None, analyzer=None, history=None):
+    def __init__(self, *, offline: bool = False, config_path=None, resolver=None, parser=None, analyzer=None, history=None, history_db=None, max_images=None, llm_provider=None, llm_model=None):
         self.offline = offline
         self.config = load_config(config_path)
         self.parser = parser or DocxDocumentParser()
-        self.analyzer = analyzer or RuleBasedNewsAnalyzer()
-        self.resolver = resolver or DefaultSourceResolver()
-        self.history = history
+        self.analyzer = analyzer or (OpenAINewsAnalyzer(provider=llm_provider, model=llm_model, api_key=__import__("os").getenv("OPENAI_API_KEY")) if llm_provider and llm_model else RuleBasedNewsAnalyzer())
+        self.history = history or (SQLiteHistoryStore(history_db) if history_db else None)
+        self.resolver = resolver or DefaultSourceResolver(history_lookup=(self.history.sources_for if self.history else None))
+        self.max_images = max_images
 
     def run(self, input_path: Path | str, *, issue_id: str, output_dir: Path | str) -> PipelineResult:
         failures: list[FailureRecord] = []
@@ -52,6 +54,10 @@ class Application:
             except Exception as exc:
                 failures.append(FailureRecord(stage=FailureStage.RESOLVE, news_id=news.id, code="news_failed", message=str(exc), retryable=True))
         curated = ImageCurator(self.config).curate(issue, candidates, self.history)
+        if self.max_images is not None:
+            selected = [candidate for candidate in curated.candidates if candidate.selected]
+            for candidate in selected[self.max_images:]:
+                candidate.selected = False
         result = PipelineResult(issue=issue, candidates=curated.candidates, failures=failures)
         result.review_required = [candidate for candidate in result.candidates if candidate.review_reasons]
         OutputManager().write(result, output_dir)
