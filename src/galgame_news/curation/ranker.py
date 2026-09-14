@@ -34,8 +34,13 @@ class ImageRanker:
             default_trust = {SourceType.OFFICIAL_SITE: 1.0, SourceType.OFFICIAL_X: 0.9, SourceType.STEAM: 0.85, SourceType.DIRECT_IMAGE: 0.65, SourceType.UNVERIFIED: 0.25}.get(candidate.source_type, 0.0)
             raw_trust = candidate.signals.get("source_officiality", default_trust)
             trust = max(0.0, min(1.0, float(raw_trust))) if isinstance(raw_trust, (int, float)) else default_trust
-            pixels = (candidate.width or 0) * (candidate.height or 0)
-            quality = min(1.0, pixels / 1_000_000) if pixels else 0.5
+            width, height = candidate.width or 0, candidate.height or 0
+            if width and height:
+                # Treat 1280x720 as the preferred baseline. This avoids
+                # ranking a very wide, short banner above a true 720p CG.
+                quality = max(0.0, min(1.0, min(width / 1280.0, height / 720.0)))
+            else:
+                quality = 0.5
             duplicate_penalty = 1.0 if ReviewReason.HISTORICAL_DUPLICATE in candidate.review_reasons else 0.0
             risk_penalty = 1.0 if ReviewReason.ADULT_OR_UNKNOWN in candidate.review_reasons else 0.0
             total = 100 * (self.scoring.relevance * relevance + self.scoring.freshness * freshness + self.scoring.source_trust * trust + self.scoring.quality * quality - self.scoring.duplicate_penalty * duplicate_penalty - self.scoring.risk_penalty * risk_penalty)

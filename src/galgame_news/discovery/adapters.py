@@ -6,7 +6,7 @@ import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
@@ -45,6 +45,24 @@ def _upgrade_wix(url: str) -> str | None:
     return url
 
 
+def _upgrade_image_url(url: str) -> str | None:
+    """Remove common CDN thumbnail transforms while preserving the original asset."""
+    upgraded = _upgrade_wix(url)
+    if not upgraded:
+        return None
+    parts = urlsplit(upgraded)
+    host = (parts.hostname or "").casefold()
+    path = re.sub(r"(?:[-_]\d{2,5}x\d{2,5})(?=\.[a-z0-9]{2,5}$)", "", parts.path, flags=re.I)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    if host == "pbs.twimg.com":
+        query = [(key, "orig" if key.casefold() == "name" else value) for key, value in query if key.casefold() not in {"width", "height"}]
+    elif host in {"images.ctfassets.net", "i0.wp.com", "cdn.discordapp.com"}:
+        query = [(key, value) for key, value in query if key.casefold() not in {"w", "h", "width", "height", "resize", "fit", "crop", "q", "quality"}]
+    elif "cloudinary.com" in host:
+        path = re.sub(r"/(?:f_[^,/]+,?|q_[^,/]+,?|w_\d+,?|h_\d+,?|c_[^,/]+,?)+(?=/)", "", path, flags=re.I)
+    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query), parts.fragment))
+
+
 def _srcset_largest(value: str) -> str | None:
     entries = []
     for raw in value.split(","):
@@ -57,6 +75,13 @@ def _srcset_largest(value: str) -> str | None:
             weight = int(match.group(1)) if match else 0
         entries.append((weight, bits[0]))
     return max(entries, key=lambda pair: pair[0])[1] if entries else None
+
+
+def _looks_like_image_url(url: str) -> bool:
+    path = urlsplit(url).path.casefold()
+    if path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+        return True
+    return any(f"/{token}/" in f"{path}/" for token in ("gallery", "cg", "images", "media", "screenshot", "screenshots")) and not path.endswith("/")
 
 
 def _image_priority(url: str) -> int:
@@ -78,7 +103,8 @@ def _is_public_x_media(url: str) -> bool:
 
 class DirectImageAdapter:
     def collect(self, news_item: NewsItem, source_ref: SourceRef, context: CollectionContext) -> CollectionResult:
-        return CollectionResult(candidates=[_candidate(news_item, source_ref.url, source_ref, context)])
+        image_url = _upgrade_image_url(source_ref.url) or source_ref.url
+        return CollectionResult(candidates=[_candidate(news_item, image_url, source_ref, context)])
 
 
 class OfficialHtmlAdapter:
@@ -100,7 +126,7 @@ class OfficialHtmlAdapter:
             thumbnail_values: set[str] = set()
             for anchor in soup.find_all("a", href=True):
                 href = anchor["href"]
-                if urlsplit(href).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+                if _looks_like_image_url(href) or (anchor.find("img") is not None and any(token in urlsplit(href).path.casefold() for token in ("gallery", "cg", "image", "media"))):
                     urls.append(href)
                     for image in anchor.find_all("img"):
                         for attr in ("src", "data-src", "data-lazy-src", "data-original"):
@@ -111,7 +137,7 @@ class OfficialHtmlAdapter:
                 if key in {"og:image", "og:image:url", "twitter:image", "twitter:image:src"} and tag.get("content"):
                     urls.append(tag["content"])
             for tag in soup.find_all("img"):
-                for attr in ("src", "data-src", "data-lazy-src", "data-original"):
+                for attr in ("data-original", "data-full", "data-large", "data-hires", "data-zoom-image", "src", "data-src", "data-lazy-src"):
                     if tag.get(attr) and tag[attr] not in thumbnail_values: urls.append(tag[attr])
                 if tag.get("srcset"):
                     largest = _srcset_largest(tag["srcset"])
@@ -152,9 +178,9 @@ class OfficialHtmlAdapter:
             seen = set()
             for value in urls:
                 if not isinstance(value, str): continue
-                image_url = _upgrade_wix(urljoin(page_url, value))
+                image_url = _upgrade_image_url(urljoin(page_url, value))
                 if not image_url or image_url in seen or urlsplit(image_url).scheme not in {"http", "https"}: continue
-                if not urlsplit(image_url).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+                if not _looks_like_image_url(image_url):
                     continue
                 seen.add(image_url)
                 candidate = _candidate(news_item, image_url, source_ref, context)
@@ -210,7 +236,9 @@ class XAdapter:
                 for tag in soup.find_all("meta"):
                     key = (tag.get("property") or tag.get("name") or "").casefold()
                     if key in {"og:image", "og:image:url", "twitter:image", "twitter:image:src"} and tag.get("content"):
-                        image_url = urljoin(source_ref.url, tag["content"])
+                        image_url = _upgrade_image_url(urljoin(source_ref.url, tag["content"]))
+                        if not image_url:
+                            continue
                         image_host = (urlsplit(image_url).hostname or "").casefold()
                         image_path = urlsplit(image_url).path.casefold()
                         if image_host == "pbs.twimg.com" and (image_path.startswith("/media/") or image_path.startswith("/card_img/")):

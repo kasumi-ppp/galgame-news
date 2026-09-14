@@ -81,6 +81,18 @@ def test_ranker_prefers_gallery_cg_over_larger_generic_asset_for_cg_news():
     assert ranked[0] is gallery
 
 
+def test_ranker_prefers_720p_candidate_over_wide_but_short_banner():
+    from galgame_news.curation.ranker import ImageRanker
+
+    item = news()
+    banner = candidate("https://official.example/gallery/banner.jpg", signals={"cg_match": 1.0, "source_officiality": 1.0})
+    banner.width, banner.height = 1920, 540
+    cg = candidate("https://official.example/gallery/cg01.jpg", signals={"cg_match": 1.0, "source_officiality": 1.0})
+    cg.width, cg.height = 1280, 720
+    ranked = ImageRanker(load_config().scoring).rank(item, [banner, cg])
+    assert ranked[0] is cg
+
+
 def test_allocator_limits_per_news_and_total_and_reports_shortfall():
     from galgame_news.curation.allocator import ImageAllocator
 

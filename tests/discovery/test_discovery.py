@@ -283,6 +283,29 @@ def test_wix_pseudo_quality_url_is_ignored_when_original_media_exists():
     assert [candidate.image_url for candidate in result.candidates] == ["https://static.wixstatic.com/media/abc~mv2.jpg"]
 
 
+def test_common_cdn_thumbnail_urls_are_upgraded_to_originals():
+    from galgame_news.discovery.adapters import DirectImageAdapter, OfficialHtmlAdapter
+
+    html = '''
+    <img src="https://cdn.example/game-300x169.jpg">
+    <img src="https://pbs.twimg.com/media/cg.jpg?format=jpg&name=small">
+    <img src="https://images.ctfassets.net/game/cg.jpg?w=640&h=360&q=80">
+    '''
+    adapter = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url))
+    result = adapter.collect(item(), SourceRef(url="https://official.example/gallery", domain="official.example", source_type=SourceType.OFFICIAL_SITE), CollectionContext())
+    urls = {candidate.image_url for candidate in result.candidates}
+    assert "https://cdn.example/game.jpg" in urls
+    assert "https://pbs.twimg.com/media/cg.jpg?format=jpg&name=orig" in urls
+    assert "https://images.ctfassets.net/game/cg.jpg" in urls
+
+    direct = DirectImageAdapter().collect(
+        item(),
+        SourceRef(url="https://cdn.example/game-640x360.jpg", domain="cdn.example", source_type=SourceType.DIRECT_IMAGE),
+        CollectionContext(),
+    )
+    assert direct.candidates[0].image_url == "https://cdn.example/game.jpg"
+
+
 def test_html_discovers_background_data_iframe_and_json_images():
     from galgame_news.discovery.adapters import OfficialHtmlAdapter
     html = '''
