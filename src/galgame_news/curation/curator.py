@@ -38,7 +38,7 @@ class ImageCurator:
             try:
                 if item is None:
                     typed = ImageTypeResult(ImageType.UNKNOWN, 0.0, ("news_not_found",))
-                    decision = ImageTypeDecision(True, requires_review=True, type_match=0.1)
+                    decision = ImageTypeDecision(True, requires_review=True, auto_select=False, type_match=0.1)
                 else:
                     typed = classifier.classify(item, candidate)
                     decision = policy.evaluate(item, typed)
@@ -47,6 +47,7 @@ class ImageCurator:
                 if typed.supporting_signals:
                     candidate.signals["image_type_supporting_signals"] = ",".join(typed.supporting_signals)
                 candidate.signals["type_match"] = decision.type_match
+                candidate.signals["auto_select"] = decision.auto_select
                 if decision.fallback_only:
                     candidate.signals["fallback_only"] = True
                 if decision.requires_review and ReviewReason.IMAGE_TYPE_REVIEW not in candidate.review_reasons:
@@ -69,6 +70,7 @@ class ImageCurator:
                 candidate.image_type = ImageType.UNKNOWN
                 candidate.image_type_confidence = 0.0
                 candidate.signals["type_match"] = 0.1
+                candidate.signals["auto_select"] = False
                 if ReviewReason.IMAGE_TYPE_REVIEW not in candidate.review_reasons:
                     candidate.review_reasons.append(ReviewReason.IMAGE_TYPE_REVIEW)
                 eligible.append(candidate)
@@ -90,5 +92,11 @@ class ImageCurator:
                 ranked.extend(ImageRanker(self.config.scoring, self.config.image_types).rank(item, group))
             else:
                 ranked.extend(group)
-        allocated = ImageAllocator(min_images=self.config.selection.min_images, max_images=None, per_news_max=self.config.selection.per_news_max, minimum_score=self.config.selection.minimum_score).allocate(issue.news_items, ranked)
+        allocated = ImageAllocator(
+            min_images=self.config.selection.min_images,
+            max_images=None,
+            per_news_max=self.config.selection.per_news_max,
+            minimum_score=self.config.selection.minimum_score,
+            max_unknown_per_news=self.config.image_types.max_unknown_per_news,
+        ).allocate(issue.news_items, ranked)
         return CurationResult(candidates=list(allocated), filtered_candidates=filtered, failures=failures, selection_shortfall=allocated.selection_shortfall)

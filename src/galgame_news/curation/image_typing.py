@@ -25,6 +25,7 @@ class ImageTypeDecision:
     fallback_only: bool = False
     rejection_reason: str | None = None
     requires_review: bool = False
+    auto_select: bool = True
     type_match: float = 0.0
 
 
@@ -234,7 +235,12 @@ class ImageRequirementPolicy:
         type_match = self.type_match(news, result.image_type)
         fallback_only = requirement is ImageRequirement.CG and result.image_type is ImageType.KEY_VISUAL
         requires_review = result.image_type is ImageType.UNKNOWN and self.config.unknown_requires_review
-        return ImageTypeDecision(True, fallback_only=fallback_only, requires_review=requires_review, type_match=type_match)
+        auto_select = True
+        if result.image_type is ImageType.UNKNOWN:
+            # Unknown material remains visible for editorial review, but is
+            # never allowed to satisfy an explicit CG/image requirement.
+            auto_select = requirement is not ImageRequirement.CG and self.config.auto_select_unknown
+        return ImageTypeDecision(True, fallback_only=fallback_only, requires_review=requires_review, auto_select=auto_select, type_match=type_match)
 
     def type_match(self, news: NewsItem, image_type: ImageType) -> float:
         return _TYPE_MATCH_SCORES[self._requirement(news)].get(image_type, 0.25)

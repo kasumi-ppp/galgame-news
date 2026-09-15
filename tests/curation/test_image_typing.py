@@ -208,6 +208,64 @@ def test_unknown_requires_manual_review():
     assert decision.requires_review
 
 
+def test_explicit_cg_unknown_is_retained_but_never_auto_selected():
+    from galgame_news.curation.curator import ImageCurator
+
+    item = make_news()
+    unknown = make_candidate("https://official.example/assets/asset-01.jpg", news_id=item.id)
+    issue = Issue(issue_id="252", input_path="252.docx", news_items=[item])
+    result = ImageCurator(load_config()).curate(issue, [unknown])
+
+    assert result.candidates == [unknown]
+    assert unknown.image_type is ImageType.UNKNOWN
+    assert unknown.selected is False
+    assert ReviewReason.IMAGE_TYPE_REVIEW in unknown.review_reasons
+
+
+def test_cg_key_visual_is_fallback_only_when_no_preferred_type_exists():
+    from galgame_news.curation.curator import ImageCurator
+
+    item = make_news()
+    key_visual = make_candidate("https://official.example/assets/keyvisual_main.jpg", news_id=item.id)
+    game_cg = make_candidate("https://official.example/gallery/cg01.jpg", source_url="https://official.example/gallery", news_id=item.id, signals={"cg_match": 1.0})
+    issue = Issue(issue_id="252", input_path="252.docx", news_items=[item])
+
+    with_preferred = ImageCurator(load_config()).curate(issue, [key_visual, game_cg])
+    assert game_cg.selected is True
+    assert key_visual.selected is False
+
+    only_fallback = make_candidate("https://official.example/assets/keyvisual_only.jpg", news_id=item.id)
+    result = ImageCurator(load_config()).curate(issue, [only_fallback])
+    assert only_fallback.selected is True
+    assert result.selection_shortfall == 4
+
+
+def test_generic_and_unknown_requirements_do_not_auto_select_unknown_by_default():
+    from galgame_news.curation.curator import ImageCurator
+
+    item = make_news(title="新情报", body="官方发布了新情报。", image_need=ImageNeed.UNKNOWN)
+    unknown = make_candidate("https://official.example/assets/asset-01.jpg", news_id=item.id)
+    result = ImageCurator(load_config()).curate(Issue(issue_id="252", input_path="252.docx", news_items=[item]), [unknown])
+
+    assert unknown.image_type is ImageType.UNKNOWN
+    assert unknown.selected is False
+    assert result.selection_shortfall == 5
+
+
+def test_unknown_auto_selection_can_be_enabled_by_toml_override(tmp_path):
+    from galgame_news.curation.curator import ImageCurator
+
+    config_path = tmp_path / "override.toml"
+    config_path.write_text("[image_types]\nauto_select_unknown = true\nmax_unknown_per_news = 1\n", encoding="utf-8")
+    config = load_config(config_path)
+    item = make_news(title="新情报", body="官方发布了新情报。", image_need=ImageNeed.UNKNOWN)
+    unknown = make_candidate("https://official.example/assets/asset-01.jpg", news_id=item.id)
+    result = ImageCurator(config).curate(Issue(issue_id="252", input_path="252.docx", news_items=[item]), [unknown])
+
+    assert unknown.selected is True
+    assert result.selection_shortfall == 4
+
+
 def test_classifier_and_ranker_are_repeatable_for_same_input():
     from galgame_news.curation.ranker import ImageRanker
 
@@ -323,7 +381,8 @@ def test_252_offline_fixture_keeps_screenshot_and_rejects_chrome_and_goods():
     assert "goods_tapestry.jpg" not in selected_names
     assert "logo.png" not in selected_names
     assert "bnr_main.jpg" not in selected_names
-    assert sum(candidate.selected for candidate in result.candidates) == 2
+    assert not by_name["keyvisual_main.jpg"].selected
+    assert sum(candidate.selected for candidate in result.candidates) == 1
     assert any(f.code == "image_type_rejected" and "goods" in f.message for f in result.failures)
 
 

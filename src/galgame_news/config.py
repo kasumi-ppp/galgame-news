@@ -79,6 +79,8 @@ class ImageTypeConfig(_ConfigModel):
     minimum_type_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     unknown_requires_review: bool = True
     fallback_penalty: float = Field(default=0.25, ge=0.0, le=1.0)
+    auto_select_unknown: bool = False
+    max_unknown_per_news: int = Field(default=0, ge=0)
     rejected_image_types_by_requirement: dict[str, list[str]] = Field(
         default_factory=lambda: copy.deepcopy(DEFAULT_REJECTED_IMAGE_TYPES)
     )
