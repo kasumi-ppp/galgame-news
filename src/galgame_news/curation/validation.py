@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 import re
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from PIL import Image
 
@@ -23,10 +23,27 @@ class ValidationResult:
 
 MAGIC_MIME = {"jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
 
+_PLACEHOLDER_TERMS = (
+    "now_printing", "now-printing", "no_image", "no-image", "noimage",
+    "placeholder", "dummy", "image_pending", "image-pending", "coming_soon",
+    "coming-soon", "preparing", "準備中", "画像準備中", "画像なし",
+)
+
+
+def placeholder_asset_reason(candidate: ImageCandidate) -> str | None:
+    """Return a stable failure code for known placeholder assets."""
+    value = unquote(urlsplit(candidate.image_url).path + "?" + urlsplit(candidate.image_url).query).casefold()
+    compact = re.sub(r"[^a-z0-9一-龯ぁ-んァ-ヶ]+", "", value)
+    for term in _PLACEHOLDER_TERMS:
+        folded = term.casefold()
+        if folded in value or re.sub(r"[^a-z0-9一-龯ぁ-んァ-ヶ]+", "", folded) in compact:
+            return "placeholder_image"
+    return None
+
 
 def meaningless_asset_reason(candidate: ImageCandidate) -> str | None:
     path = urlsplit(candidate.image_url).path.casefold()
-    if path.endswith(".svg") or "profile_images" in path or "placeholder" in path:
+    if path.endswith(".svg") or "profile_images" in path:
         return "invalid_material"
     tokens = set(filter(None, re.split(r"[^a-z0-9]+", path)))
     meaningless = {"logo", "favicon", "icon", "icons", "sprite", "button", "btn", "banner", "header", "footer", "thumbnail", "thumb", "capsule", "fonts", "editorui", "parastorage"}

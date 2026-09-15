@@ -6,8 +6,10 @@ from ..config import PrescanConfig, load_config
 from ..domain import CurationResult, FailureRecord, FailureStage, ImageCandidate, ImageType, Issue, ReviewReason
 from .allocator import ImageAllocator
 from .dedup import Deduplicator
+from .entity_matching import EntityMatcher
 from .image_typing import ImageRequirementPolicy, ImageTypeClassifier, ImageTypeDecision, ImageTypeResult
 from .ranker import ImageRanker
+from .source_policy import SourceTrustPolicy
 
 
 class ImageCurator:
@@ -31,6 +33,8 @@ class ImageCurator:
         by_news = {item.id: item for item in issue.news_items}
         classifier = ImageTypeClassifier(self.config.image_types)
         policy = ImageRequirementPolicy(self.config.image_types)
+        entity_matcher = EntityMatcher()
+        source_policy = SourceTrustPolicy()
         eligible: list[ImageCandidate] = []
         filtered: list[ImageCandidate] = []
         for candidate in values:
@@ -44,6 +48,10 @@ class ImageCurator:
                     decision = policy.evaluate(item, typed)
                 candidate.image_type = typed.image_type
                 candidate.image_type_confidence = typed.confidence
+                source_result = source_policy.classify(candidate)
+                candidate.signals["source_tier"] = source_result.tier
+                candidate.signals["source_officiality"] = source_result.officiality
+                candidate.signals["source_is_official"] = source_result.is_official
                 if typed.supporting_signals:
                     candidate.signals["image_type_supporting_signals"] = ",".join(typed.supporting_signals)
                 candidate.signals["type_match"] = decision.type_match
@@ -52,6 +60,41 @@ class ImageCurator:
                     candidate.signals["fallback_only"] = True
                 if decision.requires_review and ReviewReason.IMAGE_TYPE_REVIEW not in candidate.review_reasons:
                     candidate.review_reasons.append(ReviewReason.IMAGE_TYPE_REVIEW)
+                try:
+                    match = entity_matcher.match(item, candidate) if item is not None else None
+                except Exception as exc:
+                    # A malformed page-local signal must not discard the
+                    # other candidates for this news item.
+                    candidate.signals["entity_match"] = "unknown"
+                    candidate.signals["entity_match_confidence"] = 0.0
+                    candidate.signals["auto_select"] = False
+                    if ReviewReason.UNCERTAIN_MATCH not in candidate.review_reasons:
+                        candidate.review_reasons.append(ReviewReason.UNCERTAIN_MATCH)
+                    eligible.append(candidate)
+                    failures.append(FailureRecord(stage=FailureStage.CURATE, news_id=candidate.news_id, candidate_id=candidate.id, code="entity_match_error", message=str(exc), source_url=candidate.image_url, retryable=False))
+                    continue
+                if match is not None:
+                    candidate.signals["entity_match"] = match.matched if match.matched is not None else "unknown"
+                    candidate.signals["entity_match_confidence"] = match.confidence
+                    candidate.signals["entity_match_evidence"] = ",".join(match.supporting_signals)
+                    candidate.signals["official_domain_match"] = match.official_domain_match
+                    if match.conflicting_entities:
+                        candidate.signals["entity_conflict"] = ",".join(match.conflicting_entities)
+                    if match.matched is False:
+                        candidate.selected = False
+                        filtered.append(candidate)
+                        failures.append(FailureRecord(stage=FailureStage.CURATE, news_id=candidate.news_id, candidate_id=candidate.id, code="entity_mismatch", message="candidate conflicts with the news game entity", source_url=candidate.image_url, retryable=False))
+                        continue
+                    if match.matched is None:
+                        candidate.signals["auto_select"] = False
+                        if ReviewReason.UNCERTAIN_MATCH not in candidate.review_reasons:
+                            candidate.review_reasons.append(ReviewReason.UNCERTAIN_MATCH)
+                        failures.append(FailureRecord(stage=FailureStage.CURATE, news_id=candidate.news_id, candidate_id=candidate.id, code="entity_unverified", message="candidate lacks sufficient game/entity context", source_url=candidate.image_url, retryable=False))
+                    elif not source_result.is_official and match.confidence < 0.8:
+                        candidate.signals["auto_select"] = False
+                        if ReviewReason.UNCERTAIN_MATCH not in candidate.review_reasons:
+                            candidate.review_reasons.append(ReviewReason.UNCERTAIN_MATCH)
+                        failures.append(FailureRecord(stage=FailureStage.CURATE, news_id=candidate.news_id, candidate_id=candidate.id, code="entity_unverified", message="non-official candidate requires stronger entity evidence", source_url=candidate.image_url, retryable=False))
                 if decision.accepted:
                     eligible.append(candidate)
                 else:
@@ -98,5 +141,6 @@ class ImageCurator:
             per_news_max=self.config.selection.per_news_max,
             minimum_score=self.config.selection.minimum_score,
             max_unknown_per_news=self.config.image_types.max_unknown_per_news,
+            type_limits=self.config.selection.type_limits,
         ).allocate(issue.news_items, ranked)
         return CurationResult(candidates=list(allocated), filtered_candidates=filtered, failures=failures, selection_shortfall=allocated.selection_shortfall)

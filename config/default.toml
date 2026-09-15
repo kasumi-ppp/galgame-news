@@ -24,6 +24,21 @@ max_images = 20
 per_news_max = 20
 minimum_score = 0.0
 
+[selection.type_limits]
+game_cg = 20
+gameplay_screenshot = 10
+key_visual = 1
+cover = 1
+character_art = 4
+announcement_art = 3
+goods = 10
+background_art = 20
+unknown = 0
+photo = 0
+logo = 0
+banner = 0
+ui = 0
+
 [search]
 max_results = 10
 same_domain_depth = 1

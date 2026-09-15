@@ -15,7 +15,7 @@ from PIL import Image
 from ..config import PrescanConfig
 from ..domain import FailureRecord, FailureStage, ImageCandidate
 from ..discovery.http import SafeHttpClient
-from .validation import ImageValidator, meaningless_asset_reason
+from .validation import ImageValidator, meaningless_asset_reason, placeholder_asset_reason
 
 
 _EXTENSIONS = {
@@ -68,6 +68,10 @@ class ImageDownloader:
             if key in seen_urls:
                 continue
             seen_urls.add(key)
+            placeholder_reason = placeholder_asset_reason(candidate)
+            if placeholder_reason:
+                filtered.append(self._failure(candidate, placeholder_reason, "placeholder asset was rejected before download", False))
+                continue
             reason = meaningless_asset_reason(candidate)
             if reason or parts.scheme not in {"http", "https"}:
                 filtered.append(self._failure(candidate, "filtered_invalid_material", reason or "invalid_scheme", False))

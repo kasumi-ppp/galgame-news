@@ -47,6 +47,13 @@ class SelectionConfig(_ConfigModel):
     max_images: int = Field(ge=1)
     per_news_max: int = Field(ge=1)
     minimum_score: float = Field(ge=0.0, le=100.0)
+    type_limits: dict[str, int] = Field(default_factory=lambda: copy.deepcopy(DEFAULT_TYPE_LIMITS))
+
+    @model_validator(mode="after")
+    def type_limits_are_valid(self) -> "SelectionConfig":
+        if any(not isinstance(value, int) or value < 0 for value in self.type_limits.values()):
+            raise ValueError("selection.type_limits values must be non-negative integers")
+        return self
 
     @model_validator(mode="after")
     def limits_are_ordered(self) -> "SelectionConfig":
@@ -68,6 +75,25 @@ DEFAULT_REJECTED_IMAGE_TYPES = {
     "release": ["logo", "banner", "ui", "goods", "photo"],
     "generic": ["logo", "banner", "ui"],
     "unknown": ["logo", "banner", "ui"],
+}
+
+
+# Per-news image type caps.  Keeping these in the config model gives older
+# TOML files a safe default while allowing editorial overrides in TOML.
+DEFAULT_TYPE_LIMITS = {
+    "game_cg": 20,
+    "gameplay_screenshot": 10,
+    "key_visual": 1,
+    "cover": 1,
+    "character_art": 4,
+    "announcement_art": 3,
+    "goods": 10,
+    "background_art": 20,
+    "unknown": 0,
+    "photo": 0,
+    "logo": 0,
+    "banner": 0,
+    "ui": 0,
 }
 
 
