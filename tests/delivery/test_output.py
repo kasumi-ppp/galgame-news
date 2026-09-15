@@ -89,3 +89,34 @@ def test_output_rerun_removes_managed_images_that_are_no_longer_present(tmp_path
     second = [ImageCandidate(news_id=item.id, image_url=f"https://cdn.example/second-{i}.jpg", source_url="https://official.example", source_type=SourceType.OFFICIAL_SITE, fetched_at=datetime.now(timezone.utc), local_path=str(source2), selected=True) for i in range(3)]
     manager.write(PipelineResult(issue=issue, candidates=second), out)
     assert sorted(p.name for p in (out / "images" / "x1").glob("*.jpg")) == ["x1.01.jpg", "x1.02.jpg", "x1.03.jpg"]
+
+
+def test_output_redacts_signed_url_credentials_from_json_indexes(tmp_path):
+    from galgame_news.delivery.output import OutputManager
+
+    item = NewsItem(issue_id="254", sequence=1, section="周边", title="OST发售", body="")
+    signed_url = (
+        "https://cdn.example/cover.png?"
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&"
+        "X-Amz-Credential=EXAMPLEACCESS%2F20260915%2Fregion%2Fs3%2Faws4_request&"
+        "X-Amz-Signature=secret-signature&safe=value"
+    )
+    candidate = ImageCandidate(
+        news_id=item.id,
+        image_url=signed_url,
+        source_url="https://official.example/ost",
+        source_type=SourceType.OFFICIAL_SITE,
+        fetched_at=datetime.now(timezone.utc),
+        review_reasons=["unknown_publish_time"],
+        selected=False,
+    )
+    out = tmp_path / "out"
+
+    OutputManager().write(PipelineResult(issue=Issue(issue_id="254", input_path="254.docx", news_items=[item]), candidates=[candidate]), out)
+
+    for name in ("image_index.json", "review_required.json"):
+        text = (out / name).read_text(encoding="utf-8")
+        assert "X-Amz-Credential" not in text
+        assert "X-Amz-Signature" not in text
+        assert "EXAMPLEACCESS" not in text
+        assert "safe=value" in text

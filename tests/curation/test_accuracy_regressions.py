@@ -141,3 +141,78 @@ def test_259_accuracy_fixture_covers_seven_news_without_network():
         if entry["key"] in {"yuriarashi", "phantom", "nekopara"}:
             assert any(value.selected for value in candidates if "other" not in value.image_url.casefold() and "cbrimages" not in value.image_url)
         assert all(value.selected is False for value in candidates if "other" in value.image_url.casefold() or "cbrimages" in value.image_url)
+
+
+def test_third_party_same_title_movie_page_is_not_auto_selected_as_game_media():
+    news = _news(
+        issue_id="254",
+        title="《Summer Snow.》Steam商店页面公开",
+        game_names=["Summer Snow."],
+        source_urls=["https://store.steampowered.com/app/4933880/Summer_Snow/"],
+    )
+    movie = _candidate(
+        news,
+        "https://www.tvguide.com/a/img/hub/screen-shot.png",
+        source_url="https://www.tvguide.com/movies/summer-snow/2000206522/",
+        source_type=SourceType.UNVERIFIED,
+        signals={"page_title": "Summer Snow - Where to Watch and Stream - TV Guide"},
+    )
+
+    result = ImageCurator(load_config()).curate(Issue(issue_id="254", input_path="254.docx", news_items=[news]), [movie])
+
+    assert movie.selected is False
+    assert any(f.code in {"entity_mismatch", "entity_unverified"} for f in result.failures)
+
+
+def test_store_page_rejects_image_with_conflicting_named_product_slug():
+    news = _news(
+        issue_id="254",
+        title="《魔卡魅恋！》快闪店活动",
+        game_names=["魔卡魅恋！", "Magical Charming"],
+        source_urls=["https://store.hikarifield.co.jp/shop/magical_charming"],
+        event_type=EventType.GOODS,
+        image_need=ImageNeed.UNKNOWN,
+    )
+    wrong = _candidate(
+        news,
+        "https://static.hikarifield.co.jp/images/visual/540/tayutama2.jpg",
+        source_url="https://store.hikarifield.co.jp/shop/magical_charming",
+        source_type=SourceType.UNVERIFIED,
+        signals={"page_title": "HIKARI FIELD STORE | 魔卡魅恋！"},
+    )
+
+    result = ImageCurator(load_config()).curate(Issue(issue_id="254", input_path="254.docx", news_items=[news]), [wrong])
+
+    assert wrong.signals["entity_match"] is False
+    assert wrong.selected is False
+    assert any(f.code == "entity_mismatch" for f in result.failures)
+
+
+def test_third_party_folklore_page_sharing_game_name_is_not_auto_selected():
+    news = _news(
+        issue_id="254",
+        title="《anemoi》OST正式发售",
+        game_names=["anemoi"],
+        source_urls=["https://key.visualarts.gr.jp/anemoi/"],
+        event_type=EventType.GOODS,
+        image_need=ImageNeed.UNKNOWN,
+    )
+    unrelated = _candidate(
+        news,
+        "https://i0.wp.com/example.invalid/wp-content/uploads/10.png",
+        source_url="https://example.invalid/folklore-legends/the-anemoi-of-march/",
+        source_type=SourceType.UNVERIFIED,
+        signals={
+            "page_title": "The Anemoi of March - Example Author",
+            "alt": "outside movie screen",
+        },
+    )
+
+    result = ImageCurator(load_config()).curate(
+        Issue(issue_id="254", input_path="254.docx", news_items=[news]),
+        [unrelated],
+    )
+
+    assert unrelated.signals["entity_match"] is False
+    assert unrelated.selected is False
+    assert any(f.code == "entity_mismatch" for f in result.failures)

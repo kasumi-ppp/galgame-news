@@ -55,6 +55,78 @@ class EntityMatcher:
         "game_slug", "entity", "game_name", "brand", "original_url",
     }
     _NUMERIC_EVIDENCE = ("game_match", "organization_match", "page_match", "event_match", "character_match", "cg_match")
+    _NON_GAME_MEDIA_MARKERS = (
+        "tv guide", "where to watch", "/movies/", "/movie/", "/anime/",
+        "streaming", "episode guide", "film review", "/folklore", "folklore",
+    )
+    _GAME_CONTEXT_MARKERS = (
+        "visual novel", "galgame", "steam", "pc game", "game official",
+        "ゲーム", "ギャラリー", "公式サイト", "game cg",
+    )
+    _GENERIC_SOURCE_SLUGS = {"shop", "store", "product", "products", "item", "items", "detail", "goods"}
+    _GENERIC_IMAGE_STEMS = {
+        "image", "img", "photo", "picture", "visual", "keyvisual", "cover",
+        "banner", "logo", "thumbnail", "thumb", "goods", "product", "item",
+        "main", "sub", "detail", "intro", "sample", "screenshot", "screen",
+    }
+
+    @classmethod
+    def _non_game_media_conflict(cls, candidate: ImageCandidate, page_values: list[str]) -> bool:
+        """Reject obvious film/TV pages that merely share the game's title."""
+
+        if candidate.source_type is not SourceType.UNVERIFIED:
+            return False
+        context = " ".join([candidate.source_url, *page_values]).casefold()
+        return (
+            any(marker in context for marker in cls._NON_GAME_MEDIA_MARKERS)
+            and not any(marker in context for marker in cls._GAME_CONTEXT_MARKERS)
+        )
+
+    @classmethod
+    def _conflicting_product_image_slug(cls, candidate: ImageCandidate) -> str | None:
+        """Find named assets for a different product embedded in a store page.
+
+        Product pages commonly include recommendation carousels. Page-level
+        title evidence must not be inherited by clearly named image files for
+        another product. Numeric, hashed and generic asset names remain
+        undecided and continue through the normal image/type filters.
+        """
+
+        if candidate.source_type is not SourceType.UNVERIFIED:
+            return None
+        source = urlsplit(candidate.source_url)
+        source_segments = [unquote(part) for part in source.path.split("/") if part]
+        if not any(part.casefold() in {"shop", "store", "product", "products", "goods"} for part in source_segments):
+            return None
+        product_slug = next(
+            (
+                part for part in reversed(source_segments)
+                if part.casefold() not in cls._GENERIC_SOURCE_SLUGS
+                and not part.isdigit()
+                and len(_compact(part)) >= 4
+            ),
+            None,
+        )
+        if not product_slug:
+            return None
+
+        image_path = unquote(urlsplit(candidate.image_url).path)
+        filename = image_path.rsplit("/", 1)[-1]
+        stem = filename.rsplit(".", 1)[0]
+        compact_stem = _compact(stem)
+        compact_product = _compact(product_slug)
+        compact_image_path = _compact(image_path)
+        if (
+            not compact_stem
+            or compact_stem.isdigit()
+            or compact_stem in cls._GENERIC_IMAGE_STEMS
+            or re.fullmatch(r"[0-9a-f]{16,}", compact_stem)
+            or not any(char.isalpha() for char in compact_stem)
+        ):
+            return None
+        if compact_product in compact_image_path or compact_stem in compact_product:
+            return None
+        return stem
 
     def match(self, news: NewsItem, candidate: ImageCandidate) -> EntityMatchResult:
         aliases = [str(name) for name in news.game_names if str(name).strip()]
@@ -112,6 +184,11 @@ class EntityMatcher:
         target_text = " ".join(_compact(alias) for alias in aliases)
         if "9nineproject" in host_text and "9nine" not in target_text:
             conflicts.append("9-nine")
+        if self._non_game_media_conflict(candidate, page_values):
+            conflicts.append("non_game_media_page")
+        conflicting_slug = self._conflicting_product_image_slug(candidate)
+        if conflicting_slug:
+            conflicts.append(f"other_product_asset:{conflicting_slug}")
         # A third-party page title that clearly names another work is a
         # contradiction, not merely missing evidence.  Generic words such as
         # "CG" or "image" are deliberately ignored.
