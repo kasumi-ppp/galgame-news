@@ -119,7 +119,7 @@ class EntityMatcher:
             page_title = page_values[0]
             title_tokens = re.findall(r"[A-Z][A-Za-z0-9]{2,}|\d[\w-]{2,}|[\u3040-\u30ff\u4e00-\u9fff]{2,}", page_title)
             if title_tokens and not any(_compact(alias) in page_text for alias in aliases):
-                generic = {"CG", "GAME", "IMAGE", "SCREENSHOT", "OFFICIAL", "公式", "公式サイト", "官方网站", "画像", "画像公開"}
+                generic = {"CG", "GAME", "IMAGE", "SCREENSHOT", "OFFICIAL", "GALLERY", "公式", "公式サイト", "官方网站", "画像", "画像一覧", "画像公開", "ギャラリー", "ゲーム", "作品", "トップ", "ニュース", "新着"}
                 other = [token for token in title_tokens if token.casefold() not in {word.casefold() for word in generic}]
                 if other:
                     conflicts.extend(other)

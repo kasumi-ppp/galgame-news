@@ -24,6 +24,7 @@ class SourceTrustPolicy:
         "media-amazon.com", "images-na.ssl-images-amazon.com", "kun", "kunimg.com",
     }
     _trusted_db = {"vndb.org", "vndb.net", "vgmdb.net"}
+    _aggregators = {"fandom.com", "wikipedia.org", "myanimelist.net", "bangumi.tv", "game8.jp"}
 
     @staticmethod
     def _host(url: str) -> str:
@@ -58,6 +59,8 @@ class SourceTrustPolicy:
             return SourceTrustResult(tier, 0.18, False, True)
         if self._is_host_or_subdomain(host, self._trusted_db):
             return SourceTrustResult("trusted_database", 0.42, False, True)
+        if self._is_host_or_subdomain(host, self._aggregators):
+            return SourceTrustResult("aggregator", 0.12, False, True)
         if host.startswith(("cdn.", "static.", "images.", "img.", "media.")) or image_host != host:
             return SourceTrustResult("image_proxy", 0.25, False, True)
         if host:

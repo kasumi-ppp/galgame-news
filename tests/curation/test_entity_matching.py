@@ -175,6 +175,16 @@ def test_source_policy_marks_kun_related_proxy_low_trust():
     assert result.is_official is False
 
 
+def test_source_policy_classifies_aggregator_as_low_trust():
+    candidate = make_candidate(
+        "https://fandom.com/wiki/File:game.jpg",
+        source_url="https://fandom.com/wiki/Other_Game",
+    )
+    result = SourceTrustPolicy().classify(candidate)
+    assert result.tier == "aggregator"
+    assert result.is_official is False
+
+
 def test_brand_page_without_specific_game_evidence_requires_review():
     from galgame_news.curation.curator import ImageCurator
     from galgame_news.domain import ImageNeed, Issue

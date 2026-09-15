@@ -124,6 +124,23 @@ class OfficialHtmlAdapter:
                 return CollectionResult(manual_review_reasons=[ReviewReason.AGE_GATE])
             urls: list[str] = []
             thumbnail_values: set[str] = set()
+            page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
+            if not page_title:
+                for meta in soup.find_all("meta"):
+                    key = (meta.get("property") or meta.get("name") or "").casefold()
+                    if key in {"og:title", "twitter:title"} and meta.get("content"):
+                        page_title = str(meta["content"]).strip()
+                        break
+            image_context: dict[str, list[str]] = {}
+
+            def remember_context(raw_url: str, tag) -> None:
+                if not isinstance(raw_url, str):
+                    return
+                normalized = _upgrade_image_url(urljoin(page_url, raw_url))
+                alt = str(tag.get("alt") or "").strip()
+                if normalized and alt:
+                    image_context.setdefault(normalized, []).append(alt)
+
             for anchor in soup.find_all("a", href=True):
                 href = anchor["href"]
                 if _looks_like_image_url(href) or (anchor.find("img") is not None and any(token in urlsplit(href).path.casefold() for token in ("gallery", "cg", "image", "media"))):
@@ -132,13 +149,17 @@ class OfficialHtmlAdapter:
                         for attr in ("src", "data-src", "data-lazy-src", "data-original"):
                             if image.get(attr):
                                 thumbnail_values.add(image[attr])
+                                remember_context(image[attr], image)
             for tag in soup.find_all("meta"):
                 key = (tag.get("property") or tag.get("name") or "").casefold()
                 if key in {"og:image", "og:image:url", "twitter:image", "twitter:image:src"} and tag.get("content"):
                     urls.append(tag["content"])
             for tag in soup.find_all("img"):
                 for attr in ("data-original", "data-full", "data-large", "data-hires", "data-zoom-image", "src", "data-src", "data-lazy-src"):
-                    if tag.get(attr) and tag[attr] not in thumbnail_values: urls.append(tag[attr])
+                    if tag.get(attr):
+                        remember_context(tag[attr], tag)
+                        if tag[attr] not in thumbnail_values:
+                            urls.append(tag[attr])
                 if tag.get("srcset"):
                     largest = _srcset_largest(tag["srcset"])
                     if largest: urls.append(largest)
@@ -184,6 +205,10 @@ class OfficialHtmlAdapter:
                     continue
                 seen.add(image_url)
                 candidate = _candidate(news_item, image_url, source_ref, context)
+                if page_title:
+                    candidate.signals["page_title"] = page_title
+                if image_context.get(image_url):
+                    candidate.signals["alt"] = " ".join(dict.fromkeys(image_context[image_url]))
                 if _image_priority(image_url) <= 1 or "/gallery" in urlsplit(source_ref.url).path.casefold():
                     candidate.signals["cg_match"] = 1.0
                 candidates.append(candidate)
