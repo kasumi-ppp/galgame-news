@@ -67,6 +67,9 @@ def test_short_name_requires_context():
     assert EntityMatcher().match(news, no_context).matched is None
     assert EntityMatcher().match(news, strong_context).matched is True
 
+    official_without_context = make_candidate("https://publisher.example/one-cg01.jpg", source_type=SourceType.OFFICIAL_SITE)
+    assert EntityMatcher().match(news, official_without_context).matched is None
+
 
 def test_same_official_domain_is_high_confidence():
     news = make_news(source_urls=["https://publisher.example/mono/news/cg"])
@@ -91,6 +94,19 @@ def test_steam_app_id_mismatch_is_a_conflict():
     result = EntityMatcher().match(news, candidate)
     assert result.matched is False
     assert result.conflicting_entities
+
+
+def test_matching_steam_app_id_is_strong_entity_evidence():
+    news = make_news(source_urls=["https://store.steampowered.com/app/123456/Mono/"])
+    candidate = make_candidate(
+        "https://cdn.steamstatic.com/steam/apps/123456/header.jpg",
+        source_url="https://steamcommunity.com/app/123456/",
+        source_type=SourceType.STEAM,
+    )
+    result = EntityMatcher().match(news, candidate)
+    assert result.matched is True
+    assert result.confidence >= 0.8
+    assert "steam_app_id_match" in result.supporting_signals
 
 
 def test_third_party_without_entity_evidence_is_unverified():

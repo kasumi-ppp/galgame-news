@@ -71,7 +71,7 @@ class SearchConfig(_ConfigModel):
 DEFAULT_REJECTED_IMAGE_TYPES = {
     "cg": ["cover", "goods", "logo", "banner", "ui", "photo", "character_art", "announcement_art"],
     "announcement": ["logo", "banner", "ui", "photo", "goods", "cover"],
-    "goods": ["logo", "banner", "ui", "photo"],
+    "goods": ["logo", "banner", "ui", "photo", "game_cg", "gameplay_screenshot", "key_visual", "character_art", "cover"],
     "release": ["logo", "banner", "ui", "goods", "photo"],
     "generic": ["logo", "banner", "ui"],
     "unknown": ["logo", "banner", "ui"],

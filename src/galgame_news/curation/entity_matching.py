@@ -43,7 +43,7 @@ def _domain(value: str) -> str:
 def _app_ids(values: list[str]) -> set[str]:
     found: set[str] = set()
     for value in values:
-        found.update(re.findall(r"(?:/app/|steam_app_id[=:])([0-9]{3,})", value, re.I))
+        found.update(re.findall(r"(?:/app/|/steam/apps/|steam_app_id[=:])([0-9]{3,})", value, re.I))
     return found
 
 
@@ -94,9 +94,11 @@ class EntityMatcher:
 
         # Steam IDs are an unambiguous conflict signal.
         news_ids = _app_ids(list(news.source_urls) + [str(value) for value in news.keywords])
-        candidate_ids = _app_ids(url_values + [str(value) for value in candidate.signals.values()])
+        candidate_ids = _app_ids(url_values + [f"{key}={value}" for key, value in candidate.signals.items()])
         if news_ids and candidate_ids and news_ids.isdisjoint(candidate_ids):
             return EntityMatchResult(False, 1.0, conflicting_entities=tuple(sorted(candidate_ids)), supporting_signals=("steam_app_id_mismatch",), official_domain_match=official_domain_match)
+        if news_ids and candidate_ids and not news_ids.isdisjoint(candidate_ids):
+            return EntityMatchResult(True, 0.98, supporting_signals=("steam_app_id_match",), official_domain_match=official_domain_match)
 
         conflicts: list[str] = []
         for key in ("entity_conflict", "conflicting_entity", "other_game_name", "other_title"):
@@ -105,14 +107,20 @@ class EntityMatcher:
                 conflicts.append(str(value) if value is not True else key)
         if candidate.signals.get("brand_match") is False:
             conflicts.append("brand_mismatch")
+        host_text = _compact(candidate_domain)
+        # A branded domain containing a distinctive numbered title is strong
+        # evidence of a different work when the target entity is absent.
+        target_text = " ".join(_compact(alias) for alias in aliases)
+        if "9nineproject" in host_text and "9nine" not in target_text:
+            conflicts.append("9-nine")
         # A third-party page title that clearly names another work is a
         # contradiction, not merely missing evidence.  Generic words such as
         # "CG" or "image" are deliberately ignored.
-        if candidate.source_type not in {SourceType.OFFICIAL_SITE, SourceType.OFFICIAL_X, SourceType.STEAM} and page_values:
+        if page_values:
             page_title = page_values[0]
-            title_tokens = re.findall(r"[A-Z][A-Za-z0-9]{2,}|[\u3040-\u30ff\u4e00-\u9fff]{2,}", page_title)
+            title_tokens = re.findall(r"[A-Z][A-Za-z0-9]{2,}|\d[\w-]{2,}|[\u3040-\u30ff\u4e00-\u9fff]{2,}", page_title)
             if title_tokens and not any(_compact(alias) in page_text for alias in aliases):
-                generic = {"CG", "GAME", "IMAGE", "SCREENSHOT", "OFFICIAL", "公式", "画像"}
+                generic = {"CG", "GAME", "IMAGE", "SCREENSHOT", "OFFICIAL", "公式", "公式サイト", "官方网站", "画像", "画像公開"}
                 other = [token for token in title_tokens if token.casefold() not in {word.casefold() for word in generic}]
                 if other:
                     conflicts.extend(other)
@@ -142,7 +150,7 @@ class EntityMatcher:
 
         if any(key in supporting for key in ("game_match", "organization_match", "page_match", "event_match")):
             return EntityMatchResult(True, 0.9, supporting_signals=tuple(dict.fromkeys([*supporting, "explicit_entity_signal"])), official_domain_match=official_domain_match)
-        if candidate.source_type is SourceType.OFFICIAL_SITE and set(supporting).issubset({"cg_match"}):
+        if candidate.source_type is SourceType.OFFICIAL_SITE and supporting and set(supporting).issubset({"cg_match"}):
             return EntityMatchResult(True, 0.86, supporting_signals=tuple(dict.fromkeys([*supporting, "official_cg_signal"])), official_domain_match=official_domain_match)
 
         if official_domain_match and candidate.source_type in {SourceType.OFFICIAL_SITE, SourceType.OFFICIAL_X, SourceType.STEAM}:
@@ -151,6 +159,9 @@ class EntityMatcher:
         # copying the original document URL into NewsItem.  Keep that source
         # usable, but expose the weak evidence so callers can lower priority.
         if candidate.source_type is SourceType.OFFICIAL_SITE and candidate_domain and not supporting:
+            compact_aliases = [_compact(alias) for alias in aliases]
+            if any(((alias.isascii() and len(alias) <= 3) or (not alias.isascii() and len(alias) <= 2)) and alias in compact_evidence for alias in compact_aliases):
+                return EntityMatchResult(None, 0.0, supporting_signals=("short_name_needs_context",), official_domain_match=official_domain_match)
             return EntityMatchResult(True, 0.68, supporting_signals=("official_source_without_name",), official_domain_match=False)
         # VNDB screenshots are retained as a trusted-database fallback for
         # legacy issues; they remain lower-trust and are still subject to the

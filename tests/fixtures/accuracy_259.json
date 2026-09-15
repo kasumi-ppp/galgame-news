@@ -1,0 +1,79 @@
+{
+  "issue_id": "259",
+  "news": [
+    {
+      "key": "yuriarashi",
+      "title": "《女装百合嵐》体验版公开",
+      "game_names": ["女装百合嵐"],
+      "source_urls": ["https://no-strike.jp/yuriarashi/"],
+      "candidates": [
+        {"url": "https://no-strike.jp/yuriarashi/gallery/cg01.jpg", "source_url": "https://no-strike.jp/yuriarashi/", "source_type": "official_site", "signals": {"page_title": "女装百合嵐 CG"}},
+        {"url": "https://no-strike.jp/yuriarashi/character/chara01.png", "source_url": "https://no-strike.jp/yuriarashi/", "source_type": "official_site", "signals": {"page_title": "女装百合嵐 character"}},
+        {"url": "https://no-strike.jp/other-game/gallery/cg01.jpg", "source_url": "https://no-strike.jp/other-game/", "source_type": "official_site", "signals": {"page_title": "Other Game CG"}}
+      ]
+    },
+    {
+      "key": "phantom",
+      "title": "《PHANTOM OF INFERNO》新图",
+      "game_names": ["PHANTOM OF INFERNO", "ファントム オブ インフェルノ"],
+      "source_urls": ["https://nitro-origin.com/news/phantom"],
+      "candidates": [
+        {"url": "https://nitro-origin.com/news/images/Phantom_steam_KV.jpg", "source_url": "https://nitro-origin.com/news/phantom", "source_type": "official_site", "signals": {"page_title": "PHANTOM OF INFERNO"}},
+        {"url": "https://static0.cbrimages.com/phantom-screenshot.jpg", "source_url": "https://cbrimages.com/anime/phantom", "source_type": "unverified", "signals": {"page_title": "PHANTOM anime screenshot"}},
+        {"url": "https://static0.cbrimages.com/phantom-anime-cover-art.jpg", "source_url": "https://cbrimages.com/anime/phantom", "source_type": "unverified", "signals": {"page_title": "PHANTOM anime cover art"}}
+      ]
+    },
+    {
+      "key": "ousama",
+      "title": "《王様恋愛》咖啡厅联动",
+      "game_names": ["王様恋愛"],
+      "source_urls": ["https://example-official.jp/ousama/"],
+      "candidates": [
+        {"url": "https://www.melonbooks.co.jp/user_data/packages/responsive/img/pic/now_printing.jpeg", "source_url": "https://www.melonbooks.co.jp/event/ousama", "source_type": "unverified"},
+        {"url": "https://example-official.jp/ousama/cafe-goods01.jpg", "source_url": "https://example-official.jp/ousama/", "source_type": "official_site", "signals": {"page_title": "王様恋愛 cafe goods"}}
+      ]
+    },
+    {
+      "key": "rainneko",
+      "title": "RainNeko手办发售",
+      "game_names": ["RainNeko"],
+      "source_urls": ["https://rainneko.example/figure/"],
+      "candidates": [
+        {"url": "https://rainneko.example/figure/rainneko-figure.jpg", "source_url": "https://rainneko.example/figure/", "source_type": "official_site", "signals": {"page_title": "RainNeko figure goods"}},
+        {"url": "https://entergram.co.jp/oldgame/gallery/cg01.jpg", "source_url": "https://entergram.co.jp/oldgame/gallery", "source_type": "official_site", "signals": {"page_title": "Other Game old goods"}},
+        {"url": "https://entergram.co.jp/oldgame/keyvisual_main.jpg", "source_url": "https://entergram.co.jp/oldgame/", "source_type": "official_site"}
+      ]
+    },
+    {
+      "key": "nekopara",
+      "title": "《ネコぱら》手办公开",
+      "game_names": ["ネコぱら", "NEKOPARA"],
+      "source_urls": ["https://nekopara.example/figure/"],
+      "candidates": [
+        {"url": "https://nekopara.example/figure/nekopara-figure.jpg", "source_url": "https://nekopara.example/figure/", "source_type": "official_site", "signals": {"page_title": "ネコぱら figure goods"}},
+        {"url": "https://nekoconne.com/assets/other-keyvisual.jpg", "source_url": "https://nekoconne.com/other-game/", "source_type": "official_site", "signals": {"page_title": "Other Game key visual"}}
+      ]
+    },
+    {
+      "key": "cuffs",
+      "title": "CUFFS活动商品公开",
+      "game_names": ["CUFFS"],
+      "source_urls": ["https://cuffs.example/event/"],
+      "candidates": [
+        {"url": "https://cuffs.example/event/goods01.jpg", "source_url": "https://cuffs.example/event/", "source_type": "official_site", "signals": {"page_title": "CUFFS event goods"}},
+        {"url": "https://cuffs.example/event/goods02.jpg", "source_url": "https://cuffs.example/event/", "source_type": "official_site", "signals": {"page_title": "CUFFS event goods"}},
+        {"url": "https://cuffs.example/event/goods03.jpg", "source_url": "https://cuffs.example/event/", "source_type": "official_site", "signals": {"page_title": "CUFFS event goods"}}
+      ],
+      "expand_candidates": 58
+    },
+    {
+      "key": "happy-weekend",
+      "title": "《Happy Weekend》主机板制作完成",
+      "game_names": ["Happy Weekend"],
+      "source_urls": ["https://int-creative.com/air/weekend/"],
+      "candidates": [
+        {"url": "https://int-creative.com/air/weekend/gallery/celebration01.jpg", "source_url": "https://int-creative.com/air/weekend/", "source_type": "official_site", "signals": {"page_title": "Happy Weekend celebration"}}
+      ]
+    }
+  ]
+}
