@@ -60,9 +60,8 @@ class EntityMatcher:
         aliases = [str(name) for name in news.game_names if str(name).strip()]
         # A title often contains the canonical game name even when an older
         # parser did not populate game_names.
-        if not aliases:
-            aliases.extend(re.findall(r"《([^》]+)》|\[([^\]]+)\]", news.title))
-            aliases = [next((part for part in pair if part), "") for pair in aliases]
+        title_aliases = re.findall(r"《([^》]+)》|\[([^\]]+)\]", news.title)
+        aliases.extend(next((part for part in pair if part), "") for pair in title_aliases)
         aliases = list(dict.fromkeys(name for name in aliases if name))
 
         url_values = [candidate.image_url, candidate.source_url]

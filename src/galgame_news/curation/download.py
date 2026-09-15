@@ -84,6 +84,10 @@ class ImageDownloader:
                 status = int(getattr(response, "status_code", 200))
                 if status < 200 or status >= 300:
                     return None, self._failure(candidate, "http_error", f"image request returned HTTP {status}", status >= 500 or status in {408, 429}), None
+                final_response_url = str(getattr(response, "url", candidate.image_url) or candidate.image_url)
+                redirected = candidate.model_copy(update={"image_url": final_response_url})
+                if placeholder_asset_reason(redirected):
+                    return None, self._failure(candidate, "placeholder_image", "redirected URL is a placeholder asset", False), None
                 data = getattr(response, "content", b"") or b""
                 declared_mime = getattr(response, "headers", {}).get("content-type")
                 validation = self.validator.validate(data, declared_mime)
@@ -96,7 +100,7 @@ class ImageDownloader:
                 candidate.mime_type, candidate.byte_size = validation.mime_type, len(data)
                 candidate.sha256, candidate.perceptual_hash = hashlib.sha256(data).hexdigest(), _perceptual_hash(data)
                 candidate.local_path, candidate.downloadable = str(target), True
-                return candidate, None, str(getattr(response, "url", candidate.image_url) or candidate.image_url)
+                return candidate, None, final_response_url
             except Exception as exc:
                 return None, self._failure(candidate, "download_error", str(exc), True), None
 

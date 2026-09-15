@@ -56,6 +56,18 @@ def test_entity_matching_accepts_alias_from_game_names():
     assert "モノクロームセレナーデ" in result.matched_entities
 
 
+def test_entity_matching_uses_quoted_title_when_game_names_are_missing():
+    news = make_news(game_names=[],)
+    news.title = "《Example Game》CG更新"
+    candidate = make_candidate(
+        "https://cdn.example/example-game-cg01.jpg",
+        signals={"page_title": "Example Game CG"},
+    )
+    result = EntityMatcher().match(news, candidate)
+    assert result.matched is True
+    assert result.matched_entities
+
+
 def test_short_name_requires_context():
     news = make_news(game_names=["ONE"])
     no_context = make_candidate("https://cdn.example/one-cg01.jpg")
@@ -161,6 +173,23 @@ def test_source_policy_marks_kun_related_proxy_low_trust():
     result = SourceTrustPolicy().classify(candidate)
     assert result.tier in {"image_proxy", "third_party_news"}
     assert result.is_official is False
+
+
+def test_brand_page_without_specific_game_evidence_requires_review():
+    from galgame_news.curation.curator import ImageCurator
+    from galgame_news.domain import ImageNeed, Issue
+
+    news = make_news(source_urls=["https://publisher.example/company/about"])
+    candidate = make_candidate(
+        "https://publisher.example/company/brand-visual.jpg",
+        source_url="https://publisher.example/company/about",
+        source_type=SourceType.OFFICIAL_SITE,
+    )
+    candidate.news_id = news.id
+    result = ImageCurator().curate(Issue(issue_id="259", input_path="fixture.docx", news_items=[news]), [candidate])
+    assert candidate.signals["source_tier"] == "official_brand_page"
+    assert candidate.selected is False
+    assert "uncertain_match" in {reason.value for reason in candidate.review_reasons}
 
 
 def test_conflicting_game_name_is_rejected():

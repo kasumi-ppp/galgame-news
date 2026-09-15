@@ -79,3 +79,17 @@ def test_placeholder_asset_is_rejected_before_transport(tmp_path):
     assert accepted == []
     assert calls == []
     assert failures[0].code == "placeholder_image"
+
+
+def test_placeholder_redirect_is_rejected_after_transport(tmp_path):
+    from galgame_news.curation.download import ImageDownloader
+    from tests.curation.test_curation import jpeg_bytes
+
+    def transport(url, **_):
+        return type("Response", (), {"content": jpeg_bytes((800, 600)), "headers": {"content-type": "image/jpeg"}, "status_code": 200, "url": "https://official.example/assets/placeholder.jpg"})()
+
+    value = candidate(2, ImageType.GAME_CG)
+    value.image_url = "https://official.example/assets/redirect.jpg"
+    accepted, failures = ImageDownloader(load_config(), transport=transport).download([value], tmp_path)
+    assert accepted == []
+    assert any(failure.code == "placeholder_image" for failure in failures)

@@ -90,7 +90,13 @@ class ImageCurator:
                         if ReviewReason.UNCERTAIN_MATCH not in candidate.review_reasons:
                             candidate.review_reasons.append(ReviewReason.UNCERTAIN_MATCH)
                         failures.append(FailureRecord(stage=FailureStage.CURATE, news_id=candidate.news_id, candidate_id=candidate.id, code="entity_unverified", message="candidate lacks sufficient game/entity context", source_url=candidate.image_url, retryable=False))
-                    elif not source_result.is_official and match.confidence < 0.8:
+                    elif (
+                        (not source_result.is_official and match.confidence < 0.8)
+                        or (
+                            source_result.tier in {"official_brand_page", "official_store"}
+                            and not any(signal in match.supporting_signals for signal in ("entity_name_in_context", "page_context", "steam_app_id_match", "explicit_entity_signal"))
+                        )
+                    ):
                         candidate.signals["auto_select"] = False
                         if ReviewReason.UNCERTAIN_MATCH not in candidate.review_reasons:
                             candidate.review_reasons.append(ReviewReason.UNCERTAIN_MATCH)
