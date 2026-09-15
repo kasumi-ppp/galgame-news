@@ -1,0 +1,38 @@
+{
+  "news": {
+    "title": "《Example Game》新CG公开",
+    "body": "官方公开了游戏截图和新CG。"
+  },
+  "candidates": [
+    {
+      "image_url": "https://store.akamai.steamstatic.com/public/shared/images/responsive/steam_share_image.jpg",
+      "source_url": "https://store.steampowered.com/app/1/example/",
+      "source_type": "steam"
+    },
+    {
+      "image_url": "https://t.vndb.org/screenshots/ss_01.jpg",
+      "source_url": "https://vndb.org/v1/screenshots",
+      "source_type": "unverified"
+    },
+    {
+      "image_url": "https://smee.jp/example/keyvisual_main.jpg",
+      "source_url": "https://smee.jp/example/news/cg",
+      "source_type": "official_site"
+    },
+    {
+      "image_url": "https://official.example/shop/goods_tapestry.jpg",
+      "source_url": "https://official.example/shop/product",
+      "source_type": "official_site"
+    },
+    {
+      "image_url": "https://official.example/assets/logo.png",
+      "source_url": "https://official.example/news/cg",
+      "source_type": "official_site"
+    },
+    {
+      "image_url": "https://official.example/assets/bnr_main.jpg",
+      "source_url": "https://official.example/news/cg",
+      "source_type": "official_site"
+    }
+  ]
+}

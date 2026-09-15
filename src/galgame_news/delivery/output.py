@@ -86,21 +86,22 @@ class OutputManager:
                 shutil.copyfile(source_path, target)
             candidate.local_path = str(target)
             files.append(str(target.relative_to(root)))
-        for candidate in result.candidates:
+        all_candidates = result.all_candidates
+        for candidate in all_candidates:
             if not candidate.selected:
                 candidate.local_path = None
-        candidate_payload = [candidate.model_dump(mode="json") for candidate in result.candidates]
+        candidate_payload = [candidate.model_dump(mode="json") for candidate in all_candidates]
         news_payload = []
         for item in result.issue.news_items:
-            related = [candidate for candidate in result.candidates if candidate.news_id == item.id]
+            related = [candidate for candidate in all_candidates if candidate.news_id == item.id]
             status = "selected" if any(c.selected for c in related) else ("failed" if any(f.news_id == item.id for f in result.failures) else ("no_candidate" if not related else "not_selected"))
             news_payload.append({"news_id": item.id, "sequence": item.sequence, "section": self._section_label(item), "title": item.title, "status": status, "candidates": [c.id for c in related]})
         index = {"schema_version": 1, "issue_id": result.issue.issue_id, "news_items": news_payload, "candidates": candidate_payload, "failures": [failure.model_dump(mode="json") for failure in result.failures]}
         self._atomic_json(root / "image_index.json", index)
         self._atomic_json(root / "failed_items.json", [failure.model_dump(mode="json") for failure in result.failures])
-        reviews = result.review_required or [c for c in result.candidates if c.review_reasons]
+        reviews = result.review_required or [c for c in all_candidates if c.review_reasons]
         self._atomic_json(root / "review_required.json", [candidate.model_dump(mode="json") for candidate in reviews])
-        lines = [f"# Issue {result.issue.issue_id}", "", f"候选图片：{len(result.candidates)} 张", ""]
+        lines = [f"# Issue {result.issue.issue_id}", "", f"候选图片：{len(all_candidates)} 张", ""]
         for item in news_payload:
             lines.append(f"- {item['sequence']}. {item['title']} — {item['status']} ({len(item['candidates'])} candidates)")
         (root / "image_index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

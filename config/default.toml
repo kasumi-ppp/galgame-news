@@ -28,3 +28,13 @@ minimum_score = 0.0
 max_results = 10
 same_domain_depth = 1
 max_candidates_per_source = 500
+
+[image_types]
+banner_aspect_ratio = 3.0
+character_aspect_ratio = 1.8
+scene_aspect_ratio = 1.15
+minimum_gallery_group_size = 2
+minimum_type_confidence = 0.6
+unknown_requires_review = true
+fallback_penalty = 0.25
+rejected_image_types_by_requirement = { cg = ["cover", "goods", "logo", "banner", "ui", "photo", "character_art", "announcement_art"], announcement = ["logo", "banner", "ui", "photo", "goods", "cover"], goods = ["logo", "banner", "ui", "photo"], release = ["logo", "banner", "ui", "goods", "photo"], generic = ["logo", "banner", "ui"], unknown = ["logo", "banner", "ui"] }

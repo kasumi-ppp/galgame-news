@@ -41,6 +41,21 @@ class SourceType(_StringEnum):
     UNKNOWN = "unknown"
 
 
+class ImageType(_StringEnum):
+    GAME_CG = "game_cg"
+    GAMEPLAY_SCREENSHOT = "gameplay_screenshot"
+    KEY_VISUAL = "key_visual"
+    CHARACTER_ART = "character_art"
+    COVER = "cover"
+    ANNOUNCEMENT_ART = "announcement_art"
+    GOODS = "goods"
+    LOGO = "logo"
+    BANNER = "banner"
+    UI = "ui"
+    PHOTO = "photo"
+    UNKNOWN = "unknown"
+
+
 class ImageNeed(_StringEnum):
     EXPLICIT_NEW_IMAGE = "explicit_new_image"
     EVENT_IMAGE = "event_image"
@@ -69,6 +84,7 @@ class ReviewReason(_StringEnum):
     FALLBACK_OLD_MATERIAL = "fallback_old_material"
     HISTORICAL_DUPLICATE = "historical_duplicate"
     ADULT_OR_UNKNOWN = "adult_or_unknown"
+    IMAGE_TYPE_REVIEW = "image_type_review"
 
 
 class FailureStage(_StringEnum):
@@ -183,6 +199,7 @@ class ScoreBreakdown(ContractModel):
     quality: float = Field(ge=0.0, le=1.0)
     duplicate_penalty: float = Field(default=0.0, ge=0.0, le=1.0)
     risk_penalty: float = Field(default=0.0, ge=0.0, le=1.0)
+    type_match: float = Field(default=0.0, ge=0.0, le=1.0)
     total: float = Field(ge=0.0, le=100.0)
 
 
@@ -192,6 +209,8 @@ class ImageCandidate(ContractModel):
     image_url: str = Field(min_length=1)
     source_url: str = Field(min_length=1)
     source_type: SourceType = SourceType.UNKNOWN
+    image_type: ImageType = ImageType.UNKNOWN
+    image_type_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     published_at: datetime | None = None
     fetched_at: datetime
     width: int | None = Field(default=None, ge=1)
@@ -271,6 +290,7 @@ class NewsResult(ContractModel):
 
 class CurationResult(ContractModel):
     candidates: list[ImageCandidate] = Field(default_factory=list)
+    filtered_candidates: list[ImageCandidate] = Field(default_factory=list)
     failures: list[FailureRecord] = Field(default_factory=list)
     selection_shortfall: int = Field(default=0, ge=0)
 
@@ -279,8 +299,13 @@ class PipelineResult(ContractModel):
     schema_version: Literal[1] = Field(default=1, frozen=True)
     issue: Issue
     candidates: list[ImageCandidate] = Field(default_factory=list)
+    filtered_candidates: list[ImageCandidate] = Field(default_factory=list)
     failures: list[FailureRecord] = Field(default_factory=list)
     review_required: list[ImageCandidate] = Field(default_factory=list)
+
+    @property
+    def all_candidates(self) -> list[ImageCandidate]:
+        return [*self.candidates, *self.filtered_candidates]
 
 
 class OutputManifest(ContractModel):

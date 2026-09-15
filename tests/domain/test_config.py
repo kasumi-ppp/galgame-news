@@ -12,6 +12,8 @@ def test_load_config_reads_repository_defaults():
     assert config.filters.min_width == 300
     assert config.selection.max_images == 20
     assert config.search.max_candidates_per_source >= 100
+    assert config.image_types.scene_aspect_ratio > 1.0
+    assert config.image_types.minimum_gallery_group_size >= 2
 
 
 def test_config_rejects_weights_that_do_not_sum_to_one(tmp_path: Path):

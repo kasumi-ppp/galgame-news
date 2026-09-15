@@ -100,8 +100,8 @@ class Application:
                 selected = [candidate for candidate in curated.candidates if candidate.news_id == news_id and candidate.selected]
                 for candidate in selected[self.max_images:]:
                     candidate.selected = False
-        result = PipelineResult(issue=issue, candidates=curated.candidates, failures=failures)
-        result.review_required = [candidate for candidate in result.candidates if candidate.review_reasons]
+        result = PipelineResult(issue=issue, candidates=curated.candidates, filtered_candidates=curated.filtered_candidates, failures=failures)
+        result.review_required = [candidate for candidate in result.all_candidates if candidate.review_reasons]
         if self.history is not None:
             from .domain import NewsResult
             for news in issue.news_items:

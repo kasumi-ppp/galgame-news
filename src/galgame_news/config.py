@@ -61,12 +61,36 @@ class SearchConfig(_ConfigModel):
     max_candidates_per_source: int = Field(ge=20, le=2000)
 
 
+DEFAULT_REJECTED_IMAGE_TYPES = {
+    "cg": ["cover", "goods", "logo", "banner", "ui", "photo", "character_art", "announcement_art"],
+    "announcement": ["logo", "banner", "ui", "photo", "goods", "cover"],
+    "goods": ["logo", "banner", "ui", "photo"],
+    "release": ["logo", "banner", "ui", "goods", "photo"],
+    "generic": ["logo", "banner", "ui"],
+    "unknown": ["logo", "banner", "ui"],
+}
+
+
+class ImageTypeConfig(_ConfigModel):
+    banner_aspect_ratio: float = Field(default=3.0, gt=1.0)
+    character_aspect_ratio: float = Field(default=1.8, gt=1.0)
+    scene_aspect_ratio: float = Field(default=1.15, gt=1.0)
+    minimum_gallery_group_size: int = Field(default=2, ge=2)
+    minimum_type_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    unknown_requires_review: bool = True
+    fallback_penalty: float = Field(default=0.25, ge=0.0, le=1.0)
+    rejected_image_types_by_requirement: dict[str, list[str]] = Field(
+        default_factory=lambda: copy.deepcopy(DEFAULT_REJECTED_IMAGE_TYPES)
+    )
+
+
 class PrescanConfig(_ConfigModel):
     scoring: ScoringConfig
     filters: FilterConfig
     network: NetworkConfig
     selection: SelectionConfig
     search: SearchConfig
+    image_types: ImageTypeConfig = Field(default_factory=ImageTypeConfig)
 
 
 def _merge(base: dict, override: dict) -> dict:
