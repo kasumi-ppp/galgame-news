@@ -124,7 +124,7 @@ def test_curator_default_does_not_truncate_a_news_item_to_three_candidates():
     from galgame_news.domain import Issue
 
     item = news("n1")
-    values = [candidate(f"https://cdn/{index}.jpg", news_id=item.id, signals={"game_match": 1.0}) for index in range(8)]
+    values = [candidate(f"https://official.example/gallery/cg{index}.jpg", news_id=item.id, signals={"game_match": 1.0}) for index in range(8)]
     result = ImageCurator().curate(Issue(issue_id="259", input_path="259.docx", news_items=[item]), values)
     assert sum(value.selected for value in result.candidates) == 8
 

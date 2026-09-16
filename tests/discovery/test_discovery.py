@@ -95,7 +95,7 @@ def test_wix_transformed_thumbnail_is_upgraded_to_original_media_url():
     transformed = "https://static.wixstatic.com/media/abc123~mv2.png/v1/fill/w_485,h_273,q_90/abc123~mv2.png"
     html = f"<img src=\"{transformed}\">"
     adapter = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url))
-    result = adapter.collect(item(), SourceRef(url="https://reterial.wixsite.com/gallery", domain="reterial.wixsite.com", source_type=SourceType.OFFICIAL_SITE), CollectionContext())
+    result = adapter.collect(item(), SourceRef(url="https://official.example/wix-gallery", domain="official.example", source_type=SourceType.OFFICIAL_SITE), CollectionContext())
     assert result.candidates[0].image_url == "https://static.wixstatic.com/media/abc123~mv2.png"
 
 
@@ -239,8 +239,11 @@ def test_ddgs_provider_accepts_current_href_and_body_field_names():
     assert result[0].source_type is SourceType.UNVERIFIED
 
 
-def test_wix_embedded_dynamic_data_yields_original_media_images():
+def test_wix_embedded_dynamic_data_yields_original_media_images(monkeypatch):
     from galgame_news.discovery.adapters import OfficialHtmlAdapter
+    import socket
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [(socket.AF_INET, 0, 0, "", ("8.8.8.8", 0))])
 
     html = r'''<script id="wix-warmup-data" type="application/json">{"gallery":{"items":[{"src":"https:\/\/static.wixstatic.com\/media\/one~mv2.jpg\/v1\/fill\/w_400,h_200\/one.jpg"},{"src":"wix:image://v1/two~mv2.png/two.png#originWidth=1600&originHeight=900"}]}}</script>'''
     adapter = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url))
@@ -275,8 +278,11 @@ def test_x_public_metadata_rejects_avatar_and_accepts_only_post_media_paths():
     }
 
 
-def test_wix_pseudo_quality_url_is_ignored_when_original_media_exists():
+def test_wix_pseudo_quality_url_is_ignored_when_original_media_exists(monkeypatch):
     from galgame_news.discovery.adapters import OfficialHtmlAdapter
+    import socket
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: [(socket.AF_INET, 0, 0, "", ("8.8.8.8", 0))])
     html = '''<img src="https://site.wixsite.com/q_90/image.jpg"><img src="https://static.wixstatic.com/media/abc~mv2.jpg/v1/fill/w_400,h_300,q_90/abc.jpg">'''
     adapter = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url))
     result = adapter.collect(item(), SourceRef(url="https://site.wixsite.com/gallery", domain="site.wixsite.com", source_type=SourceType.OFFICIAL_SITE), CollectionContext())
