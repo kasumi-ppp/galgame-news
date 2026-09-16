@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import json
 
-from galgame_news.domain import ImageCandidate, ImageNeed, ImageNeed, Issue, NewsItem, PipelineResult, SourceType
+from galgame_news.domain import ImageCandidate, ImageNeed, ImageType, Issue, NewsItem, PipelineResult, ScoreBreakdown, SourceType
 
 
 def test_output_manager_writes_indexes_and_news_mapping(tmp_path):
@@ -120,3 +120,115 @@ def test_output_redacts_signed_url_credentials_from_json_indexes(tmp_path):
         assert "X-Amz-Signature" not in text
         assert "EXAMPLEACCESS" not in text
         assert "safe=value" in text
+
+
+def _score(relevance: float, total: float) -> ScoreBreakdown:
+    return ScoreBreakdown(
+        relevance=relevance,
+        freshness=0.5,
+        source_trust=0.8,
+        quality=0.9,
+        type_match=0.9,
+        total=total,
+    )
+
+
+def test_output_exports_reviewable_failures_with_cg_first_then_similarity(tmp_path):
+    from galgame_news.delivery.output import OutputManager
+
+    item = NewsItem(issue_id="1", sequence=1, section="新作", title="《Game》更新", body="")
+    issue = Issue(issue_id="1", input_path="fixture.docx", news_items=[item])
+
+    def candidate(name, image_type, *, relevance, total, width=1280, height=720, selected=False):
+        source = tmp_path / f"{name}.jpg"
+        source.write_bytes(name.encode("ascii"))
+        return ImageCandidate(
+            news_id=item.id,
+            image_url=f"https://cdn.example/{name}.jpg",
+            source_url="https://official.example/game",
+            source_type=SourceType.OFFICIAL_SITE,
+            image_type=image_type,
+            image_type_confidence=0.9,
+            fetched_at=datetime.now(timezone.utc),
+            width=width,
+            height=height,
+            mime_type="image/jpeg",
+            downloadable=True,
+            local_path=str(source),
+            score=_score(relevance, total),
+            selected=selected,
+            signals={"entity_match": True, "entity_match_confidence": 0.95},
+        )
+
+    selected = candidate("selected", ImageType.GAME_CG, relevance=1.0, total=99, selected=True)
+    cg_lower = candidate("cg-lower", ImageType.GAME_CG, relevance=0.70, total=70)
+    screenshot = candidate("screenshot", ImageType.GAMEPLAY_SCREENSHOT, relevance=0.99, total=98)
+    cg_higher = candidate("cg-higher", ImageType.GAME_CG, relevance=0.90, total=90)
+    logo = candidate("logo", ImageType.LOGO, relevance=1.0, total=100)
+    low_resolution = candidate("low-resolution", ImageType.GAME_CG, relevance=1.0, total=100, width=240, height=180)
+
+    out = tmp_path / "out"
+    OutputManager().write(
+        PipelineResult(
+            issue=issue,
+            candidates=[selected, cg_lower, screenshot, cg_higher, logo, low_resolution],
+        ),
+        out,
+    )
+
+    assert (out / "images" / "x1" / "x1.01.jpg").read_bytes() == b"selected"
+    failure_dir = out / "images" / "x1" / "失败候选图"
+    assert [path.name for path in failure_dir.glob("*.jpg")] == [
+        "x1.f01.jpg",
+        "x1.f02.jpg",
+        "x1.f03.jpg",
+    ]
+    assert [(failure_dir / f"x1.f0{rank}.jpg").read_bytes() for rank in range(1, 4)] == [
+        b"cg-higher",
+        b"cg-lower",
+        b"screenshot",
+    ]
+    assert logo.local_path is None
+    assert low_resolution.local_path is None
+    assert cg_higher.selected is False
+    assert "失败候选图" in (cg_higher.local_path or "")
+
+    payload = json.loads((out / "image_index.json").read_text(encoding="utf-8"))
+    by_id = {candidate["id"]: candidate for candidate in payload["candidates"]}
+    assert by_id[cg_higher.id]["selected"] is False
+    assert "失败候选图" in by_id[cg_higher.id]["local_path"]
+
+
+def test_output_deduplicates_failed_candidates_by_content_hash(tmp_path):
+    from galgame_news.delivery.output import OutputManager
+
+    item = NewsItem(issue_id="1", sequence=1, section="新作", title="《Game》更新", body="")
+    issue = Issue(issue_id="1", input_path="fixture.docx", news_items=[item])
+    source = tmp_path / "same.jpg"
+    source.write_bytes(b"same")
+    candidates = [
+        ImageCandidate(
+            news_id=item.id,
+            image_url=f"https://cdn.example/{index}.jpg",
+            source_url="https://official.example/game",
+            source_type=SourceType.OFFICIAL_SITE,
+            image_type=ImageType.GAME_CG,
+            fetched_at=datetime.now(timezone.utc),
+            width=1280,
+            height=720,
+            mime_type="image/jpeg",
+            sha256="same-sha256",
+            downloadable=True,
+            local_path=str(source),
+            score=_score(0.8, 80),
+            selected=False,
+            signals={"entity_match": True},
+        )
+        for index in range(2)
+    ]
+
+    out = tmp_path / "out"
+    OutputManager().write(PipelineResult(issue=issue, candidates=candidates), out)
+
+    assert len(list((out / "images" / "x1" / "失败候选图").glob("*.jpg"))) == 1
+    assert sum(candidate.local_path is not None for candidate in candidates) == 1

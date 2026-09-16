@@ -10,13 +10,29 @@ import re
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from ..domain import OutputManifest, PipelineResult
+from ..domain import ImageCandidate, ImageType, OutputManifest, PipelineResult
 
 
 class OutputManager:
     _SENSITIVE_QUERY_NAMES = {
         "credential", "signature", "token", "api_key", "apikey",
         "access_key", "key", "policy", "expires", "key-pair-id",
+    }
+    _FAILED_CANDIDATE_DIR = "失败候选图"
+    _FAILED_CANDIDATE_MIN_WIDTH = 300
+    _FAILED_CANDIDATE_MIN_HEIGHT = 300
+    _FAILED_CANDIDATE_MIN_PIXELS = 120_000
+    _FAILED_CANDIDATE_EXCLUDED_TYPES = {ImageType.LOGO, ImageType.BANNER, ImageType.UI}
+    _FAILED_CANDIDATE_TYPE_ORDER = {
+        ImageType.GAME_CG: 0,
+        ImageType.GAMEPLAY_SCREENSHOT: 1,
+        ImageType.ANNOUNCEMENT_ART: 2,
+        ImageType.KEY_VISUAL: 3,
+        ImageType.CHARACTER_ART: 4,
+        ImageType.COVER: 5,
+        ImageType.GOODS: 6,
+        ImageType.PHOTO: 7,
+        ImageType.UNKNOWN: 8,
     }
 
     @classmethod
@@ -92,6 +108,46 @@ class OutputManager:
                 pass
             raise
 
+    @classmethod
+    def _is_reviewable_failed_candidate(cls, candidate: ImageCandidate) -> bool:
+        if candidate.selected or not candidate.downloadable or not candidate.local_path:
+            return False
+        source = Path(candidate.local_path)
+        if not source.is_file() or candidate.image_type in cls._FAILED_CANDIDATE_EXCLUDED_TYPES:
+            return False
+        width, height = candidate.width or 0, candidate.height or 0
+        return (
+            width >= cls._FAILED_CANDIDATE_MIN_WIDTH
+            and height >= cls._FAILED_CANDIDATE_MIN_HEIGHT
+            and width * height >= cls._FAILED_CANDIDATE_MIN_PIXELS
+        )
+
+    @classmethod
+    def _failed_candidate_sort_key(cls, candidate: ImageCandidate):
+        entity_match = candidate.signals.get("entity_match")
+        entity_order = 0 if entity_match is True else (2 if entity_match is False else 1)
+        raw_type_match = candidate.score.type_match if candidate.score else candidate.signals.get("type_match", 0.0)
+        type_match = float(raw_type_match) if isinstance(raw_type_match, (int, float)) else 0.0
+        relevance = candidate.score.relevance if candidate.score else 0.0
+        total = candidate.score.total if candidate.score else 0.0
+        raw_entity_confidence = candidate.signals.get("entity_match_confidence", 0.0)
+        entity_confidence = float(raw_entity_confidence) if isinstance(raw_entity_confidence, (int, float)) else 0.0
+        pixels = (candidate.width or 0) * (candidate.height or 0)
+        return (
+            entity_order,
+            -type_match,
+            cls._FAILED_CANDIDATE_TYPE_ORDER.get(candidate.image_type, 99),
+            -relevance,
+            -entity_confidence,
+            -total,
+            -pixels,
+            candidate.id or "",
+        )
+
+    @staticmethod
+    def _candidate_content_key(candidate: ImageCandidate) -> str:
+        return candidate.sha256 or candidate.perceptual_hash or candidate.id or candidate.image_url
+
     def write(self, result: PipelineResult, output_dir: Path | str) -> OutputManifest:
         root = Path(output_dir)
         root.mkdir(parents=True, exist_ok=True)
@@ -124,8 +180,37 @@ class OutputManager:
             candidate.local_path = str(target)
             files.append(str(target.relative_to(root)))
         all_candidates = result.all_candidates
+        exported_failed: set[int] = set()
+        for news_id in sorted({candidate.news_id for candidate in all_candidates}):
+            failed = sorted(
+                (
+                    candidate
+                    for candidate in all_candidates
+                    if candidate.news_id == news_id and self._is_reviewable_failed_candidate(candidate)
+                ),
+                key=self._failed_candidate_sort_key,
+            )
+            seen_content: set[str] = set()
+            rank = 0
+            for candidate in failed:
+                content_key = self._candidate_content_key(candidate)
+                if content_key in seen_content:
+                    continue
+                seen_content.add(content_key)
+                rank += 1
+                readable = re.sub(r"[\\/:*?\"<>|]", "_", item_names.get(news_id, news_id))
+                target_dir = image_root / readable / self._FAILED_CANDIDATE_DIR
+                target_dir.mkdir(parents=True, exist_ok=True)
+                ext = (candidate.mime_type or "image/jpeg").split("/")[-1].replace("jpeg", "jpg")
+                target = target_dir / f"{readable}.f{rank:02d}.{ext}"
+                source_path = Path(candidate.local_path or "")
+                if source_path.resolve() != target.resolve():
+                    shutil.copyfile(source_path, target)
+                candidate.local_path = str(target)
+                exported_failed.add(id(candidate))
+                files.append(str(target.relative_to(root)))
         for candidate in all_candidates:
-            if not candidate.selected:
+            if not candidate.selected and id(candidate) not in exported_failed:
                 candidate.local_path = None
         candidate_payload = self._sanitize_payload([candidate.model_dump(mode="json") for candidate in all_candidates])
         news_payload = []
