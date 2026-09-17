@@ -30,6 +30,8 @@ class Application:
             search_provider=(lambda _news: []) if offline else None,
             same_domain_depth=0 if offline else self.config.search.same_domain_depth,
             same_domain_transport=source_transport,
+            search_max_results=self.config.search.max_results,
+            search_timeout=self.config.network.timeout_seconds,
         )
         self.max_images = max_images
         self.source_transport = source_transport
@@ -45,13 +47,18 @@ class Application:
             issue = Issue(issue_id=issue_id, input_path=str(input_path), news_items=[])
         candidates = []
         source_map = {}
-        for news in issue.news_items:
+        total_news = len(issue.news_items)
+        for news_index, news in enumerate(issue.news_items, start=1):
+            display_title = news.title.encode("ascii", "replace").decode("ascii")
+            print(f"[galgame_news] resolving {news_index}/{total_news}: {display_title}", flush=True)
             try:
                 sources = self.resolver.resolve(news)
                 source_map[news.id] = list(sources)
                 if self.offline:
                     sources = [source for source in sources if source.source_type is SourceType.DIRECT_IMAGE or urlsplit(source.url).path.casefold().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"))]
                 for source in sources:
+                    if source.discovered_via.value in {"ddgs", "brave"} and source.source_type is SourceType.UNVERIFIED:
+                        continue
                     if source.source_type is SourceType.VIDEO:
                         adapter = VideoAdapter()
                     elif ReviewReason.DYNAMIC_PAGE in source.review_reasons:
@@ -83,6 +90,7 @@ class Application:
                         failures.append(FailureRecord(stage=FailureStage.COLLECT, news_id=news.id, code="manual_review_required", message=reason.value, source_url=source.url, retryable=False))
             except Exception as exc:
                 failures.append(FailureRecord(stage=FailureStage.RESOLVE, news_id=news.id, code="news_failed", message=str(exc), retryable=True))
+            print(f"[galgame_news] resolved {news_index}/{total_news}: {len(source_map.get(news.id, []))} sources", flush=True)
         root = Path(output_dir)
         root.mkdir(parents=True, exist_ok=True)
         if self.offline:

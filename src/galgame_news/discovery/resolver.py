@@ -20,12 +20,12 @@ def _normalize(url: str) -> str:
 
 
 class DefaultSourceResolver:
-    def __init__(self, *, history_lookup: Callable[[NewsItem], Iterable[SourceRef]] | None = None, same_domain_lookup: Callable[[SourceRef, NewsItem], Iterable[SourceRef]] | None = None, same_domain_depth: int = 1, same_domain_transport: Callable[..., Any] | None = None, search_provider: Callable[[NewsItem], Iterable[SourceRef]] | None = None):
+    def __init__(self, *, history_lookup: Callable[[NewsItem], Iterable[SourceRef]] | None = None, same_domain_lookup: Callable[[SourceRef, NewsItem], Iterable[SourceRef]] | None = None, same_domain_depth: int = 1, same_domain_transport: Callable[..., Any] | None = None, search_provider: Callable[[NewsItem], Iterable[SourceRef]] | None = None, search_max_results: int = 5, search_timeout: float = 5.0):
         self.history_lookup = history_lookup or (lambda news: [])
         self.same_domain_lookup = same_domain_lookup
         self.same_domain_depth = max(0, min(3, same_domain_depth))
-        self.same_domain_client = SafeHttpClient(transport=same_domain_transport)
-        self.search_provider = search_provider or FallbackSearchProvider().search
+        self.same_domain_client = SafeHttpClient(transport=same_domain_transport, timeout=min(5.0, search_timeout), max_retries=1)
+        self.search_provider = search_provider or FallbackSearchProvider(max_results=search_max_results, timeout=search_timeout).search
 
     @staticmethod
     def _document_source(url: str) -> SourceRef:

@@ -34,16 +34,17 @@ def _to_sources(results: Iterable[Any], method: DiscoveryMethod) -> list[SourceR
 
 
 class DDGSSearchProvider:
-    def __init__(self, *, search_fn: Callable[..., Iterable[Any]] | None = None, max_results: int = 10):
+    def __init__(self, *, search_fn: Callable[..., Iterable[Any]] | None = None, max_results: int = 5, timeout: float = 5.0):
         self.search_fn = search_fn
         self.max_results = max_results
+        self.timeout = timeout
 
     def search(self, news_item: NewsItem) -> list[SourceRef]:
         query = " ".join(news_item.game_names or [news_item.title])
         if self.search_fn is None:
             try:
                 from ddgs import DDGS
-                results = DDGS().text(query, max_results=self.max_results)
+                results = DDGS(timeout=self.timeout).text(query, max_results=self.max_results)
             except Exception:
                 return []
         else:
@@ -73,9 +74,9 @@ class BraveSearchProvider:
 
 
 class FallbackSearchProvider:
-    def __init__(self, brave: BraveSearchProvider | None = None, ddgs: DDGSSearchProvider | None = None):
-        self.brave = brave or BraveSearchProvider()
-        self.ddgs = ddgs or DDGSSearchProvider()
+    def __init__(self, brave: BraveSearchProvider | None = None, ddgs: DDGSSearchProvider | None = None, *, max_results: int = 5, timeout: float = 5.0):
+        self.brave = brave or BraveSearchProvider(max_results=max_results)
+        self.ddgs = ddgs or DDGSSearchProvider(max_results=max_results, timeout=timeout)
 
     def search(self, news_item: NewsItem) -> list[SourceRef]:
         results = self.brave.search(news_item)

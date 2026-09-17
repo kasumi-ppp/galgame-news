@@ -239,6 +239,28 @@ def test_ddgs_provider_accepts_current_href_and_body_field_names():
     assert result[0].source_type is SourceType.UNVERIFIED
 
 
+def test_ddgs_provider_passes_bounded_timeout_to_client(monkeypatch):
+    from types import SimpleNamespace
+    import sys
+    from galgame_news.discovery.search import DDGSSearchProvider
+
+    seen = {}
+
+    class FakeDDGS:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def text(self, query, **kwargs):
+            return [{"href": "https://official.example/game", "title": "game"}]
+
+    monkeypatch.setitem(sys.modules, "ddgs", SimpleNamespace(DDGS=FakeDDGS))
+    provider = DDGSSearchProvider(timeout=2.5, max_results=3)
+    result = provider.search(item())
+
+    assert result[0].url == "https://official.example/game"
+    assert seen["timeout"] == 2.5
+
+
 def test_wix_embedded_dynamic_data_yields_original_media_images(monkeypatch):
     from galgame_news.discovery.adapters import OfficialHtmlAdapter
     import socket

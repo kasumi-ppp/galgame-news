@@ -40,7 +40,7 @@ banner = 0
 ui = 0
 
 [search]
-max_results = 10
+max_results = 5
 same_domain_depth = 1
 max_candidates_per_source = 500
 
