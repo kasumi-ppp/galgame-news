@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import sys
 import tomllib
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -60,6 +62,18 @@ class SelectionConfig(_ConfigModel):
         if self.min_images > self.max_images:
             raise ValueError("min_images cannot exceed max_images")
         return self
+
+
+class VideoConfig(_ConfigModel):
+    enabled: bool = True
+    max_height: int = Field(default=1080, ge=1)
+    max_duration_seconds: int = Field(default=600, gt=0)
+    max_file_bytes: int = Field(default=1073741824, gt=0)
+    max_per_news: int = Field(default=3, ge=0)
+    preferred_container: Literal["mp4", "webm"] = "mp4"
+    # Optional directory or ffmpeg executable.  FFMPEG_LOCATION takes
+    # precedence at runtime; an empty value means automatic discovery.
+    ffmpeg_location: str | None = None
 
 
 class SearchConfig(_ConfigModel):
@@ -119,6 +133,7 @@ class PrescanConfig(_ConfigModel):
     selection: SelectionConfig
     search: SearchConfig
     image_types: ImageTypeConfig = Field(default_factory=ImageTypeConfig)
+    video: VideoConfig = Field(default_factory=VideoConfig)
 
 
 def _merge(base: dict, override: dict) -> dict:
@@ -132,6 +147,17 @@ def _merge(base: dict, override: dict) -> dict:
 
 
 def _default_path() -> Path:
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        candidates = []
+        if meipass:
+            candidates.append(Path(meipass) / "config" / "default.toml")
+        executable = getattr(sys, "executable", None)
+        if executable:
+            candidates.append(Path(executable).resolve().parent / "config" / "default.toml")
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
     return Path(__file__).resolve().parents[2] / "config" / "default.toml"
 
 

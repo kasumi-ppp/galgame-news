@@ -33,7 +33,10 @@ class DefaultSourceResolver:
         host = (parts.hostname or "unknown").casefold()
         path = parts.path.casefold()
         image_suffixes = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")
-        if path.endswith(image_suffixes):
+        video_suffixes = (".mp4", ".webm", ".m3u8")
+        if path.endswith(video_suffixes):
+            source_type, officiality = SourceType.VIDEO, 0.5
+        elif path.endswith(image_suffixes):
             source_type, officiality = SourceType.DIRECT_IMAGE, 0.8
         elif host in {"x.com", "twitter.com", "www.x.com", "www.twitter.com"}:
             source_type, officiality = SourceType.OFFICIAL_X, 0.9

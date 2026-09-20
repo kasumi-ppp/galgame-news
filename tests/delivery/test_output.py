@@ -27,7 +27,7 @@ def test_output_is_repeatable_and_does_not_duplicate_candidate_files(tmp_path):
     manager = OutputManager()
     manager.write(result, tmp_path)
     manager.write(result, tmp_path)
-    assert len(list(tmp_path.glob("*.json"))) == 3
+    assert len(list(tmp_path.glob("*.json"))) == 4
 
 
 def test_output_uses_human_readable_section_sequence_names(tmp_path):
@@ -74,6 +74,54 @@ def test_output_numbers_each_known_section_independently(tmp_path):
     }
     actual = {path.relative_to(tmp_path / "out" / "images").as_posix() for path in (tmp_path / "out" / "images").rglob("*.jpg")}
     assert actual == expected
+
+
+def test_output_accepts_chinese_section_aliases_and_numbers_by_category_appearance(tmp_path):
+    from galgame_news.delivery.output import OutputManager
+
+    # ``sequence`` is intentionally not sorted here: names must follow the
+    # order in which each category appears in the issue, not the global number.
+    items = [
+        NewsItem(issue_id="1", sequence=8, section="漢化情報", title="H first", body=""),
+        NewsItem(issue_id="1", sequence=2, section="新作", title="X first", body=""),
+        NewsItem(issue_id="1", sequence=3, section="漢化", title="H second", body=""),
+        NewsItem(issue_id="1", sequence=1, section="周邊", title="Z first", body=""),
+        NewsItem(issue_id="1", sequence=4, section="業界", title="Z second", body=""),
+    ]
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"sample")
+    candidates = [
+        ImageCandidate(
+            news_id=item.id,
+            image_url=f"https://cdn.example/{item.sequence}.jpg",
+            source_url="https://official.example",
+            source_type=SourceType.OFFICIAL_SITE,
+            fetched_at=datetime.now(timezone.utc),
+            local_path=str(source),
+            selected=True,
+        )
+        for item in items
+    ]
+
+    OutputManager().write(
+        PipelineResult(
+            issue=Issue(issue_id="1", input_path="fixture.docx", news_items=items),
+            candidates=candidates,
+        ),
+        tmp_path / "out",
+    )
+
+    image_root = tmp_path / "out" / "images"
+    assert {
+        path.relative_to(image_root).as_posix()
+        for path in image_root.rglob("*.jpg")
+    } == {
+        "h1/h1.01.jpg",
+        "x1/x1.01.jpg",
+        "h2/h2.01.jpg",
+        "z1/z1.01.jpg",
+        "z2/z2.01.jpg",
+    }
 
 
 def test_output_rerun_removes_managed_images_that_are_no_longer_present(tmp_path):
@@ -133,7 +181,7 @@ def _score(relevance: float, total: float) -> ScoreBreakdown:
     )
 
 
-def test_output_exports_reviewable_failures_with_cg_first_then_similarity(tmp_path):
+def test_output_exports_reviewable_failures_by_relevance_and_total(tmp_path):
     from galgame_news.delivery.output import OutputManager
 
     item = NewsItem(issue_id="1", sequence=1, section="新作", title="《Game》更新", body="")
@@ -177,26 +225,26 @@ def test_output_exports_reviewable_failures_with_cg_first_then_similarity(tmp_pa
     )
 
     assert (out / "images" / "x1" / "x1.01.jpg").read_bytes() == b"selected"
-    failure_dir = out / "images" / "x1" / "失败候选图"
+    failure_dir = out / "images" / "x1" / "未候选"
     assert [path.name for path in failure_dir.glob("*.jpg")] == [
-        "x1.f01.jpg",
-        "x1.f02.jpg",
-        "x1.f03.jpg",
+        "x1.u01.jpg",
+        "x1.u02.jpg",
+        "x1.u03.jpg",
     ]
-    assert [(failure_dir / f"x1.f0{rank}.jpg").read_bytes() for rank in range(1, 4)] == [
+    assert [(failure_dir / f"x1.u0{rank}.jpg").read_bytes() for rank in range(1, 4)] == [
+        b"screenshot",
         b"cg-higher",
         b"cg-lower",
-        b"screenshot",
     ]
     assert logo.local_path is None
     assert low_resolution.local_path is None
     assert cg_higher.selected is False
-    assert "失败候选图" in (cg_higher.local_path or "")
+    assert "未候选" in (cg_higher.local_path or "")
 
     payload = json.loads((out / "image_index.json").read_text(encoding="utf-8"))
     by_id = {candidate["id"]: candidate for candidate in payload["candidates"]}
     assert by_id[cg_higher.id]["selected"] is False
-    assert "失败候选图" in by_id[cg_higher.id]["local_path"]
+    assert "未候选" in by_id[cg_higher.id]["local_path"]
 
 
 def test_output_deduplicates_failed_candidates_by_content_hash(tmp_path):
@@ -230,5 +278,5 @@ def test_output_deduplicates_failed_candidates_by_content_hash(tmp_path):
     out = tmp_path / "out"
     OutputManager().write(PipelineResult(issue=issue, candidates=candidates), out)
 
-    assert len(list((out / "images" / "x1" / "失败候选图").glob("*.jpg"))) == 1
+    assert len(list((out / "images" / "x1" / "未候选").glob("*.jpg"))) == 1
     assert sum(candidate.local_path is not None for candidate in candidates) == 1

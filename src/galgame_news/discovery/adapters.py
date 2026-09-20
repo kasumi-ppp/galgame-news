@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 
 from ..domain import CollectionContext, CollectionResult, FailureRecord, FailureStage, ImageCandidate, NewsItem, ReviewReason, SourceRef, SourceType
 from .http import SafeHttpClient
+from ..video.discovery import collect_entity_videos, discover_html_video_urls, explicit_x_html_entity_urls, video_candidate
 
 
 def _candidate(news: NewsItem, image_url: str, source: SourceRef, context: CollectionContext) -> ImageCandidate:
@@ -107,6 +108,17 @@ class DirectImageAdapter:
         return CollectionResult(candidates=[_candidate(news_item, image_url, source_ref, context)])
 
 
+def _video_candidates(news_item: NewsItem, source_ref: SourceRef, urls: list[str], title: str = "") -> list:
+    result = []
+    seen = set()
+    for url in urls:
+        candidate = video_candidate(news_item, url, source_ref, title=title)
+        if candidate is not None and candidate.video_url not in seen:
+            seen.add(candidate.video_url)
+            result.append(candidate)
+    return result
+
+
 class OfficialHtmlAdapter:
     def __init__(self, *, transport: Callable[..., Any] | None = None, client: SafeHttpClient | None = None):
         self.client = client or SafeHttpClient(transport=transport)
@@ -132,6 +144,7 @@ class OfficialHtmlAdapter:
                         page_title = str(meta["content"]).strip()
                         break
             image_context: dict[str, list[str]] = {}
+            video_urls = discover_html_video_urls(html, page_url)
 
             def remember_context(raw_url: str, tag) -> None:
                 if not isinstance(raw_url, str):
@@ -212,12 +225,12 @@ class OfficialHtmlAdapter:
                 if _image_priority(image_url) <= 1 or "/gallery" in urlsplit(source_ref.url).path.casefold():
                     candidate.signals["cg_match"] = 1.0
                 candidates.append(candidate)
-            if not candidates and soup.find("script"):
+            if not candidates and not video_urls and soup.find("script"):
                 source_ref.requires_review = True
                 source_ref.review_reasons = list(dict.fromkeys([*source_ref.review_reasons, ReviewReason.DYNAMIC_PAGE]))
                 return CollectionResult(manual_review_reasons=[ReviewReason.DYNAMIC_PAGE])
             candidates.sort(key=lambda candidate: _image_priority(candidate.image_url))
-            return CollectionResult(candidates=candidates[:context.max_candidates])
+            return CollectionResult(candidates=candidates[:context.max_candidates], video_candidates=_video_candidates(news_item, source_ref, video_urls, page_title))
         except Exception as exc:
             return CollectionResult(failures=[FailureRecord(stage=FailureStage.COLLECT, news_id=news_item.id, code="adapter_error", message=str(exc), source_url=source_ref.url, retryable=True)])
 
@@ -239,16 +252,25 @@ class DynamicPageAdapter(OfficialHtmlAdapter):
 
 class VideoAdapter:
     def collect(self, news_item: NewsItem, source_ref: SourceRef, context: CollectionContext) -> CollectionResult:
+        candidate = video_candidate(news_item, source_ref.url, source_ref)
         source_ref.requires_review = True
         source_ref.review_reasons = list(dict.fromkeys([*source_ref.review_reasons, ReviewReason.DYNAMIC_PAGE]))
-        return CollectionResult(manual_review_reasons=[ReviewReason.DYNAMIC_PAGE])
+        return CollectionResult(
+            video_candidates=[candidate] if candidate is not None else [],
+            manual_review_reasons=[ReviewReason.DYNAMIC_PAGE],
+        )
 
 
 class XAdapter:
-    def __init__(self, *, token: str | None = None, transport: Callable[..., Any] | None = None, public_transport: Callable[..., Any] | None = None):
+    def __init__(self, *, token: str | None = None, transport: Callable[..., Any] | None = None, public_transport: Callable[..., Any] | None = None, public_resolver: Callable[[str], Any] | None = None):
         self.token = token
         self.transport = transport
-        self.public_client = SafeHttpClient(transport=public_transport)
+        self.public_transport = public_transport
+        self.public_resolver = public_resolver
+        self.public_client = SafeHttpClient(transport=public_transport, resolver=public_resolver)
+        # API transport and public-page transport are injectable, but all page
+        # requests still pass through SafeHttpClient's URL/redirect checks.
+        self.entity_client = SafeHttpClient(transport=public_transport or transport, resolver=public_resolver)
 
     def collect(self, news_item: NewsItem, source_ref: SourceRef, context: CollectionContext) -> CollectionResult:
         source_ref.requires_review = True
@@ -256,7 +278,8 @@ class XAdapter:
         if not self.token:
             try:
                 response = self.public_client.get(source_ref.url)
-                soup = BeautifulSoup(getattr(response, "text", "") or "", "html.parser")
+                html = getattr(response, "text", "") or ""
+                soup = BeautifulSoup(html, "html.parser")
                 urls = []
                 for tag in soup.find_all("meta"):
                     key = (tag.get("property") or tag.get("name") or "").casefold()
@@ -268,9 +291,44 @@ class XAdapter:
                         image_path = urlsplit(image_url).path.casefold()
                         if image_host == "pbs.twimg.com" and (image_path.startswith("/media/") or image_path.startswith("/card_img/")):
                             urls.append(image_url)
-                return CollectionResult(candidates=[_candidate(news_item, url, source_ref, context) for url in dict.fromkeys(urls)], manual_review_reasons=[ReviewReason.X_SOURCE])
+
+                # Only tags/embeds are trusted directly from the X page.  An
+                # anchor is accepted only with explicit tweet/card context.
+                video_urls = discover_html_video_urls(
+                    html,
+                    source_ref.url,
+                    include_anchor_links=False,
+                )
+                links = [
+                    {"expanded_url": url}
+                    for url in explicit_x_html_entity_urls(html, source_ref.url)
+                ]
+                links.extend({"expanded_url": url} for url in video_urls)
+                entity_failures: list[FailureRecord] = []
+
+                def fetch_html(url: str) -> tuple[str, str]:
+                    child = self.public_client.get(url)
+                    final_url = str(getattr(child, "url", url) or url)
+                    return final_url, getattr(child, "text", "") or ""
+
+                entity_videos = collect_entity_videos(
+                    news_item,
+                    source_ref,
+                    {"entities": {"urls": links}},
+                    fetch_html=fetch_html,
+                    url_validator=self.public_client.validate_url,
+                    failures=entity_failures,
+                )
+                combined = {candidate.video_url: candidate for candidate in entity_videos}
+                return CollectionResult(
+                    candidates=[_candidate(news_item, url, source_ref, context) for url in dict.fromkeys(urls)],
+                    video_candidates=list(combined.values()),
+                    failures=entity_failures,
+                    manual_review_reasons=[ReviewReason.X_SOURCE],
+                )
             except Exception as exc:
                 return CollectionResult(failures=[FailureRecord(stage=FailureStage.COLLECT, news_id=news_item.id, code="x_public_metadata_error", message=str(exc), source_url=source_ref.url, retryable=True)], manual_review_reasons=[ReviewReason.X_SOURCE, ReviewReason.NETWORK_RESTRICTED])
+
         # API integration is deliberately injectable; no login or scraping fallback.
         if self.transport is None:
             return CollectionResult(manual_review_reasons=[ReviewReason.X_SOURCE])
@@ -278,6 +336,26 @@ class XAdapter:
             response = self.transport(source_ref.url, token=self.token, timeout=context.timeout_seconds)
             data = response if isinstance(response, dict) else getattr(response, "json", lambda: {})()
             urls = data.get("image_urls", []) if isinstance(data, dict) else []
-            return CollectionResult(candidates=[_candidate(news_item, url, source_ref, context) for url in urls if isinstance(url, str) and _is_public_x_media(url)], manual_review_reasons=[ReviewReason.X_SOURCE])
+            entity_failures: list[FailureRecord] = []
+
+            def fetch_html(url: str) -> tuple[str, str]:
+                child = self.entity_client.get(url)
+                final_url = str(getattr(child, "url", url) or url)
+                return final_url, getattr(child, "text", "") or ""
+
+            entity_videos = collect_entity_videos(
+                news_item,
+                source_ref,
+                data,
+                fetch_html=fetch_html,
+                url_validator=self.entity_client.validate_url,
+                failures=entity_failures,
+            )
+            return CollectionResult(
+                candidates=[_candidate(news_item, url, source_ref, context) for url in urls if isinstance(url, str) and _is_public_x_media(url)],
+                video_candidates=entity_videos,
+                failures=entity_failures,
+                manual_review_reasons=[ReviewReason.X_SOURCE],
+            )
         except Exception as exc:
             return CollectionResult(failures=[FailureRecord(stage=FailureStage.COLLECT, news_id=news_item.id, code="x_api_error", message=str(exc), source_url=source_ref.url, retryable=True)], manual_review_reasons=[ReviewReason.X_SOURCE])

@@ -5,8 +5,8 @@ from __future__ import annotations
 import ipaddress
 import socket
 import time
+from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit, urlunsplit
-from typing import Any, Callable
 
 import httpx
 
@@ -33,7 +33,10 @@ def _verified_www_fallback(url: str, error: Exception) -> str | None:
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
-def _public_url(url: str) -> None:
+def _public_url(
+    url: str,
+    resolver: Callable[[str], Iterable[str]] | None = None,
+) -> None:
     parts = urlsplit(url)
     if parts.scheme.casefold() not in {"http", "https"} or not parts.hostname:
         raise UnsafeUrlError(f"unsupported URL: {url}")
@@ -42,23 +45,50 @@ def _public_url(url: str) -> None:
         addresses = [ipaddress.ip_address(host)]
     except ValueError:
         try:
-            addresses = [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(host, None)]
-        except OSError:
-            # An unresolved public hostname is safe to pass to an injected transport;
-            # the real client will report the connection error.
+            if resolver is not None:
+                addresses = [ipaddress.ip_address(value) for value in resolver(host)]
+            else:
+                addresses = [
+                    ipaddress.ip_address(info[4][0])
+                    for info in socket.getaddrinfo(host, None)
+                ]
+        except (OSError, ValueError):
+            # An unresolved public hostname is safe to pass to an injected
+            # transport; the real client will report the connection error.
             addresses = []
     for address in addresses:
-        if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved or address.is_multicast or address.is_unspecified:
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
             raise UnsafeUrlError(f"private or non-public URL: {url}")
 
 
 class SafeHttpClient:
-    def __init__(self, *, transport: Callable[..., Any] | None = None, timeout: float = 12.0, max_retries: int = 3, max_response_bytes: int = 5_242_880, user_agent: str = "WeeklyGalgameImagePrescan/2.0"):
+    def __init__(
+        self,
+        *,
+        transport: Callable[..., Any] | None = None,
+        timeout: float = 12.0,
+        max_retries: int = 3,
+        max_response_bytes: int = 5_242_880,
+        user_agent: str = "WeeklyGalgameImagePrescan/2.0",
+        resolver: Callable[[str], Iterable[str]] | None = None,
+    ):
         self.transport = transport
         self.timeout = timeout
         self.max_retries = max(1, max_retries)
         self.max_response_bytes = max_response_bytes
         self.user_agent = user_agent
+        self.resolver = resolver
+
+    def validate_url(self, url: str) -> None:
+        """Validate a URL before handing it to any injected or real transport."""
+        _public_url(url, self.resolver)
 
     def get(self, url: str) -> Any:
         current = url
@@ -66,20 +96,33 @@ class SafeHttpClient:
         attempt_limit = self.max_retries
         while attempt < attempt_limit:
             attempt += 1
-            _public_url(current)
+            _public_url(current, self.resolver)
             try:
                 if self.transport is not None:
-                    response = self.transport(current, timeout=self.timeout, headers={"user-agent": self.user_agent})
+                    response = self.transport(
+                        current,
+                        timeout=self.timeout,
+                        headers={"user-agent": self.user_agent},
+                    )
                 else:
-                    response = httpx.get(current, timeout=self.timeout, headers={"user-agent": self.user_agent}, follow_redirects=True)
+                    response = httpx.get(
+                        current,
+                        timeout=self.timeout,
+                        headers={"user-agent": self.user_agent},
+                        follow_redirects=True,
+                    )
                 final_url = str(getattr(response, "url", current))
-                _public_url(final_url)
+                _public_url(final_url, self.resolver)
                 content = getattr(response, "content", b"") or b""
                 content_length = getattr(response, "headers", {}).get("content-length")
                 if content_length and int(content_length) > self.max_response_bytes:
-                    raise ResponseTooLarge(f"response exceeds {self.max_response_bytes} bytes")
+                    raise ResponseTooLarge(
+                        f"response exceeds {self.max_response_bytes} bytes"
+                    )
                 if len(content) > self.max_response_bytes:
-                    raise ResponseTooLarge(f"response exceeds {self.max_response_bytes} bytes")
+                    raise ResponseTooLarge(
+                        f"response exceeds {self.max_response_bytes} bytes"
+                    )
                 status = int(getattr(response, "status_code", 200))
                 if status in {408, 429} or status >= 500:
                     if attempt < attempt_limit:

@@ -208,3 +208,63 @@ def test_application_continues_after_one_source_adapter_raises(tmp_path, monkeyp
     fixture=tmp_path/"sample.docx"; fixture.write_bytes(b"fixture")
     result=Application(parser=Parser(),analyzer=Analyzer(),resolver=Resolver()).run(fixture,issue_id="1",output_dir=tmp_path/"out")
     assert any(f.code == "source_failed" for f in result.failures)
+
+
+def test_application_legacy_wrapper_reruns_existing_output_dir(tmp_path):
+    from galgame_news.application import Application
+
+    class Parser:
+        def parse(self, path, issue_id):
+            return IssueDraft(issue_id=issue_id, input_path=str(path), entries=[
+                NewsDraft(sequence=1, section="新作", title="Game", body="CG"),
+            ])
+
+    class Analyzer:
+        def analyze(self, draft):
+            return Issue(issue_id=draft.issue_id, input_path=draft.input_path, news_items=[
+                NewsItem(issue_id=draft.issue_id, sequence=1, section="新作", title="Game", body="CG"),
+            ])
+
+    class Resolver:
+        def resolve(self, news):
+            return []
+
+    fixture = tmp_path / "sample.docx"
+    fixture.write_bytes(b"fixture")
+    output_dir = tmp_path / "out"
+    app = Application(parser=Parser(), analyzer=Analyzer(), resolver=Resolver())
+    app.run(fixture, issue_id="1", output_dir=output_dir)
+
+    rerun = app.run(fixture, issue_id="1", output_dir=output_dir)
+
+    assert not any(failure.code == "setup_error" for failure in rerun.failures)
+
+
+def test_application_legacy_failure_preserves_existing_images(tmp_path):
+    from galgame_news.application import Application
+
+    class FailingParser:
+        def parse(self, path, issue_id):
+            raise ValueError("bad DOCX")
+
+    class Analyzer:
+        def analyze(self, draft):
+            raise AssertionError("analyzer must not run")
+
+    class Resolver:
+        def resolve(self, news):
+            return []
+
+    fixture = tmp_path / "sample.docx"
+    fixture.write_bytes(b"fixture")
+    output_dir = tmp_path / "out"
+    existing_image = output_dir / "images" / "x1" / "keep.jpg"
+    existing_image.parent.mkdir(parents=True)
+    existing_image.write_bytes(b"old image")
+
+    result = Application(
+        parser=FailingParser(), analyzer=Analyzer(), resolver=Resolver(),
+    ).run(fixture, issue_id="1", output_dir=output_dir)
+
+    assert result.failures
+    assert existing_image.read_bytes() == b"old image"

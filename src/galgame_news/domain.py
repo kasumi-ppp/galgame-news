@@ -31,6 +31,15 @@ class EventType(_StringEnum):
     UNKNOWN = "unknown"
 
 
+class VideoStatus(_StringEnum):
+    DISCOVERED = "discovered"
+    DOWNLOADING = "downloading"
+    DOWNLOADED = "downloaded"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
 class SourceType(_StringEnum):
     OFFICIAL_SITE = "official_site"
     OFFICIAL_X = "official_x"
@@ -116,6 +125,16 @@ def news_id_for(issue_id: str, sequence: int, title: str) -> str:
 
 def candidate_id_for(image_url: str) -> str:
     return hashlib.sha256(_normalized_url(image_url).encode("utf-8")).hexdigest()[:16]
+
+
+def video_candidate_id_for(video_url: str) -> str:
+    """Return a stable id for a video URL after removing fragments."""
+    return hashlib.sha256(_normalized_url(video_url).encode("utf-8")).hexdigest()[:16]
+
+
+def video_id_for(video_url: str) -> str:
+    """Backward-friendly alias for callers that use the shorter name."""
+    return video_candidate_id_for(video_url)
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -235,6 +254,33 @@ class ImageCandidate(ContractModel):
     _fetched_at_aware = field_validator("fetched_at")(_aware)
 
 
+class VideoCandidate(ContractModel):
+    id: str | None = None
+    news_id: str = Field(min_length=1)
+    source_url: str = Field(min_length=1)
+    video_url: str = Field(min_length=1)
+    title: str = ""
+    uploader: str = ""
+    duration_seconds: float | None = Field(default=None, ge=0)
+    width: int | None = Field(default=None, ge=1)
+    height: int | None = Field(default=None, ge=1)
+    format: str | None = None
+    mime_type: str | None = None
+    byte_size: int | None = Field(default=None, ge=0)
+    sha256: str | None = None
+    local_path: str | None = None
+    downloadable: bool = False
+    review_reasons: list[str] = Field(default_factory=list)
+    status: VideoStatus = VideoStatus.DISCOVERED
+    failure_reason: str | None = None
+    discovered_via: DiscoveryMethod = DiscoveryMethod.UNKNOWN
+
+    @model_validator(mode="after")
+    def assign_stable_id(self) -> "VideoCandidate":
+        object.__setattr__(self, "id", video_candidate_id_for(self.video_url))
+        return self
+
+
 class FailureRecord(ContractModel):
     stage: FailureStage = FailureStage.UNKNOWN
     news_id: str | None = None
@@ -243,6 +289,7 @@ class FailureRecord(ContractModel):
     message: str = Field(min_length=1)
     source_url: str | None = None
     retryable: bool = False
+    occurrences: int = Field(default=1, ge=1)
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     _occurred_at_aware = field_validator("occurred_at")(_aware)
@@ -274,6 +321,7 @@ class CollectionContext(ContractModel):
 
 class CollectionResult(ContractModel):
     candidates: list[ImageCandidate] = Field(default_factory=list)
+    video_candidates: list[VideoCandidate] = Field(default_factory=list)
     failures: list[FailureRecord] = Field(default_factory=list)
     manual_review_reasons: list[ReviewReason] = Field(default_factory=list)
 
@@ -299,6 +347,7 @@ class PipelineResult(ContractModel):
     schema_version: Literal[1] = Field(default=1, frozen=True)
     issue: Issue
     candidates: list[ImageCandidate] = Field(default_factory=list)
+    videos: list[VideoCandidate] = Field(default_factory=list)
     filtered_candidates: list[ImageCandidate] = Field(default_factory=list)
     failures: list[FailureRecord] = Field(default_factory=list)
     review_required: list[ImageCandidate] = Field(default_factory=list)

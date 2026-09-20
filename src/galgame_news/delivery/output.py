@@ -7,10 +7,11 @@ import os
 import shutil
 import tempfile
 import re
+import unicodedata
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from ..domain import ImageCandidate, ImageType, OutputManifest, PipelineResult
+from ..domain import ImageCandidate, ImageType, OutputManifest, PipelineResult, VideoStatus
 
 
 class OutputManager:
@@ -18,7 +19,11 @@ class OutputManager:
         "credential", "signature", "token", "api_key", "apikey",
         "access_key", "key", "policy", "expires", "key-pair-id",
     }
-    _FAILED_CANDIDATE_DIR = "失败候选图"
+    # ``未候选`` is the user-facing canonical name.  Keep the old label as a
+    # read-compatibility marker for imported outputs, but never write both
+    # directories for one candidate.
+    _UNSELECTED_CANDIDATE_DIR = "未候选"
+    _LEGACY_FAILED_CANDIDATE_DIR = "失败候选图"
     _FAILED_CANDIDATE_MIN_WIDTH = 300
     _FAILED_CANDIDATE_MIN_HEIGHT = 300
     _FAILED_CANDIDATE_MIN_PIXELS = 120_000
@@ -76,23 +81,67 @@ class OutputManager:
         return section or "news"
 
     @classmethod
-    def _item_names(cls, items) -> dict[str, str]:
+    def _section_prefix(cls, section: str) -> str:
+        """Map the editorial section aliases to the canonical folder prefix."""
+
+        normalized = re.sub(r"\s+", "", unicodedata.normalize("NFKC", section).casefold())
+        if "新作" in normalized:
+            return "x"
+        if "汉化" in normalized or "漢化" in normalized:
+            return "h"
+        # Weekly issues use several labels for the remaining columns.  Both
+        # simplified/traditional forms and their common suffixes are accepted.
+        if any(
+            alias in normalized
+            for alias in (
+                "周边", "周邊", "周报", "周報", "业界", "業界", "动画", "動畫",
+                "旧作", "舊作", "其他", "其它", "资讯", "資訊", "杂项", "雜項",
+            )
+        ):
+            return "z"
+        # Every non-new/non-localized item is part of the remaining weekly
+        # columns.  Keep unknown labels deterministic and in the z namespace;
+        # callers can still preserve the original section in JSON metadata.
+        return "z"
+
+    @classmethod
+    def item_names(cls, items) -> dict[str, str]:
+        """Return canonical xN/hN/zN folder names in document order.
+
+        The helper accepts both domain objects and the dictionaries stored in
+        review manifests so raw and final exports share exactly one naming
+        policy.
+        """
+
+        def value(item, *keys, default=None):
+            for key in keys:
+                if isinstance(item, dict):
+                    candidate = item.get(key)
+                else:
+                    candidate = getattr(item, key, None)
+                if candidate is not None:
+                    return candidate
+            return default
+
         counters = {"x": 0, "h": 0, "z": 0}
         names: dict[str, str] = {}
-        for item in sorted(items, key=lambda value: value.sequence):
-            section = cls._section_label(item)
-            if "新作" in section:
-                prefix = "x"
-            elif "汉化" in section:
-                prefix = "h"
-            elif "周边" in section or "周报" in section:
-                prefix = "z"
-            else:
-                names[item.id] = f"{section}{item.sequence}"
-                continue
+        # ``items`` is already the document order.  Number each category by
+        # appearance within that category rather than by the global sequence.
+        for item in items:
+            section_value = value(item, "section", default="news")
+            sequence = value(item, "sequence", default=0)
+            section = str(section_value or "news").strip() or "news"
+            if "\ufffd" in section:
+                section = "新作" if int(sequence or 0) <= 10 else "其他"
+            prefix = cls._section_prefix(section)
             counters[prefix] += 1
-            names[item.id] = f"{prefix}{counters[prefix]}"
+            item_id = value(item, "id", "news_id")
+            if item_id:
+                names[str(item_id)] = f"{prefix}{counters[prefix]}"
         return names
+
+    # Private compatibility alias used by older delivery callers.
+    _item_names = item_names
 
     def _atomic_json(self, path: Path, payload) -> None:
         fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -135,11 +184,11 @@ class OutputManager:
         pixels = (candidate.width or 0) * (candidate.height or 0)
         return (
             entity_order,
-            -type_match,
-            cls._FAILED_CANDIDATE_TYPE_ORDER.get(candidate.image_type, 99),
             -relevance,
-            -entity_confidence,
             -total,
+            -type_match,
+            -entity_confidence,
+            cls._FAILED_CANDIDATE_TYPE_ORDER.get(candidate.image_type, 99),
             -pixels,
             candidate.id or "",
         )
@@ -147,6 +196,43 @@ class OutputManager:
     @staticmethod
     def _candidate_content_key(candidate: ImageCandidate) -> str:
         return candidate.sha256 or candidate.perceptual_hash or candidate.id or candidate.image_url
+
+    @staticmethod
+    def _safe_video_name(candidate, fallback: str) -> str:
+        source = Path(candidate.local_path or "")
+        extension = source.suffix or ".mp4"
+        raw = candidate.title or source.stem or f"{fallback}_video"
+        raw = re.sub(r'[\\/:*?"<>|]', "", raw).strip().rstrip(".")
+        return f"{raw or fallback + '_video'}{extension.casefold()}"
+
+    @classmethod
+    def _video_index_payload(cls, result: PipelineResult, videos) -> dict:
+        related_news = []
+        for item in result.issue.news_items:
+            related = [video for video in videos if video.news_id == item.id]
+            related_news.append(
+                {
+                    "news_id": item.id,
+                    "sequence": item.sequence,
+                    "section": cls._section_label(item),
+                    "title": item.title,
+                    "videos": [video.id for video in related],
+                }
+            )
+        failures = [
+            failure.model_dump(mode="json")
+            for failure in result.failures
+            if failure.stage.value == "download" and failure.news_id in {video.news_id for video in videos}
+        ]
+        return cls._sanitize_payload(
+            {
+                "schema_version": 1,
+                "issue_id": result.issue.issue_id,
+                "news_items": related_news,
+                "videos": [video.model_dump(mode="json") for video in videos],
+                "failures": failures,
+            }
+        )
 
     def write(self, result: PipelineResult, output_dir: Path | str) -> OutputManifest:
         root = Path(output_dir)
@@ -199,16 +285,41 @@ class OutputManager:
                 seen_content.add(content_key)
                 rank += 1
                 readable = re.sub(r"[\\/:*?\"<>|]", "_", item_names.get(news_id, news_id))
-                target_dir = image_root / readable / self._FAILED_CANDIDATE_DIR
+                target_dir = image_root / readable / self._UNSELECTED_CANDIDATE_DIR
                 target_dir.mkdir(parents=True, exist_ok=True)
                 ext = (candidate.mime_type or "image/jpeg").split("/")[-1].replace("jpeg", "jpg")
-                target = target_dir / f"{readable}.f{rank:02d}.{ext}"
+                target = target_dir / f"{readable}.u{rank:02d}.{ext}"
                 source_path = Path(candidate.local_path or "")
                 if source_path.resolve() != target.resolve():
                     shutil.copyfile(source_path, target)
                 candidate.local_path = str(target)
                 exported_failed.add(id(candidate))
                 files.append(str(target.relative_to(root)))
+        videos = list(getattr(result, "videos", []) or [])
+        video_reserved: dict[str, set[str]] = {}
+        for video in videos:
+            if video.status is not VideoStatus.DOWNLOADED or not video.local_path:
+                continue
+            source_path = Path(video.local_path)
+            if not source_path.is_file():
+                continue
+            readable = re.sub(r'[\\/:*?"<>|]', "_", item_names.get(video.news_id, video.news_id))
+            target_dir = image_root / readable
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_name = self._safe_video_name(video, readable)
+            reserved = video_reserved.setdefault(video.news_id, set())
+            stem, suffix = Path(target_name).stem, Path(target_name).suffix
+            index = 2
+            while target_name.casefold() in reserved or (target_dir / target_name).exists():
+                target_name = f"{stem} ({index}){suffix}"
+                index += 1
+            reserved.add(target_name.casefold())
+            target = target_dir / target_name
+            if source_path.resolve() != target.resolve():
+                shutil.copyfile(source_path, target)
+            video.local_path = str(target)
+            files.append(str(target.relative_to(root)))
+
         for candidate in all_candidates:
             if not candidate.selected and id(candidate) not in exported_failed:
                 candidate.local_path = None
@@ -221,6 +332,7 @@ class OutputManager:
         failures_payload = self._sanitize_payload([failure.model_dump(mode="json") for failure in result.failures])
         index = {"schema_version": 1, "issue_id": result.issue.issue_id, "news_items": news_payload, "candidates": candidate_payload, "failures": failures_payload}
         self._atomic_json(root / "image_index.json", index)
+        self._atomic_json(root / "video_index.json", self._video_index_payload(result, videos))
         self._atomic_json(root / "failed_items.json", failures_payload)
         reviews = result.review_required or [c for c in all_candidates if c.review_reasons]
         reviews_payload = self._sanitize_payload([candidate.model_dump(mode="json") for candidate in reviews])

@@ -55,3 +55,12 @@ fallback_penalty = 0.25
 auto_select_unknown = false
 max_unknown_per_news = 0
 rejected_image_types_by_requirement = { cg = ["cover", "goods", "logo", "banner", "ui", "photo", "character_art", "announcement_art"], announcement = ["logo", "banner", "ui", "photo", "goods", "cover"], goods = ["logo", "banner", "ui", "photo", "game_cg", "gameplay_screenshot", "key_visual", "character_art", "cover"], release = ["logo", "banner", "ui", "goods", "photo"], generic = ["logo", "banner", "ui"], unknown = ["logo", "banner", "ui"] }
+
+[video]
+enabled = true
+max_height = 1080
+max_duration_seconds = 600
+max_file_bytes = 1073741824
+max_per_news = 3
+preferred_container = "mp4"
+ffmpeg_location = ""
