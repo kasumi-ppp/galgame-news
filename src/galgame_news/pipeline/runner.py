@@ -53,6 +53,10 @@ from .contracts import (
 )
 
 
+class _NoNewsItemsError(ValueError):
+    """Raised when analysis produces no actionable news entries."""
+
+
 class PipelineRunner:
     """Run one task with isolated output and strict resumable checkpoints."""
 
@@ -223,6 +227,10 @@ class PipelineRunner:
                         else RuleBasedNewsAnalyzer()
                     )
                 issue = analyzer.analyze(draft)
+                if not issue.news_items:
+                    raise _NoNewsItemsError(
+                        "No news items were recognized; check the DOCX section and title formatting"
+                    )
                 token.wait_if_paused()
                 self._emit(sink, failures, self._event(
                     "analyze_completed", task_id, issue.issue_id, message="news analyzed",
@@ -239,6 +247,19 @@ class PipelineRunner:
                     request, task_id, task_dir, raw_dir, checkpoint_path, issue,
                     input_hash, config_hash, completed, candidates, videos, failures,
                     source_map, sink, resumed,
+                )
+            except _NoNewsItemsError as exc:
+                self._emit(sink, failures, self._event(
+                    f"{phase}_failed", task_id, request.issue_id, message=str(exc),
+                ))
+                failures.append(FailureRecord(
+                    stage=FailureStage.ANALYZE, code="no_news_items",
+                    message=str(exc), retryable=False,
+                ))
+                result = self._pipeline_result(issue, candidates, videos, failures)
+                return self._failed_result(
+                    request, task_id, task_dir, raw_dir, checkpoint_path, result,
+                    failures, sink, resumed, input_hash, config_hash,
                 )
             except Exception as exc:
                 self._emit(sink, failures, self._event(

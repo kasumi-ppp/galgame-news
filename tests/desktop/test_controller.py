@@ -200,6 +200,46 @@ def test_pipeline_worker_routes_failed_task_result_to_failed(qtbot):
     assert failed == [failed_result]
 
 
+def test_controller_shows_failed_when_runner_returns_empty_news_failure(qtbot, tmp_path: Path):
+    failure = SimpleNamespace(code="no_news_items", message="No news items were recognized")
+    failed_result = SimpleNamespace(
+        status="failed",
+        failures=[failure],
+        task_dir=tmp_path / "task",
+    )
+
+    class _EmptyNewsRunner:
+        def run(self, request, event_sink=None, cancellation_token=None):
+            return failed_result
+
+    input_path = tmp_path / "empty.docx"
+    input_path.write_bytes(b"fixture")
+    controller = DesktopController(
+        runner_factory=_EmptyNewsRunner,
+        app_data=tmp_path / "app",
+    )
+    qtbot.addWidget(controller.progress_page)
+
+    try:
+        assert controller.start_task(
+            input_path=input_path,
+            issue_id="empty",
+            output_dir=tmp_path / "output",
+        ) is True
+        qtbot.waitUntil(
+            lambda: controller.progress_page.status_label.text() == "Failed"
+            and not controller.is_running,
+            timeout=2000,
+        )
+        assert controller.progress_page.status_label.text() == "Failed"
+        assert controller.progress_page.completed_label.text() == "0"
+        assert controller.progress_page.total_label.text() == "0"
+        assert "No news items were recognized" in controller.progress_page.log.toPlainText()
+    finally:
+        controller.close()
+        controller.task_store.close()
+
+
 def test_controller_retry_merges_one_news_attempt_without_overwriting_raw(qtbot, tmp_path: Path):
     source = tmp_path / "input.docx"
     source.write_bytes(b"docx")

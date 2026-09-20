@@ -257,6 +257,31 @@ def test_pipeline_runner_reports_parse_failure_without_writing_partial_output(tm
     assert sentinel.read_text(encoding="utf-8") == "preserve"
 
 
+def test_pipeline_runner_fails_when_analyzer_returns_no_news(tmp_path):
+    class EmptyParser:
+        def parse(self, path, issue_id):
+            return IssueDraft(issue_id=issue_id, input_path=str(path), entries=[])
+
+    class EmptyAnalyzer:
+        def analyze(self, draft):
+            return Issue(issue_id=draft.issue_id, input_path=draft.input_path, news_items=[])
+
+    input_path = tmp_path / "empty.docx"
+    input_path.write_bytes(b"fixture")
+    events = []
+
+    result = PipelineRunner(parser=EmptyParser(), analyzer=EmptyAnalyzer()).run(
+        TaskRequest(input_path=input_path, issue_id="empty", output_dir=tmp_path / "out"),
+        events.append,
+        CancellationToken(),
+    )
+
+    assert result.status == "failed"
+    assert any(failure.code == "no_news_items" for failure in result.failures)
+    assert any(event.kind == "analyze_failed" for event in events)
+    assert not any(event.kind == "task_completed" for event in events)
+
+
 def test_pipeline_runner_isolates_event_sink_failures(tmp_path):
     parser, analyzer, resolver, _ = _components(1)
     input_path = tmp_path / "sample.docx"

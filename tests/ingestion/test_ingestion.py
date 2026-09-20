@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import zipfile
+from xml.etree import ElementTree as ET
 
 import pytest
 
@@ -15,6 +16,23 @@ def make_docx(path: Path, paragraphs: list[str]) -> None:
     document = f'<w:document xmlns:w="{ns}"><w:body>{body}</w:body></w:document>'
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("word/document.xml", document)
+
+
+def make_styled_docx(path: Path, paragraphs: list[tuple[str, int, bool]]) -> None:
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ET.register_namespace("w", namespace)
+    root = ET.Element(f"{{{namespace}}}document")
+    body = ET.SubElement(root, f"{{{namespace}}}body")
+    for text, size, bold in paragraphs:
+        paragraph = ET.SubElement(body, f"{{{namespace}}}p")
+        run = ET.SubElement(paragraph, f"{{{namespace}}}r")
+        properties = ET.SubElement(run, f"{{{namespace}}}rPr")
+        if bold:
+            ET.SubElement(properties, f"{{{namespace}}}b")
+        ET.SubElement(properties, f"{{{namespace}}}sz", {f"{{{namespace}}}val": str(size)})
+        ET.SubElement(run, f"{{{namespace}}}t").text = text
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("word/document.xml", ET.tostring(root, encoding="unicode"))
 
 
 def test_docx_parser_keeps_all_news_sections_and_splits_concatenated_urls(tmp_path: Path):
@@ -49,6 +67,32 @@ def test_docx_parser_ignores_preamble_and_url_fragments_as_headings(tmp_path: Pa
     assert len(issue.entries) == 1
     assert issue.entries[0].title == "作品"
     assert issue.entries[0].source_urls == ["https://official.example/news#gallery"]
+
+
+def test_docx_parser_recognizes_styled_titles_without_hash_author(tmp_path: Path):
+    source = tmp_path / "styled.docx"
+    make_styled_docx(
+        source,
+        [
+            ("261期 20260912-0918", 52, True),
+            ("《Game》正式发售", 22, False),
+            ("新作", 32, True),
+            ("《Game》正式发售", 30, True),
+            ("正文 https://official.example/news", 22, False),
+            ("汉化", 32, True),
+            ("《Translated Game》汉化发布", 30, True),
+            ("汉化正文 https://translation.example/news", 22, False),
+        ],
+    )
+
+    issue = DocxDocumentParser().parse(source, "261")
+
+    assert [entry.section for entry in issue.entries] == ["新作", "汉化"]
+    assert issue.entries[0].title == "《Game》正式发售"
+    assert issue.entries[0].author is None
+    assert issue.entries[0].source_urls == ["https://official.example/news"]
+    assert issue.entries[1].author is None
+    assert issue.entries[1].source_urls == ["https://translation.example/news"]
 
 
 def test_rule_analyzer_extracts_entities_event_date_and_image_need():
