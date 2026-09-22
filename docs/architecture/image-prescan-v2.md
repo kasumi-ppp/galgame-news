@@ -21,9 +21,13 @@
 3. `discovery/`：来源解析、搜索 Provider、网页与平台 Adapter、候选收集。
 4. `curation/`：下载安全、有效性过滤、哈希去重、评分及全期图片分配。
 5. `delivery/`：SQLite 历史、人工复核数据和输出文件。
-6. `application.py` 与 `cli.py`：唯一编排层；业务模块之间不得互相反向导入。
+6. `pipeline/runner.py`：唯一公开编排层；`application.py`、`cli.py` 与桌面端只提供兼容或 UI 入口。
 
-允许依赖方向：`application → ingestion/discovery/curation/delivery → domain`。`domain` 不依赖其他业务模块。
+允许依赖方向：`pipeline → ingestion/discovery/curation/delivery → domain`；`application` 和前端只依赖 pipeline 合约。`domain` 不依赖其他业务模块。
+
+`pipeline/workspace.py` 集中处理任务目录、路径约束和暂存目录，
+`pipeline/checkpoint.py` 集中处理检查点 JSON、校验和输入/config hash。两者
+只提供 runner 的内部实现辅助，不改变 `PipelineRunner` 的公开接口。
 
 ## 公共模型
 
@@ -196,7 +200,7 @@ X 配置 `X_BEARER_TOKEN` 时调用官方接口；没有凭据或访问失败时
 
 ```text
 output/{issue}/
-  images/{news_id}/{rank}_{candidate_id}.{ext}
+  images/{xN|hN|zN}/{xN|hN|zN}.{rank}.{ext}
   image_index.json
   image_index.md
   failed_items.json
@@ -214,7 +218,6 @@ output/{issue}/
 
 ## 验收
 
-- 19 份现有 DOCX 均完成处理且每条新闻有状态。
+- 普通 CI 完全离线；真实网络验证不属于结构重构验证。
 - 第259期和另一份周报人工标注集上的图片召回率不低于 85%，错误匹配率低于 5%。
 - 每期人工审核不超过 30 分钟。
-- 普通 CI 完全离线；真实网络验证通过单独的 `live-smoke` 命令运行。

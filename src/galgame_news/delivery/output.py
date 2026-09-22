@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import json
-import os
 import shutil
-import tempfile
 import re
-import unicodedata
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..domain import ImageCandidate, ImageType, OutputManifest, PipelineResult, VideoStatus
+from .helpers import atomic_json_write, item_names as canonical_item_names, safe_video_name, section_label, section_prefix
 
 
 class OutputManager:
@@ -73,89 +70,21 @@ class OutputManager:
 
     @staticmethod
     def _section_label(item) -> str:
-        section = (item.section or "news").strip()
-        # Some legacy DOCX files contain replacement characters in section labels;
-        # keep sample folders readable while preserving the sequence number.
-        if "\ufffd" in section:
-            section = "新作" if item.sequence <= 10 else "其他"
-        return section or "news"
+        return section_label(item)
 
     @classmethod
     def _section_prefix(cls, section: str) -> str:
-        """Map the editorial section aliases to the canonical folder prefix."""
-
-        normalized = re.sub(r"\s+", "", unicodedata.normalize("NFKC", section).casefold())
-        if "新作" in normalized:
-            return "x"
-        if "汉化" in normalized or "漢化" in normalized:
-            return "h"
-        # Weekly issues use several labels for the remaining columns.  Both
-        # simplified/traditional forms and their common suffixes are accepted.
-        if any(
-            alias in normalized
-            for alias in (
-                "周边", "周邊", "周报", "周報", "业界", "業界", "动画", "動畫",
-                "旧作", "舊作", "其他", "其它", "资讯", "資訊", "杂项", "雜項",
-            )
-        ):
-            return "z"
-        # Every non-new/non-localized item is part of the remaining weekly
-        # columns.  Keep unknown labels deterministic and in the z namespace;
-        # callers can still preserve the original section in JSON metadata.
-        return "z"
+        return section_prefix(section)
 
     @classmethod
     def item_names(cls, items) -> dict[str, str]:
-        """Return canonical xN/hN/zN folder names in document order.
-
-        The helper accepts both domain objects and the dictionaries stored in
-        review manifests so raw and final exports share exactly one naming
-        policy.
-        """
-
-        def value(item, *keys, default=None):
-            for key in keys:
-                if isinstance(item, dict):
-                    candidate = item.get(key)
-                else:
-                    candidate = getattr(item, key, None)
-                if candidate is not None:
-                    return candidate
-            return default
-
-        counters = {"x": 0, "h": 0, "z": 0}
-        names: dict[str, str] = {}
-        # ``items`` is already the document order.  Number each category by
-        # appearance within that category rather than by the global sequence.
-        for item in items:
-            section_value = value(item, "section", default="news")
-            sequence = value(item, "sequence", default=0)
-            section = str(section_value or "news").strip() or "news"
-            if "\ufffd" in section:
-                section = "新作" if int(sequence or 0) <= 10 else "其他"
-            prefix = cls._section_prefix(section)
-            counters[prefix] += 1
-            item_id = value(item, "id", "news_id")
-            if item_id:
-                names[str(item_id)] = f"{prefix}{counters[prefix]}"
-        return names
+        return canonical_item_names(items)
 
     # Private compatibility alias used by older delivery callers.
     _item_names = item_names
 
     def _atomic_json(self, path: Path, payload) -> None:
-        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
-                handle.write("\n")
-            os.replace(name, path)
-        except Exception:
-            try:
-                os.unlink(name)
-            except OSError:
-                pass
-            raise
+        atomic_json_write(path, payload, default=str)
 
     @classmethod
     def _is_reviewable_failed_candidate(cls, candidate: ImageCandidate) -> bool:
@@ -199,11 +128,7 @@ class OutputManager:
 
     @staticmethod
     def _safe_video_name(candidate, fallback: str) -> str:
-        source = Path(candidate.local_path or "")
-        extension = source.suffix or ".mp4"
-        raw = candidate.title or source.stem or f"{fallback}_video"
-        raw = re.sub(r'[\\/:*?"<>|]', "", raw).strip().rstrip(".")
-        return f"{raw or fallback + '_video'}{extension.casefold()}"
+        return safe_video_name(candidate, fallback)
 
     @classmethod
     def _video_index_payload(cls, result: PipelineResult, videos) -> dict:

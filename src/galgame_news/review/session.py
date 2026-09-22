@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import shutil
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -24,7 +22,7 @@ from ..domain import (
     candidate_id_for,
     video_candidate_id_for,
 )
-from ..delivery.output import OutputManager
+from ..delivery.helpers import atomic_json_write, item_names as canonical_item_names, safe_title
 
 
 class ReviewDecision(str, Enum):
@@ -112,9 +110,7 @@ def _review_ids(payload: Any) -> set[str]:
 
 
 def _safe_title(value: Any, fallback: str) -> str:
-    text = str(value or "")
-    text = re.sub(r'[\\/:*?"<>|]', "", text).strip().rstrip(".")
-    return text or fallback
+    return safe_title(value, fallback)
 
 
 class ReviewSession:
@@ -440,27 +436,14 @@ class ReviewSession:
 
     def _persist(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=f".{self.state_path.name}.", suffix=".tmp", dir=self.state_path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(
-                    {
-                        "schema_version": 1,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                        "decisions": {key: value.value for key, value in sorted(self._decisions.items())},
-                    },
-                    handle,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                handle.write("\n")
-            os.replace(temp_name, self.state_path)
-        except Exception:
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-            raise
+        atomic_json_write(
+            self.state_path,
+            {
+                "schema_version": 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "decisions": {key: value.value for key, value in sorted(self._decisions.items())},
+            },
+        )
 
     def decision(self, media_id: str) -> ReviewDecision:
         return self._decisions.get(str(media_id), ReviewDecision.REJECTED)
@@ -602,7 +585,7 @@ class ReviewSession:
         # Use the same canonical naming policy as raw output.  Manifest order
         # is the editorial appearance order; sorting by global sequence would
         # renumber categories when legacy manifests contain non-monotonic IDs.
-        names = OutputManager.item_names(self.news_items)
+        names = canonical_item_names(self.news_items)
         counters = {
             prefix: sum(name.startswith(prefix) for name in names.values())
             for prefix in ("x", "h", "z")
@@ -721,16 +704,4 @@ class ReviewSession:
 
     @staticmethod
     def _atomic_json(path: Path, payload: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-            os.replace(temp_name, path)
-        except Exception:
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-            raise
+        atomic_json_write(path, payload, ensure_parent=True)

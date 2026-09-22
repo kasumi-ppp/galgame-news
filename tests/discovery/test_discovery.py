@@ -106,6 +106,29 @@ def test_direct_image_adapter_returns_candidate_without_fetching_html():
     assert [c.image_url for c in result.candidates] == ["https://cdn.example/cg.jpg"]
 
 
+def test_official_html_accepts_injected_client():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+
+    class Client:
+        def __init__(self):
+            self.urls = []
+
+        def get(self, url):
+            self.urls.append(url)
+            return FakeResponse(text='<img src="/gallery/cg01.jpg">', url=url)
+
+    client = Client()
+    adapter = OfficialHtmlAdapter(client=client)
+    result = adapter.collect(
+        item(),
+        SourceRef(url="https://official.example/gallery", domain="official.example", source_type=SourceType.OFFICIAL_SITE),
+        CollectionContext(),
+    )
+
+    assert client.urls == ["https://official.example/gallery"]
+    assert result.candidates[0].image_url == "https://official.example/gallery/cg01.jpg"
+
+
 def test_x_without_token_keeps_source_and_requires_manual_review():
     from galgame_news.discovery.adapters import XAdapter
 

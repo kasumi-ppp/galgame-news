@@ -1,10 +1,21 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _build_module():
+    spec = importlib.util.spec_from_file_location("galgame_news_packaging_build", ROOT / "packaging" / "build.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_pyinstaller_spec_is_syntax_valid_and_targets_portable_executable():
@@ -19,6 +30,17 @@ def test_pyinstaller_spec_is_syntax_valid_and_targets_portable_executable():
     assert '"desktop_entry.py"' in source
     assert "console=False" in source
     assert 'contents_directory="."' in source
+
+
+def test_pyinstaller_spec_excludes_unneeded_bindings_and_dev_science_stacks():
+    source = (ROOT / "packaging" / "GalgameNewsToolbox.spec").read_text(encoding="utf-8")
+    expected_excludes = {
+        "PyQt5", "PyQt6", "PySide2", "tkinter", "pytest", "IPython",
+        "sphinx", "black", "jedi", "docutils", "nbformat", "matplotlib", "numpy",
+    }
+    assert "excludes=EXCLUDED_OPTIONAL_MODULES" in source
+    assert expected_excludes <= set(source.split('EXCLUDED_OPTIONAL_MODULES =', 1)[1].split(']', 1)[0].replace('"', '').replace(',', '').split())
+    assert '"PySide6"' not in source
 
 
 def test_desktop_build_entry_uses_absolute_import():
@@ -39,3 +61,38 @@ def test_build_entry_is_importable_without_pyinstaller():
     assert tree
     assert "PyInstaller" in source
     assert "download" not in source.casefold()
+
+
+def test_publish_bundle_rolls_back_only_runtime_files_on_copy_failure(monkeypatch, tmp_path):
+    build = _build_module()
+    staged = tmp_path / "staged"
+    target = tmp_path / "dist" / "GalgameNewsToolbox"
+    staged.mkdir()
+    target.mkdir(parents=True)
+    (staged / "a_new.txt").write_text("new", encoding="utf-8")
+    (staged / "b_existing.txt").write_text("replacement", encoding="utf-8")
+    (target / "b_existing.txt").write_text("original", encoding="utf-8")
+    (target / "unknown.txt").write_text("keep", encoding="utf-8")
+    output = target / "output"
+    output.mkdir()
+    (output / "user-data.txt").write_text("keep", encoding="utf-8")
+
+    original_copy2 = build.shutil.copy2
+    staged_copies = 0
+
+    def flaky_copy2(source, destination, *args, **kwargs):
+        nonlocal staged_copies
+        if Path(source).resolve().is_relative_to(staged.resolve()):
+            staged_copies += 1
+            if staged_copies == 2:
+                raise OSError("simulated runtime copy failure")
+        return original_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(build.shutil, "copy2", flaky_copy2)
+    with pytest.raises(OSError, match="simulated runtime copy failure"):
+        build.publish_bundle(staged, target)
+
+    assert not (target / "a_new.txt").exists()
+    assert (target / "b_existing.txt").read_text(encoding="utf-8") == "original"
+    assert (target / "unknown.txt").read_text(encoding="utf-8") == "keep"
+    assert (output / "user-data.txt").read_text(encoding="utf-8") == "keep"

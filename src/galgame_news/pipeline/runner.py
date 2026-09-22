@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
-import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from pathlib import PureWindowsPath
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -46,11 +43,12 @@ from ..ingestion import DocxDocumentParser, OpenAINewsAnalyzer, RuleBasedNewsAna
 from .contracts import (
     CancellationRequested,
     CancellationToken,
-    Checkpoint,
     ProgressEvent,
     TaskRequest,
     TaskResult,
 )
+from . import checkpoint as checkpoint_io
+from . import workspace
 
 
 class _NoNewsItemsError(ValueError):
@@ -61,8 +59,8 @@ class PipelineRunner:
     """Run one task with isolated output and strict resumable checkpoints."""
 
     CHECKPOINT_SCHEMA_VERSION = 1
-    _MAX_ISSUE_LABEL_LENGTH = 64
-    _UNSAFE_TASK_LABEL_CHARS = frozenset('/\\<>:"|?*')
+    _MAX_ISSUE_LABEL_LENGTH = workspace.MAX_ISSUE_LABEL_LENGTH
+    _UNSAFE_TASK_LABEL_CHARS = workspace.UNSAFE_TASK_LABEL_CHARS
 
     def __init__(
         self,
@@ -801,80 +799,25 @@ class PipelineRunner:
         return result
 
     def _task_paths(self, request):
-        output_root = Path(request.output_dir).resolve()
-        if self._legacy_output:
-            task_dir = output_root
-            return task_dir, task_dir, task_dir / "checkpoint.json", request.task_id or request.issue_id
-        task_label = self._safe_task_label(request.issue_id)
-        if request.resume:
-            if request.task_dir is None:
-                raise ValueError("resume requires task_dir")
-            task_dir = Path(request.task_dir).resolve()
-            if not self._within(task_dir, output_root):
-                raise ValueError("task_dir escapes output root")
-            raw_dir = task_dir / "raw"
-            checkpoint = task_dir / "checkpoint.json"
-            if request.checkpoint_path is not None and Path(request.checkpoint_path).resolve() != checkpoint:
-                raise ValueError("checkpoint_path must be task_dir/checkpoint.json")
-            return task_dir, raw_dir, checkpoint, request.task_id or task_dir.name
-        if request.task_dir is not None or request.checkpoint_path is not None:
-            raise ValueError("arbitrary task paths are forbidden for new tasks")
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        task_dir = output_root / f"{task_label}-{stamp}-{uuid.uuid4().hex[:8]}"
-        return task_dir, task_dir / "raw", task_dir / "checkpoint.json", request.task_id or task_dir.name
+        paths = workspace.resolve_task_paths(request, legacy_output=self._legacy_output)
+        return paths.task_dir, paths.raw_dir, paths.checkpoint_path, paths.task_id
 
     @classmethod
     def _safe_task_label(cls, issue_id: str) -> str:
-        """Validate the issue id before using it as one directory component.
-
-        The issue id remains unchanged in domain objects and published JSON;
-        this label is only for the runner's timestamped task directory.
-        """
-
-        value = str(issue_id)
-        label = value.strip()
-        if not label or len(value) > cls._MAX_ISSUE_LABEL_LENGTH:
-            raise ValueError("unsafe issue_id")
-        if ".." in value or any(char in cls._UNSAFE_TASK_LABEL_CHARS for char in value):
-            raise ValueError("unsafe issue_id")
-        if Path(value).is_absolute() or PureWindowsPath(value).is_absolute():
-            raise ValueError("unsafe issue_id")
-        if any(unicodedata.category(char) == "Cc" for char in value):
-            raise ValueError("unsafe issue_id")
-        if label.endswith("."):
-            raise ValueError("unsafe issue_id")
-        return label
+        return workspace.safe_task_label(issue_id)
 
     @staticmethod
     def _within(path, root):
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
+        return workspace.within(path, root)
 
     def _prepare_task_dir(self, task_dir, request):
-        if request.resume:
-            if not task_dir.is_dir():
-                raise FileNotFoundError(f"task directory is missing: {task_dir}")
-            return
-        if self._legacy_output:
-            task_dir.parent.mkdir(parents=True, exist_ok=True)
-            task_dir.mkdir(parents=True, exist_ok=True)
-            return
-        task_dir.parent.mkdir(parents=True, exist_ok=True)
-        task_dir.mkdir(exist_ok=False)
-        (task_dir / ".work").mkdir()
+        workspace.prepare_task_dir(task_dir, request, legacy_output=self._legacy_output)
 
     def _image_stage(self, task_dir):
-        stage = task_dir / ".work" / "images"
-        stage.mkdir(parents=True, exist_ok=True)
-        return stage
+        return workspace.image_stage(task_dir)
 
     def _video_stage(self, task_dir):
-        stage = task_dir / ".work" / "videos"
-        stage.mkdir(parents=True, exist_ok=True)
-        return stage
+        return workspace.video_stage(task_dir)
 
     def _resolver_for(self, request):
         if request.offline and not self._resolver_injected:
@@ -914,82 +857,49 @@ class PipelineRunner:
 
     @staticmethod
     def _sha256(path):
-        digest = hashlib.sha256()
-        with Path(path).open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
+        return checkpoint_io.sha256_path(path)
 
     def _config_hash(self, config=None, request=None):
-        config = config or self.config
-        behavior = {}
-        if request is not None:
-            behavior = {
-                "offline": request.offline, "no_videos": request.no_videos,
-                "max_images": request.max_images,
-                "llm_provider": request.llm_provider, "llm_model": request.llm_model,
-            }
-        payload = {"config": config.model_dump(mode="json"), "request": behavior}
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return checkpoint_io.config_hash(config or self.config, request)
 
     def _write_checkpoint(
         self, path, *, status, task_id, issue, input_hash, config_hash,
         completed_news_ids, candidates, videos, failures, source_map, result=None,
     ):
-        checkpoint = Checkpoint(
-            schema_version=self.CHECKPOINT_SCHEMA_VERSION, status=status,
-            task_id=task_id, issue_id=issue.issue_id, input_sha256=input_hash,
-            config_sha256=config_hash, issue=issue,
-            completed_news_ids=sorted(completed_news_ids),
-            candidates=list(candidates), videos=self._dedupe_videos(videos),
-            failures=self._merge_failures(failures), source_map=source_map,
+        checkpoint_io.write_checkpoint(
+            path,
+            status=status,
+            task_id=task_id,
+            issue=issue,
+            input_hash=input_hash,
+            config_hash_value=config_hash,
+            completed_news_ids=completed_news_ids,
+            candidates=candidates,
+            videos=videos,
+            failures=failures,
+            source_map=source_map,
             result=result,
+            schema_version=self.CHECKPOINT_SCHEMA_VERSION,
+            dedupe_videos=self._dedupe_videos,
+            merge_failures=self._merge_failures,
         )
-        self._validate_checkpoint_associations(checkpoint)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
-        temporary.write_text(
-            json.dumps(checkpoint.model_dump(mode="json"), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
 
     def _load_checkpoint(self, path):
-        return Checkpoint.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
+        return checkpoint_io.load_checkpoint(path)
 
     def _validate_checkpoint(self, checkpoint, request, input_hash, config_hash, task_id):
-        if checkpoint.schema_version != self.CHECKPOINT_SCHEMA_VERSION:
-            raise ValueError("checkpoint schema mismatch")
-        if checkpoint.issue_id != request.issue_id or checkpoint.issue.issue_id != request.issue_id:
-            raise ValueError("checkpoint issue mismatch")
-        if checkpoint.task_id != task_id:
-            raise ValueError("checkpoint task mismatch")
-        if checkpoint.input_sha256 != input_hash:
-            raise ValueError("checkpoint input mismatch")
-        if checkpoint.config_sha256 != config_hash:
-            raise ValueError("checkpoint config mismatch")
-        self._validate_checkpoint_associations(checkpoint)
-        if checkpoint.status == "completed" and checkpoint.result is None:
-            raise ValueError("completed checkpoint has no result")
+        checkpoint_io.validate_checkpoint(
+            checkpoint,
+            request,
+            input_hash,
+            config_hash,
+            task_id,
+            schema_version=self.CHECKPOINT_SCHEMA_VERSION,
+        )
 
     @staticmethod
     def _validate_checkpoint_associations(checkpoint):
-        ids = {item.id for item in checkpoint.issue.news_items}
-        if len(ids) != len(checkpoint.issue.news_items) or None in ids:
-            raise ValueError("checkpoint issue has invalid news ids")
-        if not set(checkpoint.completed_news_ids).issubset(ids):
-            raise ValueError("checkpoint completed news id is unknown")
-        if not set(checkpoint.source_map).issubset(ids):
-            raise ValueError("checkpoint source map news id is unknown")
-        for candidate in checkpoint.candidates:
-            if candidate.news_id not in ids:
-                raise ValueError("checkpoint candidate news id is unknown")
-        for video in checkpoint.videos:
-            if video.news_id not in ids:
-                raise ValueError("checkpoint video news id is unknown")
-        if checkpoint.result is not None and checkpoint.result.issue.issue_id != checkpoint.issue_id:
-            raise ValueError("checkpoint result issue mismatch")
+        checkpoint_io.validate_checkpoint_associations(checkpoint)
 
     @staticmethod
     def _dedupe_videos(videos):

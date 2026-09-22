@@ -6,15 +6,26 @@ The release artifact is a PyInstaller onedir bundle named
 Install the pinned build tooling in a clean virtual environment, then run:
 
 ```powershell
-python -m pip install -e ".[build]"
+python -m pip install -e ".[desktop,dev,build]"
 python packaging/build.py
 ```
 
-The generated bundle is written below `dist/GalgameNewsToolbox/`. The spec
-includes the repository `config/` and an optional repository `assets/`
-directory. A release maintainer may place already-acquired `ffmpeg.exe` and
-`ffprobe.exe` below `bin/`; the spec copies those files when present. The
-build never downloads FFmpeg and no FFmpeg binaries are committed here.
+The generated bundle is staged outside the repository and then overlaid below
+`dist/GalgameNewsToolbox/`. The spec includes only `config/default.toml`, plus
+an optional repository `assets/` directory. A release maintainer may place
+already-acquired `ffmpeg.exe` and `ffprobe.exe` below `bin/`; the spec copies
+those files when present. The build never downloads FFmpeg and no FFmpeg
+binaries are committed here.
+
+The overlay never deletes unknown bundle files or `dist/.../output` user data.
+If the target executable is in use, publication fails before copying files.
+After a successful Windows build, `00_启动工具箱.lnk` points to the bundle
+executable with the repository root as its working directory.
+
+The spec keeps PySide6 as the only Qt binding and explicitly excludes PyQt5,
+PyQt6, PySide2, tkinter, test/notebook/documentation modules, and unused
+scientific stacks such as NumPy and Matplotlib. These packages are not imported
+by the production entry point; project runtime dependencies remain included.
 
 Desktop UI and keyring support are optional extras. The headless CLI must be
 usable from the base installation, so do not import PySide6 or keyring from

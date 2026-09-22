@@ -8,9 +8,3 @@ def test_evaluate_reports_metrics_and_success(tmp_path):
     result = subprocess.run([sys.executable, "scripts/evaluate.py", str(tmp_path)], capture_output=True, text=True)
     assert result.returncode == 0
     assert "recall" in result.stdout
-
-
-def test_live_smoke_requires_explicit_network_flag():
-    result = subprocess.run([sys.executable, "scripts/live_smoke.py"], capture_output=True, text=True)
-    assert result.returncode != 0
-    assert "allow-network" in result.stderr

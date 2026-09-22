@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import os
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import load_config
-from .curation import ImageCurator, ImageDownloader
 from .discovery.adapters import DirectImageAdapter, DynamicPageAdapter, OfficialHtmlAdapter, SteamAdapter, VideoAdapter, XAdapter
 from .discovery.resolver import DefaultSourceResolver
-from .domain import CollectionContext, FailureRecord, FailureStage, Issue, PipelineResult, ReviewReason, SourceType, VideoStatus
+from .domain import PipelineResult, ReviewReason, SourceType
 from .ingestion import DocxDocumentParser, OpenAINewsAnalyzer, RuleBasedNewsAnalyzer
-from .delivery.output import OutputManager
 from .delivery.history import SQLiteHistoryStore
 from .pipeline import CancellationToken, PipelineRunner, TaskRequest
 
@@ -100,39 +96,3 @@ class Application:
         if self.no_videos:
             pipeline_result.videos = []
         return pipeline_result
-
-    def _download_videos(self, candidates, output_dir):
-        if self.video_downloader_factory is None:
-            from .video import VideoDownloader
-            downloader = VideoDownloader(self.config.video, ffmpeg_detector=self.video_ffmpeg_detector)
-        else:
-            try:
-                downloader = self.video_downloader_factory(self.config.video, ffmpeg_detector=self.video_ffmpeg_detector)
-            except TypeError:
-                downloader = self.video_downloader_factory(self.config.video)
-        return downloader.download(candidates, output_dir)
-
-    def _curate_and_write(self, issue, candidates, failures, output_dir, source_map=None, videos=None):
-        curated = ImageCurator(self.config).curate(issue, candidates, self.history)
-        failures.extend(curated.failures)
-        if self.max_images is not None:
-            for news_id in {candidate.news_id for candidate in curated.candidates}:
-                selected = [candidate for candidate in curated.candidates if candidate.news_id == news_id and candidate.selected]
-                for candidate in selected[self.max_images:]:
-                    candidate.selected = False
-        result = PipelineResult(issue=issue, candidates=curated.candidates, filtered_candidates=curated.filtered_candidates, failures=failures, videos=list(videos or []))
-        result.review_required = [candidate for candidate in result.all_candidates if candidate.review_reasons]
-        if self.history is not None:
-            from .domain import NewsResult
-            for news in issue.news_items:
-                try:
-                    self.history.record_news_result(NewsResult(
-                        news_item=news,
-                        sources=(source_map or {}).get(news.id, []),
-                        candidates=[candidate for candidate in result.candidates if candidate.news_id == news.id],
-                        failures=[failure for failure in result.failures if failure.news_id == news.id],
-                    ))
-                except Exception as exc:
-                    result.failures.append(FailureRecord(stage=FailureStage.HISTORY, news_id=news.id, code="history_error", message=str(exc), retryable=True))
-        OutputManager().write(result, output_dir)
-        return result

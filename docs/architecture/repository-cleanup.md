@@ -1,90 +1,44 @@
-# Repository Cleanup Design
+# Repository structure
 
-## Goal
-
-Reduce the repository to the Galgame image-prescan v2 implementation and its
-verification assets. Keep user DOCX inputs and generated outputs on disk, but
-remove them from the Git interface.
-
-## Preserved project surface
-
-The maintained project surface is:
-
-- `src/galgame_news/`: production package and `python -m galgame_news` CLI.
-- `tests/`: v2 unit, contract, regression, and integration tests.
-- `tests/fixtures/`: deterministic offline regression fixtures.
-- `config/default.toml`: versioned default configuration.
-- `scripts/`: evaluation and live-smoke helpers.
-- `docs/architecture/`: current architecture and this cleanup decision.
-- `README.md`, `pyproject.toml`, and `requirements.txt`.
-
-The local `input/` and `output/` directories are preserved without deleting
-or moving their contents. They are ignored by Git.
-
-## Removed project surface
-
-The following paths are deleted because the v2 package does not consume them:
-
-- `image_prescan.py`, `legacy/`, `tests/legacy/`, and `docs/legacy/`.
-- `agents/` and `docs/superpowers/`, whose implementation briefs are complete.
-- Untracked `galnews.py` and `galnews_v2.py`.
-- Untracked `config/sources.json` and `config/sources_v2.json`.
-- The registered `.superpowers/worktrees/image-prescan-v2` worktree and its
-  generated state, cache, and output files. The branch has no commits absent
-  from `main`.
-- `.idea/`, `.pytest_cache/`, `.ruff_cache/`, `cache/`, root and package
-  `__pycache__/` directories, `*.pyc`, and all root `.tmp-*/` directories.
-
-The old tracked `output/259_images_final/` sample is removed from Git. No
-other local output is deleted.
-
-## Repository interface
-
-The supported invocation is:
+The maintained implementation lives in `src/galgame_news/` and is launched
+with the module CLI:
 
 ```powershell
 python -m galgame_news run INPUT.docx --issue ISSUE --output output/ISSUE
 ```
 
-`README.md` documents this interface and no longer advertises the legacy
-single-file command.
+The production flow is intentionally layered:
 
-The ignore rules cover:
+- `domain.py` and `config.py` define models, enums, and validated settings.
+- `ingestion/`, `discovery/`, and `curation/` parse, discover, download, and
+  score candidates.
+- `pipeline/runner.py` is the single public orchestration entry point;
+  `pipeline/workspace.py` owns task-directory safety and
+  `pipeline/checkpoint.py` owns checkpoint persistence and integrity checks.
+- `delivery/` writes deterministic raw indexes and stores review state.
+- `review/` performs non-destructive decisions and final export.
+- `desktop/` and `cli.py` are frontends over the same runner contracts.
 
-- Python, pytest, ruff, and IDE caches.
-- `.tmp-*/`, `.state/`, `cache/`, and `.superpowers/`.
-- `input/` and `output/`.
-- Local source-discovery JSON files under `config/sources*.json`.
+Discovery adapters remain import-compatible through
+`galgame_news.discovery.adapters`, now organized as `adapters/html.py`,
+`adapters/x.py`, `adapters/media.py`, and shared `adapters/common.py`.
 
-`config/default.toml` remains tracked.
+## Local data and packaging
 
-## Credential handling
+`input/`, `output/`, `.state/`, `cache/`, `dist/`, `build/`, and generated
+Python metadata are local-only paths. Existing user files in those paths are
+not removed by structural cleanup. The packaging spec includes only
+`config/default.toml`, plus optional `assets/` and `bin/` files. The build
+script builds in a temporary staging directory, overlays only produced files
+into `dist/GalgameNewsToolbox/`, preserves unknown bundle files and
+`dist/.../output`, and creates the root `00_启动工具箱.lnk` on Windows after a
+successful build.
 
-The two untracked news-collection scripts contain non-empty hard-coded API-key
-literals. They must be deleted without printing or committing their contents.
-Deleting the files does not revoke a credential; any real credentials used in
-them should be rotated separately.
+The former `image_prescan.py` implementation, its legacy engine, and the
+tests/docs dedicated solely to that engine are retired. The compatibility
+script now exits non-zero with the supported module-CLI usage. `scripts/` keeps
+the offline `evaluate.py` helper; the empty live-smoke placeholder is removed.
 
-The maintained v2 implementation reads optional credentials from environment
-variables and must not persist credential-bearing URL query parameters in
-output indexes.
-
-## Verification
-
-After cleanup:
-
-1. Run `python -m pytest -q`.
-2. Run `python -m compileall -q src tests`.
-3. Run `git diff --check`.
-4. Search tracked files for common credential-assignment patterns without
-   printing secret values.
-5. Confirm `input/` and `output/` still exist and their file counts are
-   unchanged from the pre-cleanup snapshot.
-6. Confirm Git status contains only the intended cleanup commit plus the two
-   pre-existing user-modified v2 test files.
-
-## Delivery
-
-Commit the cleanup independently on `main`, then push `main` to `origin`.
-The push includes the eight existing local commits already ahead of
-`origin/main`.
+No network or model call is part of structural verification. Runtime behavior,
+checkpoint schema, retry semantics, event order, output naming, and public
+imports remain unchanged.

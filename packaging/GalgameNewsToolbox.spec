@@ -12,14 +12,38 @@ PROJECT_ROOT = SPEC_ROOT.parent
 SRC_ROOT = PROJECT_ROOT / "src"
 # PyInstaller appends .exe to this name on Windows.
 TARGET_EXECUTABLE = "GalgameNewsToolbox.exe"
+EXCLUDED_OPTIONAL_MODULES = [
+    # Keep the packaged desktop binding unambiguous: the application uses
+    # PySide6, and Anaconda may otherwise make PyInstaller discover every Qt
+    # binding installed in the environment.
+    "PyQt5",
+    "PyQt6",
+    "PySide2",
+    "tkinter",
+    # Development, notebook, documentation, and scientific stacks are not
+    # imported by the production entry point.
+    "pytest",
+    "pytestqt",
+    "IPython",
+    "sphinx",
+    "black",
+    "jedi",
+    "docutils",
+    "nbformat",
+    "matplotlib",
+    "numpy",
+]
 
 
 def _data_files() -> list[tuple[str, str]]:
     data: list[tuple[str, str]] = []
-    for directory_name in ("config", "assets"):
-        directory = PROJECT_ROOT / directory_name
-        if directory.is_dir():
-            data.append((str(directory), directory_name))
+    default_config = PROJECT_ROOT / "config" / "default.toml"
+    if default_config.is_file():
+        data.append((str(default_config), "config"))
+
+    assets = PROJECT_ROOT / "assets"
+    if assets.is_dir():
+        data.append((str(assets), "assets"))
 
     # A release may provide a local bin/ directory, but no binary is fetched
     # by this spec and the repository intentionally does not contain FFmpeg.
@@ -40,7 +64,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=EXCLUDED_OPTIONAL_MODULES,
     noarchive=False,
 )
 pyz = PYZ(a.pure)
