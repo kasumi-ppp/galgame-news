@@ -7,8 +7,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import load_config
-from .discovery.adapters import DirectImageAdapter, DynamicPageAdapter, OfficialHtmlAdapter, SteamAdapter, VideoAdapter, XAdapter
+from .discovery.adapters import DirectImageAdapter, DynamicPageAdapter, OfficialHtmlAdapter, SteamAdapter, VideoAdapter
 from .discovery.resolver import DefaultSourceResolver
+from .discovery.x_api import create_x_adapter
 from .domain import PipelineResult, ReviewReason, SourceType
 from .ingestion import DocxDocumentParser, OpenAINewsAnalyzer, RuleBasedNewsAnalyzer
 from .delivery.history import SQLiteHistoryStore
@@ -51,7 +52,7 @@ class Application:
             if source.source_type is SourceType.STEAM:
                 return SteamAdapter(transport=self.source_transport)
             if source.source_type is SourceType.OFFICIAL_X:
-                return XAdapter(token=os.getenv("X_BEARER_TOKEN"), public_transport=self.source_transport)
+                return create_x_adapter(public_transport=self.source_transport)
             return OfficialHtmlAdapter(transport=self.source_transport)
 
         def progress(event):

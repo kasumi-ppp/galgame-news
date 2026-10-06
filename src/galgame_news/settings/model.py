@@ -76,6 +76,7 @@ class AppSettings(BaseModel):
     )
     max_video_height: int = Field(default=1080, gt=0)
     theme: Literal["system", "light", "dark"] = "system"
+    browser_enabled: bool = True
     ffmpeg_location: Path | None = Field(
         default=None,
         validation_alias=AliasChoices("ffmpeg_location", "ffmpeg_path"),

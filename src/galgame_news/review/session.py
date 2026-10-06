@@ -12,8 +12,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
 
+from PIL import Image
+
 from ..domain import (
     ImageCandidate,
+    ImageEvidence,
     ImageType,
     ScoreBreakdown,
     SourceType,
@@ -23,6 +26,8 @@ from ..domain import (
     video_candidate_id_for,
 )
 from ..delivery.helpers import atomic_json_write, item_names as canonical_item_names, safe_title
+from ..delivery.image_conversion import ImageConversionError, ImageConverter
+from ..delivery.asset_paths import recover_asset_path
 
 
 class ReviewDecision(str, Enum):
@@ -139,6 +144,7 @@ class ReviewSession:
         raw_types: dict[str, str],
         review_ids: set[str],
         failed_ids: set[str],
+        ambiguous_image_ids: set[str] | None = None,
     ):
         self.output_dir = output_dir
         self.task_root = task_root or state_path.parent
@@ -150,6 +156,7 @@ class ReviewSession:
         self._raw_types = raw_types
         self._review_ids = review_ids
         self._failed_ids = failed_ids
+        self._ambiguous_image_ids = ambiguous_image_ids or set()
         self._decisions: dict[str, ReviewDecision] = {}
         self._image_by_id = {str(item.id): item for item in images}
         self._video_by_id = {str(item.id): item for item in videos}
@@ -189,18 +196,30 @@ class ReviewSession:
         videos: list[VideoCandidate] = []
         source_paths: dict[str, Path] = {}
         raw_types: dict[str, str] = {}
-        seen_images: set[str] = set()
+        seen_images: dict[str, str] = {}
+        ambiguous_image_ids: set[str] = set()
         seen_videos: set[str] = set()
         for raw in image_items:
             candidate, stable_id = cls._coerce_image(raw)
-            if candidate is None or stable_id in seen_images:
+            if candidate is None:
                 continue
-            seen_images.add(stable_id)
+            previous_news_id = seen_images.get(stable_id)
+            if previous_news_id is not None and previous_news_id == candidate.news_id:
+                continue
+            if previous_news_id is not None:
+                # Legacy indexes used URL-only image IDs. Re-key a cross-news
+                # collision locally so review choices stay independent.
+                ambiguous_image_ids.add(stable_id)
+                stable_id = candidate_id_for(candidate.image_url, candidate.news_id)
+                object.__setattr__(candidate, "id", stable_id)
+                if stable_id in seen_images:
+                    continue
+            seen_images[stable_id] = candidate.news_id
             images.append(candidate)
             raw_types[stable_id] = " ".join(
                 [str(raw.get("image_type", "")), *[str(value) for value in raw.get("review_reasons", [])]]
             ).casefold()
-            source = cls._source_path(raw.get("local_path"), root)
+            source = cls._resolve_image_path(candidate, root)
             if source is not None:
                 source_paths[stable_id] = source
         for raw in video_items:
@@ -210,8 +229,9 @@ class ReviewSession:
             seen_videos.add(stable_id)
             videos.append(candidate)
             raw_types[stable_id] = str(raw.get("media_type", "")).casefold()
-            source = cls._source_path(raw.get("local_path"), root)
+            source = cls._resolve_asset_path(raw.get("local_path"), root, candidate.sha256)
             if source is not None:
+                object.__setattr__(candidate, "local_path", str(source))
                 source_paths[stable_id] = source
 
         session = cls(
@@ -225,6 +245,7 @@ class ReviewSession:
             raw_types=raw_types,
             review_ids=review_ids,
             failed_ids=failed_ids,
+            ambiguous_image_ids=ambiguous_image_ids,
         )
         session._initialize_decisions()
         return session
@@ -266,6 +287,51 @@ class ReviewSession:
                     result.add(str(value["candidate_id"]))
         return result
 
+    @classmethod
+    def _resolve_asset_path(cls, value: Any, root: Path, expected_hash: str | None) -> Path | None:
+        if not value or ".." in Path(str(value)).parts:
+            return None
+        source = recover_asset_path(value, root, expected_hash)
+        if source is not None or any(part.casefold() == ".work" for part in Path(str(value)).parts):
+            return source
+        # Existing legacy imports can explicitly reference assets outside the
+        # index folder. Keep that contract, without using it for stage recovery.
+        source = cls._source_path(value, root)
+        if source is not None and expected_hash:
+            try:
+                if hashlib.sha256(source.read_bytes()).hexdigest() != str(expected_hash).casefold():
+                    return None
+            except OSError:
+                return None
+        return source
+
+    @classmethod
+    def _resolve_image_path(cls, candidate: ImageCandidate, root: Path) -> Path | None:
+        resolved: dict[str, Path] = {}
+        for name, expected_hash in (
+            ("local_path", candidate.output_sha256 or candidate.sha256),
+            ("original_path", candidate.original_sha256 or candidate.sha256),
+        ):
+            recorded = getattr(candidate, name)
+            recovered_stage = bool(recorded and any(part.casefold() == ".work" for part in Path(str(recorded)).parts))
+            source = cls._resolve_asset_path(recorded, root, expected_hash)
+            if source is None:
+                object.__setattr__(candidate, name, None)
+                continue
+            if recovered_stage:
+                try:
+                    with Image.open(source) as image:
+                        image.verify()
+                    # verify() checks the container; load() also forces pixel decode.
+                    with Image.open(source) as image:
+                        image.load()
+                except Exception:
+                    object.__setattr__(candidate, name, None)
+                    continue
+            object.__setattr__(candidate, name, str(source))
+            resolved[name] = source
+        return resolved.get("local_path") or resolved.get("original_path")
+
     @staticmethod
     def _source_path(value: Any, root: Path) -> Path | None:
         if not value:
@@ -284,12 +350,20 @@ class ReviewSession:
     def _coerce_image(cls, raw: dict[str, Any]) -> tuple[ImageCandidate | None, str]:
         data = dict(raw)
         image_url = str(data.get("image_url") or data.get("url") or "")
-        stable_id = str(data.get("id") or (candidate_id_for(image_url) if image_url else _stable_fallback(data, "image")))
         news_id = str(data.get("news_id") or data.get("newsId") or "")
+        stable_id = str(data.get("id") or (candidate_id_for(image_url, news_id) if image_url else _stable_fallback(data, "image")))
         if not news_id:
             return None, stable_id
         score_data = data.get("score") if isinstance(data.get("score"), dict) else {}
         total = _clamp(score_data.get("total", data.get("total", 0.0)), 0.0, 100.0)
+        raw_signals = data.get("signals") if isinstance(data.get("signals"), dict) else {}
+        evidence = []
+        if isinstance(data.get("evidence"), list):
+            for item in data["evidence"]:
+                try:
+                    evidence.append(ImageEvidence.model_validate(item))
+                except (TypeError, ValueError):
+                    continue
         score = {
             "relevance": _clamp(score_data.get("relevance", data.get("relevance", total / 100.0)), 0.0, 1.0),
             "freshness": _clamp(score_data.get("freshness", 0.0), 0.0, 1.0),
@@ -318,10 +392,36 @@ class ReviewSession:
             "perceptual_hash": data.get("perceptual_hash"),
             "downloadable": bool(data.get("downloadable", False)),
             "local_path": str(data["local_path"]) if data.get("local_path") else None,
+            "original_path": str(data["original_path"]) if data.get("original_path") else None,
+            "original_mime_type": data.get("original_mime_type"),
+            "original_byte_size": data.get("original_byte_size"),
+            "original_sha256": data.get("original_sha256"),
+            "original_width": data.get("original_width"),
+            "original_height": data.get("original_height"),
+            "output_mime_type": data.get("output_mime_type"),
+            "output_byte_size": data.get("output_byte_size"),
+            "output_sha256": data.get("output_sha256"),
+            "output_width": data.get("output_width"),
+            "output_height": data.get("output_height"),
+            "news_source_url": data.get("news_source_url"),
+            "parent_source_url": data.get("parent_source_url"),
+            "image_alt": data.get("image_alt"),
+            "nearby_text": data.get("nearby_text"),
+            "evidence": evidence,
+            "download_status": data.get("download_status", "pending"),
+            "download_error_code": data.get("download_error_code"),
+            "downloaded_url": data.get("downloaded_url"),
+            "media_source_url": data.get("media_source_url"),
+            "expected_width": data.get("expected_width"),
+            "expected_height": data.get("expected_height"),
+            "selection_reasons": data.get("selection_reasons", []),
+            "animated_source": bool(data.get("animated_source", False)),
+            "animation_frame_index": data.get("animation_frame_index"),
             "review_reasons": [str(item) for item in data.get("review_reasons", []) if item is not None] if isinstance(data.get("review_reasons", []), list) else [],
-            "signals": data.get("signals", {}) if isinstance(data.get("signals"), dict) else {},
+            "signals": raw_signals,
             "score": score,
             "selected": bool(data.get("selected", False)),
+            "curation_status": data.get("curation_status", raw_signals.get("candidate_status", "unselected")),
         }
         try:
             candidate = ImageCandidate.model_validate(payload)
@@ -381,7 +481,7 @@ class ReviewSession:
             self._decisions[str(candidate.id)] = self._initial_video_decision(candidate)
         persisted = self._read_state()
         for media_id, value in persisted.items():
-            if media_id in self._decisions:
+            if media_id in self._decisions and media_id not in self._ambiguous_image_ids:
                 try:
                     self._decisions[media_id] = ReviewDecision(value)
                 except ValueError:
@@ -394,22 +494,10 @@ class ReviewSession:
         return source is not None and source.is_file()
 
     def _hard_filtered(self, candidate: ImageCandidate) -> bool:
-        raw_type = self._raw_types.get(str(candidate.id), "")
-        image_type = getattr(candidate.image_type, "value", str(candidate.image_type)).casefold()
-        raw_tokens = set(re.split(r"[\s,;|]+", raw_type))
-        if raw_tokens & (self._HARD_IMAGE_TYPES | {"low_quality", "image_too_small", "pixel_count_too_small"}) or image_type in self._HARD_IMAGE_TYPES:
-            return True
         signals = candidate.signals if isinstance(candidate.signals, dict) else {}
-        if signals.get("low_quality") is True or signals.get("hard_filtered") is True:
-            return True
-        reasons = {str(getattr(value, "value", value)).casefold() for value in candidate.review_reasons}
-        if reasons & {"logo", "favicon", "icon", "ui", "low_quality", "image_too_small", "pixel_count_too_small"}:
-            return True
-        width, height = candidate.width, candidate.height
-        if width is not None and height is not None:
-            if width < self._LOW_QUALITY_MIN_WIDTH or height < self._LOW_QUALITY_MIN_HEIGHT or width * height < self._LOW_QUALITY_MIN_PIXELS:
-                return True
-        return False
+        # Semantic type and editorial quality may reject auto-selection, but
+        # must not hide an otherwise usable local image from a human reviewer.
+        return signals.get("invalid_file") is True
 
     def _initial_image_decision(self, candidate: ImageCandidate) -> ReviewDecision:
         if self._hard_filtered(candidate):
@@ -459,8 +547,9 @@ class ReviewSession:
         def key(candidate: ImageCandidate):
             score = candidate.score
             return (
-                -(score.relevance if score else 0.0),
                 -(score.total if score else 0.0),
+                -(score.source_trust if score else 0.0),
+                -((candidate.width or 0) * (candidate.height or 0)),
                 str(candidate.id),
             )
 
@@ -617,6 +706,26 @@ class ReviewSession:
                 return candidate
             index += 1
 
+    @staticmethod
+    def _verified_final_image(candidate: ImageCandidate, source: Path) -> tuple[bytes, str] | None:
+        try:
+            data = source.read_bytes()
+            with Image.open(source) as image:
+                actual = (image.format or "").upper()
+                image.verify()
+            mime = "image/png" if actual == "PNG" else "image/jpeg" if actual == "JPEG" else None
+            extension_matches = source.suffix.casefold() in ({".png"} if actual == "PNG" else {".jpg", ".jpeg"} if actual == "JPEG" else set())
+            metadata_matches = candidate.output_mime_type == mime and extension_matches
+            hash_matches = not candidate.output_sha256 or hashlib.sha256(data).hexdigest() == candidate.output_sha256
+            if mime and metadata_matches and hash_matches:
+                return data, mime
+            converted = ImageConverter().convert(data, candidate)
+            return converted.data, converted.mime_type
+        except ImageConversionError:
+            return None
+        except Exception:
+            return None
+
     def export_final(self) -> dict[str, Any]:
         root = self.task_root
         final_root = root / "final"
@@ -632,15 +741,16 @@ class ReviewSession:
             if source is None or not source.is_file():
                 continue
             folder = folder_names.get(str(candidate.news_id), f"x{candidate.news_id}")
+            converted = self._verified_final_image(candidate, source)
+            if converted is None:
+                continue
+            data, mime_type = converted
             image_ranks[folder] = image_ranks.get(folder, 0) + 1
-            extension = self._media_extension(candidate, source, default=".jpg")
-            if extension == ".jpeg":
-                extension = ".jpg"
+            extension = ".jpg" if mime_type == "image/jpeg" else ".png"
             target = image_root / folder / f"{folder}.{image_ranks[folder]:02d}{extension}"
             target.parent.mkdir(parents=True, exist_ok=True)
             target = self._unique_target(target, source)
-            if target.resolve() != source.resolve():
-                shutil.copyfile(source, target)
+            target.write_bytes(data)
             files.append(target.relative_to(final_root).as_posix())
 
         reserved: dict[str, set[str]] = {}
@@ -686,7 +796,7 @@ class ReviewSession:
 
     @staticmethod
     def _media_extension(candidate: ImageCandidate | VideoCandidate, source: Path, *, default: str) -> str:
-        mime_type = getattr(candidate, "mime_type", None)
+        mime_type = getattr(candidate, "output_mime_type", None) or getattr(candidate, "mime_type", None)
         if isinstance(mime_type, str) and "/" in mime_type:
             suffix = mime_type.split("/", 1)[1].split(";", 1)[0].strip().casefold()
             if suffix == "jpeg":

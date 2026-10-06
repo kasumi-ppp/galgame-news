@@ -1,4 +1,7 @@
 from datetime import datetime, timezone
+from io import BytesIO
+
+from PIL import Image
 
 from galgame_news.config import load_config
 from galgame_news.curation.allocator import ImageAllocator
@@ -6,6 +9,12 @@ from galgame_news.domain import ImageCandidate, ImageType, ImageNeed, NewsItem, 
 
 
 NOW = datetime.now(timezone.utc)
+
+
+def _jpeg_bytes(size=(800, 600)):
+    stream = BytesIO()
+    Image.new("RGB", size, "red").save(stream, format="JPEG")
+    return stream.getvalue()
 
 
 def item():
@@ -76,20 +85,22 @@ def test_placeholder_asset_is_rejected_before_transport(tmp_path):
     value = candidate(1, ImageType.UNKNOWN)
     value.image_url = "https://official.example/assets/now_printing.jpeg"
     accepted, failures = ImageDownloader(load_config(), transport=transport).download([value], tmp_path)
-    assert accepted == []
+    assert len(accepted) == 1
+    assert accepted[0].signals["invalid_reason"] == "placeholder_image"
+    assert accepted[0].downloadable is False
     assert calls == []
     assert failures[0].code == "placeholder_image"
 
 
 def test_placeholder_redirect_is_rejected_after_transport(tmp_path):
     from galgame_news.curation.download import ImageDownloader
-    from tests.curation.test_curation import jpeg_bytes
-
     def transport(url, **_):
-        return type("Response", (), {"content": jpeg_bytes((800, 600)), "headers": {"content-type": "image/jpeg"}, "status_code": 200, "url": "https://official.example/assets/placeholder.jpg"})()
+        return type("Response", (), {"content": _jpeg_bytes((800, 600)), "headers": {"content-type": "image/jpeg"}, "status_code": 200, "url": "https://official.example/assets/placeholder.jpg"})()
 
     value = candidate(2, ImageType.GAME_CG)
     value.image_url = "https://official.example/assets/redirect.jpg"
     accepted, failures = ImageDownloader(load_config(), transport=transport).download([value], tmp_path)
-    assert accepted == []
+    assert len(accepted) == 1
+    assert accepted[0].signals["invalid_reason"] == "placeholder_image"
+    assert accepted[0].downloadable is False
     assert any(failure.code == "placeholder_image" for failure in failures)

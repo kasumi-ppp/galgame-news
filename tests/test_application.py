@@ -41,7 +41,7 @@ def test_application_downloads_validates_hashes_and_saves_selected_images(tmp_pa
 
     class Analyzer:
         def analyze(self, draft):
-            return Issue(issue_id=draft.issue_id, input_path=draft.input_path, news_items=[NewsItem(issue_id=draft.issue_id, sequence=1, section="新作", title="Game", body="CG")])
+            return Issue(issue_id=draft.issue_id, input_path=draft.input_path, news_items=[NewsItem(issue_id=draft.issue_id, sequence=1, section="新作", title="Game", body="CG", source_urls=["https://cdn.example/cg.jpg"])])
 
     class Resolver:
         def resolve(self, news):
@@ -64,8 +64,9 @@ def test_application_downloads_validates_hashes_and_saves_selected_images(tmp_pa
     selected = result.candidates[0]
     assert selected.sha256 and selected.width == 800 and selected.height == 600
     assert selected.local_path and Path(selected.local_path).is_file()
-    assert Path(selected.local_path).parent.name == "x1"
-    assert Path(selected.local_path).name == "x1.01.jpg"
+    assert Path(selected.local_path).parent.name == "未候选"
+    assert Path(selected.local_path).name == "x1.u01.png"
+    assert selected.selected is False
 
 
 def test_application_does_not_truncate_gallery_before_filtering_page_assets(tmp_path):
@@ -77,7 +78,7 @@ def test_application_does_not_truncate_gallery_before_filtering_page_assets(tmp_
 
     class Analyzer:
         def analyze(self, draft):
-            return Issue(issue_id=draft.issue_id, input_path=draft.input_path, news_items=[NewsItem(issue_id=draft.issue_id, sequence=1, section="新作", title="Gallery Game", body="CG")])
+            return Issue(issue_id=draft.issue_id, input_path=draft.input_path, news_items=[NewsItem(issue_id=draft.issue_id, sequence=1, section="新作", title="Gallery Game", body="CG", source_urls=["https://official.example/game"])])
 
     class Resolver:
         def resolve(self, news):
@@ -104,7 +105,7 @@ def test_application_does_not_truncate_gallery_before_filtering_page_assets(tmp_
     )
     assert len(result.candidates) == 6
     assert all("/gallery/cg" in candidate.image_url for candidate in result.candidates)
-    assert sum(candidate.selected for candidate in result.candidates) == 6
+    assert sum(candidate.selected for candidate in result.candidates) == 0
 
 
 def test_application_dispatches_video_and_dynamic_sources_to_specialized_adapters(tmp_path, monkeypatch):

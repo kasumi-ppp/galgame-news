@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import re
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from ..domain import ImageCandidate, ImageType, OutputManifest, PipelineResult, VideoStatus
+from ..domain import FailureRecord, FailureStage, ImageCandidate, ImageCurationStatus, OutputManifest, PipelineResult, ReviewReason, VideoStatus
+from .image_conversion import ImageConversionError, ImageConverter
 from .helpers import atomic_json_write, item_names as canonical_item_names, safe_video_name, section_label, section_prefix
 
 
@@ -21,21 +23,73 @@ class OutputManager:
     # directories for one candidate.
     _UNSELECTED_CANDIDATE_DIR = "未候选"
     _LEGACY_FAILED_CANDIDATE_DIR = "失败候选图"
-    _FAILED_CANDIDATE_MIN_WIDTH = 300
-    _FAILED_CANDIDATE_MIN_HEIGHT = 300
-    _FAILED_CANDIDATE_MIN_PIXELS = 120_000
-    _FAILED_CANDIDATE_EXCLUDED_TYPES = {ImageType.LOGO, ImageType.BANNER, ImageType.UI}
-    _FAILED_CANDIDATE_TYPE_ORDER = {
-        ImageType.GAME_CG: 0,
-        ImageType.GAMEPLAY_SCREENSHOT: 1,
-        ImageType.ANNOUNCEMENT_ART: 2,
-        ImageType.KEY_VISUAL: 3,
-        ImageType.CHARACTER_ART: 4,
-        ImageType.COVER: 5,
-        ImageType.GOODS: 6,
-        ImageType.PHOTO: 7,
-        ImageType.UNKNOWN: 8,
-    }
+
+    @staticmethod
+    def _image_source(candidate: ImageCandidate) -> Path | None:
+        for value in (candidate.original_path, candidate.local_path):
+            if value:
+                path = Path(value)
+                if path.is_file():
+                    return path
+        return None
+
+    @classmethod
+    def _save_review_image(cls, candidate: ImageCandidate, source: Path, root: Path, destination: Path) -> bool:
+        source_bytes = source.read_bytes()
+        converter = ImageConverter()
+        try:
+            converted = converter.convert(source_bytes, candidate)
+        except ImageConversionError as exc:
+            original_dir = root / "originals" / candidate.news_id
+            original_dir.mkdir(parents=True, exist_ok=True)
+            original = original_dir / f"{candidate.id}.source{source.suffix.casefold()}"
+            if source.resolve() != original.resolve():
+                shutil.copyfile(source, original)
+            candidate.original_path = str(original)
+            candidate.original_mime_type = candidate.original_mime_type or candidate.mime_type
+            candidate.original_byte_size = len(source_bytes)
+            candidate.original_sha256 = hashlib.sha256(source_bytes).hexdigest()
+            candidate.original_width = candidate.original_width or candidate.width
+            candidate.original_height = candidate.original_height or candidate.height
+            candidate.signals["conversion_error"] = str(exc)
+            candidate.selection_reasons.append("review_image_conversion_failed")
+            candidate.selected = False
+            candidate.curation_status = ImageCurationStatus.UNSELECTED
+            candidate.local_path = None
+            return False
+
+        source_suffix = {
+            "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+            "image/webp": ".webp", "image/avif": ".avif",
+        }[converted.original_mime_type]
+        original_dir = root / "originals" / candidate.news_id
+        original_dir.mkdir(parents=True, exist_ok=True)
+        original = original_dir / f"{candidate.id}.source{source_suffix}"
+        if source.resolve() != original.resolve():
+            shutil.copyfile(source, original)
+        candidate.original_path = str(original)
+        candidate.original_mime_type = converted.original_mime_type
+        candidate.original_byte_size = len(source_bytes)
+        candidate.original_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        candidate.original_width = candidate.width
+        candidate.original_height = candidate.height
+        if converted.animated:
+            candidate.animated_source = True
+            candidate.animation_frame_index = converted.frame_index
+            if "animated_source_requires_review" not in candidate.selection_reasons:
+                candidate.selection_reasons.append("animated_source_requires_review")
+            if ReviewReason.IMAGE_TYPE_REVIEW not in candidate.review_reasons:
+                candidate.review_reasons.append(ReviewReason.IMAGE_TYPE_REVIEW)
+            candidate.signals["animated_source"] = True
+        destination = destination.with_suffix(".jpg" if converted.mime_type == "image/jpeg" else ".png")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(converted.data)
+        candidate.local_path = str(destination)
+        candidate.output_mime_type = converted.mime_type
+        candidate.output_byte_size = len(converted.data)
+        candidate.output_sha256 = hashlib.sha256(converted.data).hexdigest()
+        candidate.output_width, candidate.output_height = converted.width, converted.height
+        return True
 
     @classmethod
     def _safe_url(cls, value: str) -> str:
@@ -88,43 +142,23 @@ class OutputManager:
 
     @classmethod
     def _is_reviewable_failed_candidate(cls, candidate: ImageCandidate) -> bool:
-        if candidate.selected or not candidate.downloadable or not candidate.local_path:
+        if candidate.selected or candidate.curation_status is ImageCurationStatus.INVALID or not candidate.downloadable or not candidate.local_path:
             return False
         source = Path(candidate.local_path)
-        if not source.is_file() or candidate.image_type in cls._FAILED_CANDIDATE_EXCLUDED_TYPES:
-            return False
-        width, height = candidate.width or 0, candidate.height or 0
-        return (
-            width >= cls._FAILED_CANDIDATE_MIN_WIDTH
-            and height >= cls._FAILED_CANDIDATE_MIN_HEIGHT
-            and width * height >= cls._FAILED_CANDIDATE_MIN_PIXELS
-        )
+        return source.is_file()
 
     @classmethod
     def _failed_candidate_sort_key(cls, candidate: ImageCandidate):
-        entity_match = candidate.signals.get("entity_match")
-        entity_order = 0 if entity_match is True else (2 if entity_match is False else 1)
-        raw_type_match = candidate.score.type_match if candidate.score else candidate.signals.get("type_match", 0.0)
-        type_match = float(raw_type_match) if isinstance(raw_type_match, (int, float)) else 0.0
-        relevance = candidate.score.relevance if candidate.score else 0.0
         total = candidate.score.total if candidate.score else 0.0
-        raw_entity_confidence = candidate.signals.get("entity_match_confidence", 0.0)
-        entity_confidence = float(raw_entity_confidence) if isinstance(raw_entity_confidence, (int, float)) else 0.0
+        source_trust = candidate.score.source_trust if candidate.score else 0.0
         pixels = (candidate.width or 0) * (candidate.height or 0)
         return (
-            entity_order,
-            -relevance,
+            not (candidate.signals.get("x_api_photo") is True or candidate.signals.get("socialdata_photo") is True),
             -total,
-            -type_match,
-            -entity_confidence,
-            cls._FAILED_CANDIDATE_TYPE_ORDER.get(candidate.image_type, 99),
+            -source_trust,
             -pixels,
             candidate.id or "",
         )
-
-    @staticmethod
-    def _candidate_content_key(candidate: ImageCandidate) -> str:
-        return candidate.sha256 or candidate.perceptual_hash or candidate.id or candidate.image_url
 
     @staticmethod
     def _safe_video_name(candidate, fallback: str) -> str:
@@ -175,21 +209,18 @@ class OutputManager:
         files: list[str] = []
         item_names = self._item_names(result.issue.news_items)
         per_news_rank: dict[str, int] = {}
-        for candidate in [c for c in result.candidates if c.selected]:
-            if not candidate.local_path or not Path(candidate.local_path).is_file():
+        for candidate in [c for c in result.candidates if c.selected and c.curation_status is not ImageCurationStatus.INVALID]:
+            source_path = self._image_source(candidate)
+            if source_path is None:
                 continue
             per_news_rank[candidate.news_id] = per_news_rank.get(candidate.news_id, 0) + 1
             rank = per_news_rank[candidate.news_id]
             readable = re.sub(r"[\\/:*?\"<>|]", "_", item_names.get(candidate.news_id, candidate.news_id))
             target_dir = image_root / readable
             target_dir.mkdir(parents=True, exist_ok=True)
-            ext = (candidate.mime_type or "image/jpeg").split("/")[-1].replace("jpeg", "jpg")
-            target = target_dir / f"{readable}.{rank:02d}.{ext}"
-            source_path = Path(candidate.local_path)
-            if source_path.resolve() != target.resolve():
-                shutil.copyfile(source_path, target)
-            candidate.local_path = str(target)
-            files.append(str(target.relative_to(root)))
+            target = target_dir / f"{readable}.{rank:02d}.png"
+            if self._save_review_image(candidate, source_path, root, target):
+                files.append(str(Path(candidate.local_path).relative_to(root)))
         all_candidates = result.all_candidates
         exported_failed: set[int] = set()
         for news_id in sorted({candidate.news_id for candidate in all_candidates}):
@@ -201,25 +232,17 @@ class OutputManager:
                 ),
                 key=self._failed_candidate_sort_key,
             )
-            seen_content: set[str] = set()
             rank = 0
             for candidate in failed:
-                content_key = self._candidate_content_key(candidate)
-                if content_key in seen_content:
-                    continue
-                seen_content.add(content_key)
                 rank += 1
                 readable = re.sub(r"[\\/:*?\"<>|]", "_", item_names.get(news_id, news_id))
                 target_dir = image_root / readable / self._UNSELECTED_CANDIDATE_DIR
-                target_dir.mkdir(parents=True, exist_ok=True)
-                ext = (candidate.mime_type or "image/jpeg").split("/")[-1].replace("jpeg", "jpg")
-                target = target_dir / f"{readable}.u{rank:02d}.{ext}"
-                source_path = Path(candidate.local_path or "")
-                if source_path.resolve() != target.resolve():
-                    shutil.copyfile(source_path, target)
-                candidate.local_path = str(target)
+                target = target_dir / f"{readable}.u{rank:02d}.png"
+                source_path = self._image_source(candidate)
+                if source_path is None or not self._save_review_image(candidate, source_path, root, target):
+                    continue
                 exported_failed.add(id(candidate))
-                files.append(str(target.relative_to(root)))
+                files.append(str(Path(candidate.local_path).relative_to(root)))
         videos = list(getattr(result, "videos", []) or [])
         video_reserved: dict[str, set[str]] = {}
         for video in videos:
@@ -246,8 +269,34 @@ class OutputManager:
             files.append(str(target.relative_to(root)))
 
         for candidate in all_candidates:
+            # Preserve landed originals even when later policy marks a
+            # candidate invalid and therefore does not export a review image.
+            source_path = self._image_source(candidate)
+            if source_path is not None and not source_path.resolve().is_relative_to(root.resolve()):
+                original_dir = root / "originals" / candidate.news_id
+                original_dir.mkdir(parents=True, exist_ok=True)
+                original = original_dir / f"{candidate.id}.source{source_path.suffix.casefold()}"
+                shutil.copyfile(source_path, original)
+                candidate.original_path = str(original)
+                candidate.original_sha256 = hashlib.sha256(original.read_bytes()).hexdigest()
             if not candidate.selected and id(candidate) not in exported_failed:
                 candidate.local_path = None
+            conversion_error = candidate.signals.get("conversion_error")
+            already_recorded = any(
+                failure.code == "image_conversion_failed"
+                and failure.candidate_id == candidate.id
+                for failure in result.failures
+            )
+            if isinstance(conversion_error, str) and conversion_error and not already_recorded:
+                result.failures.append(FailureRecord(
+                    stage=FailureStage.OUTPUT,
+                    news_id=candidate.news_id,
+                    candidate_id=candidate.id,
+                    code="image_conversion_failed",
+                    message=conversion_error,
+                    source_url=candidate.image_url,
+                    retryable=False,
+                ))
         candidate_payload = self._sanitize_payload([candidate.model_dump(mode="json") for candidate in all_candidates])
         news_payload = []
         for item in result.issue.news_items:
@@ -265,5 +314,22 @@ class OutputManager:
         lines = [f"# Issue {result.issue.issue_id}", "", f"候选图片：{len(all_candidates)} 张", ""]
         for item in news_payload:
             lines.append(f"- {item['sequence']}. {item['title']} — {item['status']} ({len(item['candidates'])} candidates)")
+            selected_images = [
+                candidate for candidate in all_candidates
+                if candidate.news_id == item["news_id"] and candidate.selected
+            ]
+            for rank, candidate in enumerate(selected_images, 1):
+                image_url = self._safe_url(candidate.image_url)
+                source_url = self._safe_url(candidate.source_url)
+                lines.append(f"  - {rank:02d} {candidate.image_type.value}：[查看原图]({image_url}) · [查看来源页]({source_url})")
+            related_x_photos = [
+                candidate for candidate in all_candidates
+                if candidate.news_id == item["news_id"]
+                and (candidate.signals.get("x_api_photo") is True or candidate.signals.get("socialdata_photo") is True)
+            ]
+            for candidate in related_x_photos:
+                post_url = self._safe_url(candidate.source_url)
+                image_url = self._safe_url(candidate.image_url)
+                lines.append(f"  - X API： [查看 X 原帖]({post_url}) · [查看原图]({image_url})")
         (root / "image_index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return OutputManifest(issue_id=result.issue.issue_id, output_dir=str(root), image_count=sum(c.selected for c in result.candidates), files=files)
+        return OutputManifest(issue_id=result.issue.issue_id, output_dir=str(root), image_count=sum(c.selected and bool(c.local_path) for c in result.candidates), files=files)

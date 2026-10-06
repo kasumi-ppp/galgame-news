@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import os
 import shutil
 import uuid
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -14,15 +17,17 @@ from urllib.parse import urlsplit
 from ..config import PrescanConfig, load_config
 from ..curation import ImageCurator, ImageDownloader
 from ..delivery.output import OutputManager
+from ..delivery.asset_paths import rebase_asset_paths
+from ..delivery.helpers import atomic_json_write
 from ..discovery.adapters import (
     DirectImageAdapter,
     DynamicPageAdapter,
     OfficialHtmlAdapter,
     SteamAdapter,
     VideoAdapter,
-    XAdapter,
 )
 from ..discovery.resolver import DefaultSourceResolver
+from ..discovery.x_api import create_x_adapter, _STATUS_ID
 from ..domain import (
     CollectionContext,
     DiscoveryMethod,
@@ -49,6 +54,7 @@ from .contracts import (
 )
 from . import checkpoint as checkpoint_io
 from . import workspace
+from .download_state import DownloadJournal
 
 
 class _NoNewsItemsError(ValueError):
@@ -90,6 +96,12 @@ class PipelineRunner:
         self._legacy_output = _legacy_output
         self._resolver_injected = resolver is not None
         self.resolver = resolver or self._make_resolver(self.config)
+        self._socialdata_response_cache: dict[str, object] = {}
+        self._network_runtime = None
+        self.network_metrics = {}
+        self._x_query_base = 0
+        self._download_journal = None
+        self._media_cache_version = 1
 
     def _make_resolver(self, config):
         return DefaultSourceResolver(
@@ -100,7 +112,42 @@ class PipelineRunner:
             search_timeout=config.network.timeout_seconds,
         )
 
-    def run(
+    def run(self, request, event_sink=None, cancellation_token=None) -> TaskResult:
+        """Synchronous desktop/CLI facade, using one task-level event loop."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.run_async(request, event_sink, cancellation_token))
+        raise RuntimeError("Use await runner.run_async() from an active event loop")
+
+    async def run_async(self, request, event_sink=None, cancellation_token=None) -> TaskResult:
+        from .network_runtime import TaskNetworkRuntime
+        if self._network_runtime is not None:
+            raise RuntimeError("A PipelineRunner cannot run overlapping tasks")
+        token = cancellation_token or CancellationToken()
+        try:
+            self._activate_config(self._config_for_request(request))
+        except Exception:
+            # Preserve the existing setup error result instead of throwing.
+            pass
+        runtime = TaskNetworkRuntime(self, token)
+        self._network_runtime = runtime
+        try:
+            return await self._run_async_body(request, event_sink, token)
+        finally:
+            self.network_metrics = runtime.stats()
+            await runtime.close()
+            self._network_runtime = None
+
+    async def _resolve_async(self, news, request):
+        resolver = self._resolver_for(request)
+        if type(resolver) is DefaultSourceResolver:
+            return await self._network_runtime.resolve(resolver, news)
+        if hasattr(resolver, "resolve_async"):
+            return list(await resolver.resolve_async(news))
+        return list(await self._network_runtime.call_sync(lambda: list(resolver.resolve(news))))
+
+    async def _run_async_body(
         self,
         request: TaskRequest,
         event_sink: Callable[[ProgressEvent], None] | None = None,
@@ -121,8 +168,15 @@ class PipelineRunner:
         source_map: dict[str, list[SourceRef]] = {}
         input_hash = ""
         config_hash = ""
+        journal = None
+        media_only_news = set()
+        attempted_news = set()
+        self._x_query_base = 0
+        self._download_journal = None
+        self._media_cache_version = 1
 
         try:
+            self._socialdata_response_cache = {}
             config = self._config_for_request(request)
             self._activate_config(config)
             task_dir, raw_dir, checkpoint_path, task_id = self._task_paths(request)
@@ -139,15 +193,35 @@ class PipelineRunner:
                 failures.extend(checkpoint.failures)
                 completed = set(checkpoint.completed_news_ids)
                 source_map = {key: list(value) for key, value in checkpoint.source_map.items()}
-                if checkpoint.status == "completed":
+                attempted_news = set(source_map)
+                self._media_cache_version = checkpoint.media_cache_version
+                self._x_query_base = checkpoint.x_query_count
+                journal = DownloadJournal(task_dir, issue, input_hash, config_hash)
+                self._socialdata_response_cache = journal.load_posts()
+                self._x_query_base = max(self._x_query_base, len(self._socialdata_response_cache))
+                saved, collected_ids = journal.load()
+                candidates = journal.merge(candidates, saved)
+                for candidate in candidates:
+                    journal.confine(candidate)
+                    if ImageDownloader.reusable(candidate):
+                        candidate.download_status = "downloaded"
+                repair_news = {candidate.news_id for candidate in candidates if journal.needs_download(candidate, failures)}
+                media_only_news = collected_ids | {candidate.news_id for candidate in candidates}
+                completed.difference_update(repair_news)
+                missing_media_news = {value.news_id for value in failures if value.code == "download_failed" and value.news_id not in media_only_news}
+                for news_id in missing_media_news:
+                    self._emit(sink, failures, self._event("download_recovery_unavailable", task_id, issue.issue_id,
+                        news_id=news_id, message="旧记录缺少媒体候选，不能自动恢复；不会重复查询付费帖子"))
+                if checkpoint.status == "completed" and not repair_news:
                     if checkpoint.result is None:
                         raise ValueError("completed checkpoint has no result")
+                    self._emit(sink, failures, self._event("x_media_stats", task_id, issue.issue_id, payload=self._x_media_payload(candidates)))
                     return TaskResult(
                         status="completed", task_id=task_id, task_dir=task_dir,
                         output_dir=raw_dir, checkpoint_path=checkpoint_path,
                         pipeline_result=checkpoint.result, resumed=True,
                     )
-                if checkpoint.status == "failed":
+                if checkpoint.status == "failed" and not repair_news:
                     result = checkpoint.result or self._pipeline_result(issue, candidates, videos, failures)
                     return TaskResult(
                         status="failed", task_id=task_id, task_dir=task_dir,
@@ -157,7 +231,7 @@ class PipelineRunner:
             elif request.task_dir is not None or request.checkpoint_path is not None:
                 raise ValueError("task_dir/checkpoint_path are only valid when resuming")
         except Exception as exc:
-            message = str(exc)
+            message = (str(exc).strip() or f"执行失败（{type(exc).__name__}）")
             if "input mismatch" in message:
                 code = "checkpoint_input_mismatch"
             elif "config mismatch" in message:
@@ -174,7 +248,7 @@ class PipelineRunner:
                 code = "setup_error"
             failure = self._failure(code, message)
             if isinstance(exc, FileNotFoundError) and "configuration" not in message:
-                failure = self._failure("input_missing", str(exc))
+                failure = self._failure("input_missing", (str(exc).strip() or f"执行失败（{type(exc).__name__}）"))
             failures.append(failure)
             result = self._pipeline_result(issue, candidates, videos, failures)
             return self._failed_result(
@@ -186,8 +260,8 @@ class PipelineRunner:
             "task_started", task_id, request.issue_id, message="pipeline started",
         ))
         try:
-            token.wait_if_paused()
-        except CancellationRequested:
+            await token.wait_if_paused_async()
+        except (CancellationRequested, asyncio.CancelledError):
             return self._cancel(
                 request, task_id, task_dir, raw_dir, checkpoint_path, issue,
                 input_hash, config_hash, completed, candidates, videos, failures,
@@ -197,22 +271,22 @@ class PipelineRunner:
         if not resumed:
             phase = "parse"
             try:
-                token.wait_if_paused()
+                await token.wait_if_paused_async()
                 self._emit(sink, failures, self._event(
                     "parse_started", task_id, request.issue_id, message="parsing DOCX",
                 ))
-                token.wait_if_paused()
-                draft = self.parser.parse(request.input_path, request.issue_id)
-                token.wait_if_paused()
+                await token.wait_if_paused_async()
+                draft = await self._network_runtime.call_sync(lambda: self.parser.parse(request.input_path, request.issue_id))
+                await token.wait_if_paused_async()
                 self._emit(sink, failures, self._event(
                     "parse_completed", task_id, request.issue_id, message="DOCX parsed",
                 ))
-                token.wait_if_paused()
+                await token.wait_if_paused_async()
                 phase = "analyze"
                 self._emit(sink, failures, self._event(
                     "analyze_started", task_id, request.issue_id, message="analyzing news",
                 ))
-                token.wait_if_paused()
+                await token.wait_if_paused_async()
                 analyzer = self.analyzer
                 if analyzer is None:
                     analyzer = (
@@ -224,23 +298,23 @@ class PipelineRunner:
                         if request.llm_provider and request.llm_model
                         else RuleBasedNewsAnalyzer()
                     )
-                issue = analyzer.analyze(draft)
+                issue = await self._network_runtime.call_sync(lambda: analyzer.analyze(draft))
                 if not issue.news_items:
                     raise _NoNewsItemsError(
                         "No news items were recognized; check the DOCX section and title formatting"
                     )
-                token.wait_if_paused()
+                await token.wait_if_paused_async()
                 self._emit(sink, failures, self._event(
                     "analyze_completed", task_id, issue.issue_id, message="news analyzed",
                 ))
-                token.wait_if_paused()
+                await token.wait_if_paused_async()
                 self._write_checkpoint(
                     checkpoint_path, status="running", task_id=task_id, issue=issue,
                     input_hash=input_hash, config_hash=config_hash,
                     completed_news_ids=completed, candidates=candidates, videos=videos,
                     failures=failures, source_map=source_map,
                 )
-            except CancellationRequested:
+            except (CancellationRequested, asyncio.CancelledError):
                 return self._cancel(
                     request, task_id, task_dir, raw_dir, checkpoint_path, issue,
                     input_hash, config_hash, completed, candidates, videos, failures,
@@ -248,11 +322,11 @@ class PipelineRunner:
                 )
             except _NoNewsItemsError as exc:
                 self._emit(sink, failures, self._event(
-                    f"{phase}_failed", task_id, request.issue_id, message=str(exc),
+                    f"{phase}_failed", task_id, request.issue_id, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
                 ))
                 failures.append(FailureRecord(
                     stage=FailureStage.ANALYZE, code="no_news_items",
-                    message=str(exc), retryable=False,
+                    message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=False,
                 ))
                 result = self._pipeline_result(issue, candidates, videos, failures)
                 return self._failed_result(
@@ -261,9 +335,9 @@ class PipelineRunner:
                 )
             except Exception as exc:
                 self._emit(sink, failures, self._event(
-                    f"{phase}_failed", task_id, request.issue_id, message=str(exc),
+                    f"{phase}_failed", task_id, request.issue_id, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
                 ))
-                failures.append(self._failure(f"{phase}_error", str(exc)))
+                failures.append(self._failure(f"{phase}_error", (str(exc).strip() or f"执行失败（{type(exc).__name__}）")))
                 result = self._pipeline_result(issue, candidates, videos, failures)
                 return self._failed_result(
                     request, task_id, task_dir, raw_dir, checkpoint_path, result,
@@ -271,149 +345,211 @@ class PipelineRunner:
                 )
 
         total_news = len(issue.news_items)
+        journal = journal or DownloadJournal(task_dir, issue, input_hash, config_hash)
+        self._download_journal = journal
+        last_checkpoint = 0.0
+
+        def commit_checkpoint():
+            self._write_checkpoint(checkpoint_path, status="running", task_id=task_id, issue=issue,
+                input_hash=input_hash, config_hash=config_hash, completed_news_ids=completed,
+                candidates=candidates, videos=videos, failures=failures, source_map=source_map)
+
+        def media_stats():
+            self._emit(sink, failures, self._event("x_media_stats", task_id, issue.issue_id,
+                payload=self._x_media_payload(candidates)))
+
+        async def recorded(candidate, failure):
+            nonlocal last_checkpoint, failures
+            if candidate.download_status == "downloaded":
+                failures[:] = [value for value in failures if not (value.stage is FailureStage.DOWNLOAD and value.candidate_id == candidate.id)]
+            elif failure is not None and failure not in failures:
+                failures.append(failure)
+            journal.save(candidate.news_id, candidates)
+            if time.monotonic() - last_checkpoint >= 1.0 or token.is_paused or token.is_cancelled:
+                commit_checkpoint()
+                last_checkpoint = time.monotonic()
+            media_stats()
+
+        media_stats()
         try:
             for news_index, news in enumerate(issue.news_items, start=1):
-                token.wait_if_paused()
+                await token.wait_if_paused_async()
                 if news.id in completed:
                     self._emit(sink, failures, self._event(
                         "news_skipped", task_id, issue.issue_id, news_id=news.id,
                         news_index=news_index, total_news=total_news,
                         message="restored from checkpoint",
                     ))
-                    token.wait_if_paused()
+                    await token.wait_if_paused_async()
                     continue
                 self._emit(sink, failures, self._event(
                     "news_started", task_id, issue.issue_id, news_id=news.id,
                     news_index=news_index, total_news=total_news, message=news.title,
                 ))
-                token.wait_if_paused()
+                await token.wait_if_paused_async()
                 news_sources: list[SourceRef] = []
                 news_candidates: list[ImageCandidate] = []
                 news_videos: list[VideoCandidate] = []
-                self._emit(sink, failures, self._event(
-                    "resolve_started", task_id, issue.issue_id, news_id=news.id,
-                    news_index=news_index, total_news=total_news,
-                    message="resolving sources",
-                ))
-                try:
-                    token.wait_if_paused()
-                    news_sources = self._filter_sources(
-                        list(self._resolver_for(request).resolve(news)), request,
-                    )
-                    source_map[news.id] = news_sources
-                    token.wait_if_paused()
+                if news.id in media_only_news:
+                    news_sources = source_map.get(news.id, [])
+                    news_candidates = [candidate for candidate in candidates if candidate.news_id == news.id]
+                    for candidate in news_candidates:
+                        if journal.needs_download(candidate, failures) and candidate.download_status != "permanent_failed":
+                            candidate.download_status = "pending"
+                else:
                     self._emit(sink, failures, self._event(
-                        "resolve_completed", task_id, issue.issue_id, news_id=news.id,
+                        "resolve_started", task_id, issue.issue_id, news_id=news.id,
                         news_index=news_index, total_news=total_news,
-                        message=f"{len(news_sources)} sources",
+                        message="resolving sources",
                     ))
-                    token.wait_if_paused()
-                except CancellationRequested:
-                    raise
-                except Exception as exc:
-                    failures.append(FailureRecord(
-                        stage=FailureStage.RESOLVE, news_id=news.id, code="news_failed",
-                        message=str(exc), retryable=True,
-                    ))
-                    self._emit(sink, failures, self._event(
-                        "resolve_failed", task_id, issue.issue_id, news_id=news.id,
-                        news_index=news_index, total_news=total_news, message=str(exc),
-                    ))
-
-                for source in news_sources:
-                    token.wait_if_paused()
-                    self._emit(sink, failures, self._event(
-                        "collect_started", task_id, issue.issue_id, news_id=news.id,
-                        news_index=news_index, total_news=total_news, message=source.url,
-                    ))
-                    token.wait_if_paused()
                     try:
-                        collection = self._collect(news, source)
-                        news_candidates.extend(collection.candidates)
-                        news_videos.extend(collection.video_candidates)
-                        failures.extend(collection.failures)
-                        for reason in collection.manual_review_reasons:
-                            failures.append(FailureRecord(
-                                stage=FailureStage.COLLECT, news_id=news.id,
-                                code="manual_review_required", message=reason.value,
-                                source_url=source.url, retryable=False,
-                            ))
-                        token.wait_if_paused()
+                        await token.wait_if_paused_async()
+                        news_sources = self._filter_sources(
+                            await self._resolve_async(news, request), request,
+                        )
+                        source_map[news.id] = news_sources
+                        if request.resume and request.use_socialdata_x and self._media_cache_version == 0 and news.id in attempted_news:
+                            withheld = [source for source in news_sources if source.source_type is SourceType.OFFICIAL_X
+                                        and (match := _STATUS_ID.search(urlsplit(source.url).path))
+                                        and match.group(1) not in self._socialdata_response_cache]
+                            news_sources = [source for source in news_sources if source not in withheld]
+                            for source in withheld:
+                                failures.append(FailureRecord(stage=FailureStage.COLLECT, news_id=news.id,
+                                    code="resume_media_missing", message="旧记录缺少 X 媒体信息，未重复查询付费帖子", source_url=source.url, retryable=False))
+                        await token.wait_if_paused_async()
                         self._emit(sink, failures, self._event(
-                            "collect_completed", task_id, issue.issue_id,
-                            news_id=news.id, news_index=news_index,
-                            total_news=total_news, message=source.url,
+                            "resolve_completed", task_id, issue.issue_id, news_id=news.id,
+                            news_index=news_index, total_news=total_news,
+                            message=f"{len(news_sources)} sources",
                         ))
-                        token.wait_if_paused()
-                    except CancellationRequested:
+                        await token.wait_if_paused_async()
+                    except (CancellationRequested, asyncio.CancelledError):
                         raise
                     except Exception as exc:
                         failures.append(FailureRecord(
-                            stage=FailureStage.COLLECT, news_id=news.id,
-                            code="source_failed", message=str(exc),
-                            source_url=source.url, retryable=True,
+                            stage=FailureStage.RESOLVE, news_id=news.id, code="news_failed",
+                            message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=True,
                         ))
                         self._emit(sink, failures, self._event(
-                            "collect_failed", task_id, issue.issue_id, news_id=news.id,
-                            news_index=news_index, total_news=total_news,
-                            message=str(exc),
+                            "resolve_failed", task_id, issue.issue_id, news_id=news.id,
+                            news_index=news_index, total_news=total_news, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
                         ))
 
-                token.wait_if_paused()
+                    for source in news_sources:
+                        self._emit(sink, failures, self._event(
+                            "collect_started", task_id, issue.issue_id, news_id=news.id,
+                            news_index=news_index, total_news=total_news, message=source.url,
+                        ))
+                    collections = await self._network_runtime.collect_many(news, news_sources, request)
+                    for source, collection in zip(news_sources, collections):
+                        await token.wait_if_paused_async()
+                        try:
+                            if isinstance(collection, Exception):
+                                raise collection
+                            news_candidates.extend(collection.candidates)
+                            news_videos.extend(collection.video_candidates)
+                            failures.extend(collection.failures)
+                            for reason in collection.manual_review_reasons:
+                                failures.append(FailureRecord(
+                                    stage=FailureStage.COLLECT, news_id=news.id,
+                                    code="manual_review_required", message=reason.value,
+                                    source_url=source.url, retryable=False,
+                                ))
+                            await token.wait_if_paused_async()
+                            self._emit(sink, failures, self._event(
+                                "collect_completed", task_id, issue.issue_id,
+                                news_id=news.id, news_index=news_index,
+                                total_news=total_news, message=source.url,
+                            ))
+                            await token.wait_if_paused_async()
+                        except (CancellationRequested, asyncio.CancelledError):
+                            raise
+                        except Exception as exc:
+                            failures.append(FailureRecord(
+                                stage=FailureStage.COLLECT, news_id=news.id,
+                                code="source_failed", message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
+                                source_url=source.url, retryable=True,
+                            ))
+                            self._emit(sink, failures, self._event(
+                                "collect_failed", task_id, issue.issue_id, news_id=news.id,
+                                news_index=news_index, total_news=total_news,
+                                message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
+                            ))
+
+                # Register every candidate before network dispatch. Workers
+                # mutate these records; the single result consumer commits them.
+                if request.offline:
+                    importer = ImageDownloader(self.config)
+                    for candidate in news_candidates:
+                        if candidate.local_path or candidate.original_path:
+                            imported, failure, _ = await self._network_runtime.loop.run_in_executor(
+                                self._network_runtime.processing, importer.import_local,
+                                candidate, self._image_stage(task_dir),
+                            )
+                            if failure:
+                                ImageDownloader._apply_outcome(candidate, failure)
+                                failures.append(failure)
+                candidates = journal.merge(candidates, news_candidates)
+                journal.save(news.id, candidates)
+                commit_checkpoint()
+                media_stats()
+                await token.wait_if_paused_async()
                 self._emit(sink, failures, self._event(
                     "download_started", task_id, issue.issue_id, news_id=news.id,
                     news_index=news_index, total_news=total_news,
                     message="media download",
                 ))
-                token.wait_if_paused()
+                await token.wait_if_paused_async()
                 try:
                     if request.offline:
-                        candidates.extend(news_candidates)
                         for video in news_videos:
                             self._skip_video(video, "offline_mode", failures)
-                        token.wait_if_paused()
+                        await token.wait_if_paused_async()
                     else:
-                        accepted, download_failures = ImageDownloader(
-                            self.config, transport=self.image_transport,
-                        ).download(news_candidates, self._image_stage(task_dir))
+                        accepted, download_failures = await self._network_runtime.download(
+                            news_candidates, self._image_stage(task_dir), on_result=recorded,
+                        )
+                        candidates = [candidate for candidate in candidates if candidate.news_id != news.id]
                         candidates.extend(accepted)
-                        failures.extend(download_failures)
+                        failures.extend(value for value in download_failures if value not in failures)
                         # A single network request may finish while pause is
                         # requested; honor it immediately after the call.
-                        token.wait_if_paused()
+                        await token.wait_if_paused_async()
                         if request.no_videos or not self.config.video.enabled:
                             for video in news_videos:
                                 self._skip_video(video, "video_download_disabled", failures)
                             videos.extend(news_videos)
                         elif news_videos:
-                            token.wait_if_paused()
-                            downloaded, video_failures = self._download_videos(
-                                news_videos, self._video_stage(task_dir),
+                            await token.wait_if_paused_async()
+                            downloaded, video_failures = await self._network_runtime.call_sync(
+                                lambda: self._download_videos(news_videos, self._video_stage(task_dir)),
                             )
                             videos.extend(downloaded)
                             failures.extend(video_failures)
-                            token.wait_if_paused()
+                            await token.wait_if_paused_async()
                     videos = self._dedupe_videos([*videos, *news_videos])
-                    token.wait_if_paused()
+                    await token.wait_if_paused_async()
                     self._emit(sink, failures, self._event(
                         "download_completed", task_id, issue.issue_id, news_id=news.id,
                         news_index=news_index, total_news=total_news,
                         message="media downloaded",
                     ))
-                    token.wait_if_paused()
-                except CancellationRequested:
+                    await token.wait_if_paused_async()
+                except (CancellationRequested, asyncio.CancelledError):
                     raise
                 except Exception as exc:
                     failures.append(FailureRecord(
                         stage=FailureStage.DOWNLOAD, news_id=news.id,
-                        code="download_failed", message=str(exc), retryable=True,
+                        code="download_failed", message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=True,
                     ))
                     self._emit(sink, failures, self._event(
                         "download_failed", task_id, issue.issue_id, news_id=news.id,
-                        news_index=news_index, total_news=total_news, message=str(exc),
+                        news_index=news_index, total_news=total_news, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
                     ))
 
                 completed.add(news.id)
+                journal.save(news.id, candidates)
+                media_stats()
                 self._write_checkpoint(
                     checkpoint_path, status="running", task_id=task_id, issue=issue,
                     input_hash=input_hash, config_hash=config_hash,
@@ -425,23 +561,23 @@ class PipelineRunner:
                     news_index=news_index, total_news=total_news,
                     message="news completed",
                 ))
-                token.wait_if_paused()
+                await token.wait_if_paused_async()
 
-            token.wait_if_paused()
+            await token.wait_if_paused_async()
             self._emit(sink, failures, self._event(
                 "curate_started", task_id, issue.issue_id, message="curating candidates",
             ))
-            token.wait_if_paused()
+            await token.wait_if_paused_async()
             try:
                 result = self._curate_result(
                     issue, candidates, failures, videos, source_map, request.max_images,
                 )
-            except CancellationRequested:
+            except (CancellationRequested, asyncio.CancelledError):
                 raise
             except Exception as exc:
-                failures.append(self._failure("curate_error", str(exc)))
+                failures.append(self._failure("curate_error", (str(exc).strip() or f"执行失败（{type(exc).__name__}）")))
                 self._emit(sink, failures, self._event(
-                    "curate_failed", task_id, issue.issue_id, message=str(exc),
+                    "curate_failed", task_id, issue.issue_id, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
                 ))
                 result = self._pipeline_result(issue, candidates, videos, failures)
                 return self._failed_result(
@@ -451,24 +587,24 @@ class PipelineRunner:
             self._emit(sink, failures, self._event(
                 "curate_completed", task_id, issue.issue_id, message="candidates curated",
             ))
-            token.wait_if_paused()
+            await token.wait_if_paused_async()
             self._emit(sink, failures, self._event(
                 "output_started", task_id, issue.issue_id, message="publishing output",
             ))
-            token.wait_if_paused()
+            await token.wait_if_paused_async()
             try:
                 self._publish_output(result, raw_dir, task_dir)
-                token.wait_if_paused()
-            except CancellationRequested:
+                await token.wait_if_paused_async()
+            except (CancellationRequested, asyncio.CancelledError):
                 raise
             except Exception as exc:
                 failures.append(FailureRecord(
                     stage=FailureStage.OUTPUT, code="output_error",
-                    message=str(exc), retryable=True,
+                    message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=True,
                 ))
                 failure_index = len(failures) - 1
                 self._emit(sink, failures, self._event(
-                    "output_failed", task_id, issue.issue_id, message=str(exc),
+                    "output_failed", task_id, issue.issue_id, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
                 ))
                 result.failures = self._merge_failures(
                     [*result.failures, *failures[failure_index:]]
@@ -484,7 +620,7 @@ class PipelineRunner:
             result.failures = self._merge_failures(
                 [*result.failures, *failures[failure_index:]]
             )
-            token.wait_if_paused()
+            await token.wait_if_paused_async()
             failure_index = len(failures)
             self._emit(sink, failures, self._event(
                 "task_completed", task_id, issue.issue_id, message="pipeline completed",
@@ -492,10 +628,21 @@ class PipelineRunner:
             result.failures = self._merge_failures(
                 [*result.failures, *failures[failure_index:]]
             )
+            for news in issue.news_items:
+                journal.save(news.id, result.all_candidates)
+            published_ids = {value.id for value in result.all_candidates}
+            if any(value.download_status == "downloaded" and value.id not in published_ids for value in candidates):
+                raise RuntimeError("已下载图片未进入发布索引，保留暂存文件")
+            for value in result.all_candidates:
+                if value.download_status == "downloaded" and (
+                    not value.original_path or not Path(value.original_path).resolve().is_relative_to(raw_dir.resolve())
+                    or not ImageDownloader.reusable(value)
+                ):
+                    raise RuntimeError("已下载原件未正确发布，保留暂存文件")
             self._write_checkpoint(
                 checkpoint_path, status="completed", task_id=task_id, issue=issue,
                 input_hash=input_hash, config_hash=config_hash,
-                completed_news_ids=completed, candidates=result.candidates,
+                completed_news_ids=completed, candidates=result.all_candidates,
                 videos=result.videos, failures=result.failures,
                 source_map=source_map, result=result,
             )
@@ -505,7 +652,7 @@ class PipelineRunner:
                 output_dir=raw_dir, checkpoint_path=checkpoint_path,
                 pipeline_result=result, resumed=resumed,
             )
-        except CancellationRequested:
+        except (CancellationRequested, asyncio.CancelledError):
             return self._cancel(
                 request, task_id, task_dir, raw_dir, checkpoint_path, issue,
                 input_hash, config_hash, completed, candidates, videos, failures,
@@ -513,11 +660,11 @@ class PipelineRunner:
             )
         except Exception as exc:
             failures.append(FailureRecord(
-                stage=FailureStage.OUTPUT, code="output_error", message=str(exc),
+                stage=FailureStage.OUTPUT, code="output_error", message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
                 retryable=True,
             ))
             self._emit(sink, failures, self._event(
-                "output_failed", task_id, issue.issue_id, message=str(exc),
+                "output_failed", task_id, issue.issue_id, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
             ))
             result = self._pipeline_result(issue, candidates, videos, failures)
             return self._failed_result(
@@ -572,6 +719,7 @@ class PipelineRunner:
             domain=str(parsed.hostname or parsed.netloc),
             discovered_via=DiscoveryMethod.MANUAL,
             officiality=1.0,
+            root_url=str(official_url),
         )
         collection = self._collect(news, source)
         failures = list(collection.failures)
@@ -582,6 +730,15 @@ class PipelineRunner:
             self.config, transport=self.image_transport,
         ).download(collection.candidates, attempt_root / "images")
         failures.extend(download_failures)
+        retry_issue = Issue(
+            issue_id=str(issue_id),
+            input_path=str(input_path or (issue.input_path if issue is not None else "retry")),
+            published_at=issue.published_at if issue is not None else None,
+            news_items=[news],
+        )
+        curated = ImageCurator(self.config).curate(retry_issue, accepted, self.history)
+        failures.extend(curated.failures)
+        retry_candidates = [*curated.candidates, *curated.filtered_candidates]
         image_payload = {
             "schema_version": 1,
             "issue_id": str(issue_id),
@@ -590,9 +747,9 @@ class PipelineRunner:
                 "sequence": news.sequence,
                 "section": news.section,
                 "title": news.title,
-                "candidates": [str(candidate.id) for candidate in accepted],
+                "candidates": [str(candidate.id) for candidate in retry_candidates],
             }],
-            "candidates": [candidate.model_dump(mode="json") for candidate in accepted],
+            "candidates": [candidate.model_dump(mode="json") for candidate in retry_candidates],
             "failures": [failure.model_dump(mode="json") for failure in failures],
         }
         (attempt_root / "image_index.json").write_text(
@@ -616,14 +773,14 @@ class PipelineRunner:
         if not self._resolver_injected:
             self.resolver = self._make_resolver(config)
 
-    def _collect(self, news, source):
+    def _collect(self, news, source, *, request=None):
         if self.adapter_factory is not None:
             try:
                 adapter = self.adapter_factory(news, source, self.config)
             except TypeError:
                 adapter = self.adapter_factory(news, source)
         else:
-            adapter = self._default_adapter(source)
+            adapter = self._default_adapter(source, request=request)
         return adapter.collect(
             news, source,
             CollectionContext(
@@ -633,21 +790,40 @@ class PipelineRunner:
             ),
         )
 
-    def _default_adapter(self, source):
+    def _default_adapter(self, source, *, request=None):
         if source.source_type is SourceType.VIDEO:
             return VideoAdapter()
         if ReviewReason.DYNAMIC_PAGE in source.review_reasons:
-            return DynamicPageAdapter(transport=self.source_transport)
+            return DynamicPageAdapter(client=self._page_client())
         path = urlsplit(source.url).path.casefold()
         if source.source_type is SourceType.DIRECT_IMAGE or path.endswith(
             (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")
         ):
             return DirectImageAdapter()
         if source.source_type is SourceType.STEAM:
-            return SteamAdapter(transport=self.source_transport)
+            return SteamAdapter(client=self._page_client())
         if source.source_type is SourceType.OFFICIAL_X:
-            return XAdapter(token=os.getenv("X_BEARER_TOKEN"), public_transport=self.source_transport)
-        return OfficialHtmlAdapter(transport=self.source_transport)
+            runtime = self._network_runtime
+            kwargs = {}
+            if runtime is not None:
+                kwargs["socialdata_transport"] = runtime.socialdata_lookup
+            adapter = create_x_adapter(
+                public_transport=self.source_transport,
+                use_socialdata=bool(request and request.use_socialdata_x),
+                response_cache=self._socialdata_response_cache,
+                **kwargs,
+            )
+            if runtime is not None:
+                adapter.public_client = runtime.page_bridge
+                adapter.entity_client = runtime.page_bridge
+            return adapter
+        return OfficialHtmlAdapter(client=self._page_client())
+
+    def _page_client(self):
+        if self._network_runtime is not None:
+            return self._network_runtime.page_bridge
+        from ..discovery.http import SafeHttpClient
+        return SafeHttpClient(transport=self.source_transport, timeout=20.0, max_retries=2)
 
     def _download_videos(self, candidates, output_dir):
         if self.video_downloader_factory is None:
@@ -685,47 +861,58 @@ class PipelineRunner:
                 try:
                     self.history.record_news_result(NewsResult(
                         news_item=news, sources=source_map.get(news.id, []),
-                        candidates=[c for c in result.candidates if c.news_id == news.id],
+                        candidates=[c for c in result.all_candidates if c.news_id == news.id],
                         failures=[f for f in result.failures if f.news_id == news.id],
                     ))
                 except Exception as exc:
                     result.failures.append(FailureRecord(
                         stage=FailureStage.HISTORY, news_id=news.id,
-                        code="history_error", message=str(exc), retryable=True,
+                        code="history_error", message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=True,
                     ))
         result.failures = self._merge_failures(result.failures)
         return result
 
     def _publish_output(self, result, raw_dir, task_dir):
         if self._legacy_output:
-            OutputManager().write(result, raw_dir)
-            return
+            return OutputManager().write(result, raw_dir)
         work = task_dir / ".work"
         work.mkdir(parents=True, exist_ok=True)
         stage = work / f"publish-{uuid.uuid4().hex}"
-        OutputManager().write(result, stage)
         backup = task_dir / f".raw-backup-{uuid.uuid4().hex}"
+        # Delivery mutates candidates while copying/converting. Retain their
+        # identities, but restore their metadata if staging or publication fails.
+        media = {id(item): item for item in [*result.all_candidates, *result.review_required, *result.videos]}
+        previous = [(item, copy.deepcopy(item.__dict__)) for item in media.values()]
+        previous_failures = list(result.failures)
         try:
+            manifest = OutputManager().write(result, stage)
+            self._rewrite_paths(result, stage, raw_dir)
+            rebase_asset_paths(manifest, stage, raw_dir)
+            # Rewrite persisted payloads before the atomic directory swap. Any
+            # write failure therefore leaves the previous raw output intact.
+            for index in stage.glob("*.json"):
+                payload = json.loads(index.read_text(encoding="utf-8"))
+                atomic_json_write(index, rebase_asset_paths(payload, stage, raw_dir))
             if raw_dir.exists():
                 os.replace(raw_dir, backup)
             os.replace(stage, raw_dir)
         except Exception:
             if not raw_dir.exists() and backup.exists():
                 os.replace(backup, raw_dir)
+            for item, metadata in previous:
+                item.__dict__.clear()
+                item.__dict__.update(metadata)
+            result.failures[:] = previous_failures
+            if stage.exists():
+                shutil.rmtree(stage, ignore_errors=True)
             raise
         if backup.exists():
             shutil.rmtree(backup, ignore_errors=True)
-        self._rewrite_paths(result, stage, raw_dir)
+        return manifest
 
     @staticmethod
     def _rewrite_paths(result, old_root, new_root):
-        old_text, new_text = str(old_root), str(new_root)
-        for candidate in result.all_candidates:
-            if candidate.local_path:
-                candidate.local_path = candidate.local_path.replace(old_text, new_text, 1)
-        for video in result.videos:
-            if video.local_path:
-                video.local_path = video.local_path.replace(old_text, new_text, 1)
+        rebase_asset_paths(result, Path(old_root), Path(new_root))
 
     def _cancel(
         self, request, task_id, task_dir, raw_dir, checkpoint_path, issue,
@@ -740,7 +927,7 @@ class PipelineRunner:
                 failures=failures, source_map=source_map,
             )
         except Exception as exc:
-            failures.append(self._failure("checkpoint_error", str(exc)))
+            failures.append(self._failure("checkpoint_error", (str(exc).strip() or f"执行失败（{type(exc).__name__}）")))
         self._emit(sink, failures, self._event(
             "task_cancelled", task_id, issue.issue_id, message="cancelled",
         ))
@@ -768,7 +955,7 @@ class PipelineRunner:
                 try:
                     OutputManager().write(result, raw_dir)
                 except Exception as exc:
-                    failures.append(self._failure("output_error", str(exc)))
+                    failures.append(self._failure("output_error", (str(exc).strip() or f"执行失败（{type(exc).__name__}）")))
         result.failures = self._merge_failures(
             [*result.failures, *failures[failure_index:]]
         )
@@ -777,7 +964,7 @@ class PipelineRunner:
                 self._write_checkpoint(
                     checkpoint_path, status="failed", task_id=task_id, issue=result.issue,
                     input_hash=input_hash, config_hash=config_hash,
-                    completed_news_ids=completed or set(), candidates=result.candidates,
+                    completed_news_ids=completed or set(), candidates=result.all_candidates,
                     videos=result.videos, failures=result.failures,
                     source_map=source_map or {}, result=result,
                 )
@@ -879,6 +1066,8 @@ class PipelineRunner:
             failures=failures,
             source_map=source_map,
             result=result,
+            x_query_count=self._x_query_base + (self._network_runtime.socialdata.request_count if self._network_runtime else 0),
+            media_cache_version=self._media_cache_version,
             schema_version=self.CHECKPOINT_SCHEMA_VERSION,
             dedupe_videos=self._dedupe_videos,
             merge_failures=self._merge_failures,
@@ -942,13 +1131,20 @@ class PipelineRunner:
 
     @staticmethod
     def _failure(code, message):
-        return FailureRecord(stage=FailureStage.PARSE, code=code, message=message, retryable=False)
+        return FailureRecord(stage=FailureStage.PARSE, code=code, message=str(message).strip() or "执行失败，未提供异常说明", retryable=False)
+
+    def _x_media_payload(self, candidates):
+        photos = [value for value in candidates if value.signals.get("x_api_photo") or value.signals.get("socialdata_photo")]
+        return {"x_queries": self._x_query_base + (self._network_runtime.socialdata.request_count if self._network_runtime else 0),
+            "x_attachments": len(photos), "x_downloaded": sum(value.download_status == "downloaded" for value in photos),
+            "x_pending": sum(value.download_status in {"pending", "retryable_failed"} for value in photos),
+            "x_failed": sum(value.download_status in {"retryable_failed", "permanent_failed"} for value in photos)}
 
     @staticmethod
-    def _event(kind, task_id, issue_id, *, news_id=None, news_index=None, total_news=None, message=""):
+    def _event(kind, task_id, issue_id, *, news_id=None, news_index=None, total_news=None, message="", payload=None):
         return ProgressEvent(
             kind=kind, task_id=task_id, issue_id=issue_id, news_id=news_id,
-            news_index=news_index, total_news=total_news, message=message,
+            news_index=news_index, total_news=total_news, message=message, payload=payload or {},
         )
 
     @staticmethod
@@ -958,5 +1154,5 @@ class PipelineRunner:
         except Exception as exc:
             failures.append(FailureRecord(
                 stage=FailureStage.OUTPUT, code="event_sink_failed",
-                message=str(exc), retryable=False,
+                message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=False,
             ))

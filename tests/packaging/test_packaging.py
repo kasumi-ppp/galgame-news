@@ -96,3 +96,83 @@ def test_publish_bundle_rolls_back_only_runtime_files_on_copy_failure(monkeypatc
     assert (target / "b_existing.txt").read_text(encoding="utf-8") == "original"
     assert (target / "unknown.txt").read_text(encoding="utf-8") == "keep"
     assert (output / "user-data.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_publish_bundle_replaces_stale_internal_runtime_but_preserves_output(tmp_path):
+    build = _build_module()
+    staged = tmp_path / "staged"
+    target = tmp_path / "dist" / "GalgameNewsToolbox"
+    (staged / "_internal" / "PySide6").mkdir(parents=True)
+    (target / "_internal" / "PySide6").mkdir(parents=True)
+    (target / "output").mkdir(parents=True)
+
+    (staged / "_internal" / "PySide6" / "fresh.dll").write_text("new", encoding="utf-8")
+    (target / "_internal" / "PySide6" / "stale.dll").write_text("old", encoding="utf-8")
+    (target / "output" / "user-data.txt").write_text("keep", encoding="utf-8")
+
+    build.publish_bundle(staged, target)
+
+    assert (target / "_internal" / "PySide6" / "fresh.dll").read_text(encoding="utf-8") == "new"
+    assert not (target / "_internal" / "PySide6" / "stale.dll").exists()
+    assert (target / "output" / "user-data.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_publish_bundle_restores_internal_runtime_when_copy_fails(monkeypatch, tmp_path):
+    build = _build_module()
+    staged = tmp_path / "staged"
+    target = tmp_path / "dist" / "GalgameNewsToolbox"
+    (staged / "_internal" / "PySide6").mkdir(parents=True)
+    (target / "_internal" / "PySide6").mkdir(parents=True)
+    (target / "output").mkdir(parents=True)
+
+    (staged / "_internal" / "PySide6" / "fresh.dll").write_text("new", encoding="utf-8")
+    (target / "_internal" / "PySide6" / "stale.dll").write_text("old", encoding="utf-8")
+    (target / "output" / "user-data.txt").write_text("keep", encoding="utf-8")
+
+    original_copy2 = build.shutil.copy2
+
+    def fail_staged_copy(source, destination, *args, **kwargs):
+        if Path(source).resolve().is_relative_to(staged.resolve()):
+            raise OSError("simulated runtime copy failure")
+        return original_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(build.shutil, "copy2", fail_staged_copy)
+    with pytest.raises(OSError, match="simulated runtime copy failure"):
+        build.publish_bundle(staged, target)
+
+    assert (target / "_internal" / "PySide6" / "stale.dll").read_text(encoding="utf-8") == "old"
+    assert not (target / "_internal" / "PySide6" / "fresh.dll").exists()
+    assert (target / "output" / "user-data.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_publish_bundle_restores_internal_runtime_when_replacement_delete_fails(monkeypatch, tmp_path):
+    build = _build_module()
+    staged = tmp_path / "staged"
+    target = tmp_path / "dist" / "GalgameNewsToolbox"
+    (staged / "_internal" / "PySide6").mkdir(parents=True)
+    (target / "_internal" / "PySide6").mkdir(parents=True)
+    (target / "output").mkdir(parents=True)
+
+    (staged / "_internal" / "PySide6" / "fresh.dll").write_text("new", encoding="utf-8")
+    stale = target / "_internal" / "PySide6" / "stale.dll"
+    stale.write_text("old", encoding="utf-8")
+    (target / "output" / "user-data.txt").write_text("keep", encoding="utf-8")
+
+    original_rmtree = build.shutil.rmtree
+    failed_once = False
+
+    def fail_once_after_partial_delete(path, *args, **kwargs):
+        nonlocal failed_once
+        if Path(path).resolve() == (target / "_internal").resolve() and not failed_once:
+            failed_once = True
+            stale.unlink()
+            raise OSError("simulated runtime replacement delete failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(build.shutil, "rmtree", fail_once_after_partial_delete)
+    with pytest.raises(OSError, match="simulated runtime replacement delete failure"):
+        build.publish_bundle(staged, target)
+
+    assert stale.read_text(encoding="utf-8") == "old"
+    assert not (target / "_internal" / "PySide6" / "fresh.dll").exists()
+    assert (target / "output" / "user-data.txt").read_text(encoding="utf-8") == "keep"

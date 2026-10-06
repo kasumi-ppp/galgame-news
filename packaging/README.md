@@ -17,7 +17,10 @@ already-acquired `ffmpeg.exe` and `ffprobe.exe` below `bin/`; the spec copies
 those files when present. The build never downloads FFmpeg and no FFmpeg
 binaries are committed here.
 
-The overlay never deletes unknown bundle files or `dist/.../output` user data.
+The publisher preserves unknown top-level bundle files and all
+`dist/.../output` user data. The managed `_internal` runtime tree is replaced
+as a whole on each successful publish, so stale Qt/PySide6 DLLs cannot remain
+from an older build. If copying fails, the previous runtime tree is restored.
 If the target executable is in use, publication fails before copying files.
 After a successful Windows build, `00_启动工具箱.lnk` points to the bundle
 executable with the repository root as its working directory.

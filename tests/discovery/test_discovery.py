@@ -206,6 +206,37 @@ def test_dynamic_and_age_gate_sources_are_reviewable():
     assert source.requires_review
 
 
+def test_official_html_clicks_explicit_18_plus_cookie_gate_and_collects_images():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+    from galgame_news.discovery.http import SafeHttpClient
+
+    url = "https://circus.example/product/game/"
+    gate = """
+    <meta charset="utf-8"><a id="confirm-yes">はい、18才以上です。</a>
+    <script>Cookies.set('PermitRate', '18', { expires: 180 });</script>
+    """
+    confirmed = '<html><title>Gallery</title><img src="/gallery/cg01.jpg"></html>'
+    requests = []
+
+    def transport(request_url, *, headers, **_kwargs):
+        requests.append((request_url, headers.get("cookie", "")))
+        return FakeResponse(text=confirmed if "PermitRate=18" in headers.get("cookie", "") else gate, url=request_url)
+
+    client = SafeHttpClient(
+        transport=transport,
+        resolver=lambda _host: ["93.184.216.34"],
+        max_retries=1,
+    )
+    source = SourceRef(url=url, domain="circus.example", source_type=SourceType.OFFICIAL_SITE)
+    result = OfficialHtmlAdapter(client=client).collect(item(), source, CollectionContext())
+
+    assert [cookie for _, cookie in requests] == ["", "PermitRate=18"]
+    assert [candidate.image_url for candidate in result.candidates] == ["https://circus.example/gallery/cg01.jpg"]
+    assert result.manual_review_reasons == []
+    assert source.requires_review is False
+    assert result.candidates[0].signals["age_gate_confirmed"] is True
+
+
 def test_default_resolver_discovers_same_domain_gallery_using_configured_depth():
     from galgame_news.discovery.resolver import DefaultSourceResolver
 
@@ -262,6 +293,53 @@ def test_ddgs_provider_accepts_current_href_and_body_field_names():
     assert result[0].source_type is SourceType.UNVERIFIED
 
 
+def test_ddgs_provider_expands_explicit_cg_updates_with_gallery_search_terms():
+    from galgame_news.discovery.search import DDGSSearchProvider
+
+    calls = []
+
+    def search(query, **_):
+        calls.append(query)
+        return [{"title": query, "href": f"https://search.example/result-{len(calls)}", "body": "CG gallery"}]
+
+    provider = DDGSSearchProvider(search_fn=search, max_results=5)
+    result = provider.search(item(
+        title="《One Night After》CG更新",
+        game_names=["One Night After"],
+        body="官网更新了一组 CG 图片。",
+    ))
+
+    assert calls[0] == "One Night After"
+    assert any("CG" in query and "gallery" in query.casefold() for query in calls[1:])
+    assert any("画像" in query for query in calls[1:])
+    assert len(result) >= 3
+
+
+def test_fallback_search_combines_providers_for_explicit_cg_updates():
+    from galgame_news.discovery.search import FallbackSearchProvider
+
+    class Provider:
+        def __init__(self, prefix):
+            self.prefix = prefix
+            self.calls = 0
+
+        def search(self, _news):
+            self.calls += 1
+            return [SourceRef(
+                url=f"https://{self.prefix}.example/result-{i}",
+                domain=f"{self.prefix}.example",
+                source_type=SourceType.UNVERIFIED,
+                discovered_via=DiscoveryMethod.DDGS,
+            ) for i in range(3)]
+
+    brave, ddgs = Provider("brave"), Provider("ddgs")
+    provider = FallbackSearchProvider(brave=brave, ddgs=ddgs, max_results=2)
+    result = provider.search(item(title="《Happy Weekend》CG更新", game_names=["Happy Weekend"]))
+
+    assert brave.calls == ddgs.calls == 1
+    assert len(result) == 6
+
+
 def test_ddgs_provider_passes_bounded_timeout_to_client(monkeypatch):
     from types import SimpleNamespace
     import sys
@@ -303,7 +381,7 @@ def test_x_without_token_extracts_public_meta_image_and_still_requires_review():
     source = SourceRef(url="https://x.com/studio/status/1", domain="x.com", source_type=SourceType.OFFICIAL_X)
     adapter = XAdapter(token=None, public_transport=lambda url, **_: FakeResponse(text=html, url=url))
     result = adapter.collect(item(), source, CollectionContext())
-    assert [candidate.image_url for candidate in result.candidates] == ["https://pbs.twimg.com/media/cg.jpg"]
+    assert [candidate.image_url for candidate in result.candidates] == ["https://pbs.twimg.com/media/cg.jpg?name=orig"]
     assert ReviewReason.X_SOURCE in result.manual_review_reasons
 
 
@@ -382,3 +460,180 @@ def test_search_official_result_triggers_same_domain_gallery_discovery():
     )
     result = resolver.resolve(item(source_urls=[]))
     assert [source.url for source in result] == ["https://official.example/home", "https://official.example/gallery"]
+
+
+def test_official_crawl_follows_exact_game_portal_then_graphic_chapter_and_keeps_provenance():
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    pages = {
+        "https://official.example/": '<a href="/unrelated">Other game</a><a href="/product/happy">Happy Weekend</a>',
+        "https://official.example/product/happy": '<a href="/news">News</a><a href="/chapters#GRAPHIC"><img alt="GRAPHIC"></a>',
+        "https://official.example/chapters#GRAPHIC": "<p>chapter index</p>",
+    }
+    resolver = DefaultSourceResolver(
+        same_domain_depth=3,
+        same_domain_transport=lambda url, **_: FakeResponse(text=pages[url], url=url),
+        search_provider=lambda _news: [],
+    )
+    result = resolver.resolve(item(source_urls=["https://official.example/"]))
+    discovered = [source for source in result if source.discovered_via is DiscoveryMethod.SAME_DOMAIN]
+
+    assert [source.url for source in discovered] == [
+        "https://official.example/product/happy",
+        "https://official.example/chapters#GRAPHIC",
+    ]
+    assert discovered[0].root_url == "https://official.example/"
+    assert discovered[0].parent_url == "https://official.example/"
+    assert discovered[1].root_url == "https://official.example/"
+    assert discovered[1].parent_url == "https://official.example/product/happy"
+
+
+def test_homepage_portal_matches_canonical_parent_work_from_chapter_game_name():
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    pages = {
+        "https://official.example/": '<a href="/kanade">花鐘カナデ＊グラム</a><a href="/other">別作品</a>',
+        "https://official.example/kanade": '<a href="/kanade/graphic">GRAPHIC</a>',
+        "https://official.example/kanade/graphic": "<p>graphic</p>",
+    }
+    news = item(game_names=["Chapter:4 花鐘カナデ＊グラム"], source_urls=["https://official.example/"])
+    resolver = DefaultSourceResolver(
+        same_domain_depth=3,
+        same_domain_transport=lambda url, **_: FakeResponse(text=pages[url], url=url),
+        search_provider=lambda _news: [],
+    )
+
+    discovered = [source for source in resolver.resolve(news) if source.discovered_via is DiscoveryMethod.SAME_DOMAIN]
+
+    assert [source.url for source in discovered] == [
+        "https://official.example/kanade",
+        "https://official.example/kanade/graphic",
+    ]
+
+
+def test_homepage_portal_matches_parent_first_chapter_name_without_decorative_star():
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    pages = {
+        "https://official.example/": '<a href="/kanade">花鐘カナデグラム</a>',
+        "https://official.example/kanade": '<a href="/kanade/graphic">GRAPHIC</a>',
+        "https://official.example/kanade/graphic": "<p>graphic</p>",
+    }
+    news = item(
+        game_names=["花鐘カナデ＊グラム Chapter:4 綾世奏"],
+        source_urls=["https://official.example/"],
+    )
+    resolver = DefaultSourceResolver(
+        same_domain_depth=3,
+        same_domain_transport=lambda url, **_: FakeResponse(text=pages[url], url=url),
+        search_provider=lambda _news: [],
+    )
+
+    discovered = [source for source in resolver.resolve(news) if source.discovered_via is DiscoveryMethod.SAME_DOMAIN]
+
+    assert [source.url for source in discovered] == [
+        "https://official.example/kanade",
+        "https://official.example/kanade/graphic",
+    ]
+
+
+def test_official_product_portal_follows_its_numbered_chapters_only():
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    pages = {
+        "https://official.example/": '<a href="/product/prj06/index.html">花鐘カナデグラム</a>',
+        "https://official.example/product/prj06/index.html": (
+            '<a href="/product/prj06/chapter4/">Chapter:4 -綾世奏-</a>'
+            '<a href="/product/prj06/chapter4">Chapter:4 -綾世奏-</a>'
+            '<a href="/product/other/chapter1/">Chapter:1 -Other-</a>'
+            '<a href="/product/prj06/chapter4/?id=countdown&no=3">Chapter:4 countdown</a>'
+            '<div data-src="/product/prj06/chapter4/?id=countdown&no=3"></div>'
+        ),
+        "https://official.example/product/prj06/chapter4/": '<a href="#GRAPHIC">GRAPHIC</a>',
+    }
+    news = item(game_names=["花鐘カナデ＊グラム Chapter:4 綾世奏"], source_urls=["https://official.example/"])
+    resolver = DefaultSourceResolver(
+        same_domain_depth=3,
+        same_domain_transport=lambda url, **_: FakeResponse(text=pages[url], url=url),
+        search_provider=lambda _news: [],
+    )
+
+    discovered = [source.url for source in resolver.resolve(news) if source.discovered_via is DiscoveryMethod.SAME_DOMAIN]
+    assert discovered == [
+        "https://official.example/product/prj06/index.html",
+        "https://official.example/product/prj06/chapter4/",
+        "https://official.example/product/prj06/chapter4/#GRAPHIC",
+    ]
+
+
+def test_same_domain_crawl_does_not_emit_gallery_images_as_pages():
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    image_links = "".join(f'<a href="/game/gallery/cg{i:03}.jpg">CG</a>' for i in range(100))
+    page_links = "".join(f'<a href="/game/gallery/p{i:03}.html">Gallery {i}</a>' for i in range(30))
+    pages = {"https://official.example/game/": image_links + page_links}
+    news = item(game_names=["Happy Weekend"], source_urls=["https://official.example/game/"])
+    resolver = DefaultSourceResolver(
+        same_domain_depth=1,
+        same_domain_transport=lambda url, **_: FakeResponse(text=pages[url], url=url),
+        search_provider=lambda _news: [],
+    )
+    discovered = [source.url for source in resolver.resolve(news) if source.discovered_via is DiscoveryMethod.SAME_DOMAIN]
+    assert len(discovered) <= 16
+    assert all(not url.endswith(".jpg") for url in discovered)
+
+
+def test_gallery_dom_section_marks_only_images_inside_section():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+
+    html = '''<div id="GRAPHIC"><a href="/assets/full.jpg"><img src="/thumb.jpg" alt="Kanade CG"></a></div>
+    <div id="news"><a href="/assets/news.jpg"><img src="/thumb-news.jpg" alt="News thumbnail"></a></div>'''
+    source = SourceRef(url="https://official.example/game#GRAPHIC", domain="official.example", source_type=SourceType.OFFICIAL_SITE)
+    result = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url)).collect(item(), source, CollectionContext())
+
+    by_url = {candidate.image_url.rsplit("/", 1)[-1]: candidate for candidate in result.candidates}
+    assert by_url["full.jpg"].signals.get("gallery_path") is True
+    assert by_url["full.jpg"].image_alt == "Kanade CG"
+    assert by_url["news.jpg"].signals.get("gallery_path") is not True
+
+
+def test_generic_campaign_graphic_css_does_not_mark_a_quiz_as_cg_gallery():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+
+    html = '''<section id="special"><figure class="campaign__graphic"><img src="/images/quiz.jpg"></figure></section>
+    <section id="graphic"><a href="/images/cg-full.jpg"><img src="/images/cg-thumb.jpg"></a></section>'''
+    source = SourceRef(url="https://official.example/game", domain="official.example", source_type=SourceType.OFFICIAL_SITE)
+    result = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url)).collect(item(), source, CollectionContext())
+    by_name = {candidate.image_url.rsplit("/", 1)[-1]: candidate for candidate in result.candidates}
+    assert by_name["quiz.jpg"].signals.get("gallery_path") is not True
+    assert by_name["cg-full.jpg"].signals.get("gallery_path") is True
+
+
+def test_fragment_section_scopes_gallery_evidence_on_linked_full_image():
+    from galgame_news.discovery.adapters import OfficialHtmlAdapter
+
+    html = '''<div id="GALLERY"><a href="/images/chapter.jpg"><img src="/thumb/chapter.jpg" alt="Chapter CG"></a></div>
+    <div id="news"><a href="/images/news.jpg"><img src="/thumb/news.jpg" alt="News"></a></div>'''
+    source = SourceRef(url="https://official.example/game#GALLERY", domain="official.example", source_type=SourceType.OFFICIAL_SITE)
+    result = OfficialHtmlAdapter(transport=lambda url, **_: FakeResponse(text=html, url=url)).collect(item(), source, CollectionContext())
+
+    by_url = {candidate.image_url.rsplit("/", 1)[-1]: candidate for candidate in result.candidates}
+    assert by_url["chapter.jpg"].signals.get("gallery_path") is True
+    assert by_url["chapter.jpg"].signals.get("alt") == "Chapter CG"
+    assert by_url["news.jpg"].signals.get("gallery_path") is not True
+
+
+def test_official_crawl_fetches_at_most_sixteen_pages_per_news_item():
+    from galgame_news.discovery.resolver import DefaultSourceResolver
+
+    requests = []
+
+    def transport(url, **_):
+        requests.append(url)
+        links = "".join(f'<a href="/gallery/{index}">Gallery</a>' for index in range(20))
+        return FakeResponse(text=links, url=url)
+
+    resolver = DefaultSourceResolver(same_domain_depth=3, same_domain_transport=transport, search_provider=lambda _news: [])
+    resolver.resolve(item(source_urls=["https://official.example/0"]))
+
+    assert len(requests) <= 16

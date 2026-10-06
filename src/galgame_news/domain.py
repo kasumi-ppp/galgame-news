@@ -52,6 +52,8 @@ class SourceType(_StringEnum):
 
 class ImageType(_StringEnum):
     GAME_CG = "game_cg"
+    BACKGROUND_ART = "background_art"
+    DECORATIVE = "decorative"
     GAMEPLAY_SCREENSHOT = "gameplay_screenshot"
     KEY_VISUAL = "key_visual"
     CHARACTER_ART = "character_art"
@@ -62,6 +64,13 @@ class ImageType(_StringEnum):
     BANNER = "banner"
     UI = "ui"
     PHOTO = "photo"
+    UNKNOWN = "unknown"
+
+
+class ImageCurationStatus(_StringEnum):
+    SELECTED = "selected"
+    UNSELECTED = "unselected"
+    INVALID = "invalid"
     UNKNOWN = "unknown"
 
 
@@ -94,6 +103,7 @@ class ReviewReason(_StringEnum):
     HISTORICAL_DUPLICATE = "historical_duplicate"
     ADULT_OR_UNKNOWN = "adult_or_unknown"
     IMAGE_TYPE_REVIEW = "image_type_review"
+    IMAGE_QUALITY_REVIEW = "image_quality_review"
 
 
 class FailureStage(_StringEnum):
@@ -123,8 +133,10 @@ def news_id_for(issue_id: str, sequence: int, title: str) -> str:
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
-def candidate_id_for(image_url: str) -> str:
-    return hashlib.sha256(_normalized_url(image_url).encode("utf-8")).hexdigest()[:16]
+def candidate_id_for(image_url: str, news_id: str | None = None) -> str:
+    """Return a stable image identity scoped to its news item when available."""
+    key = f"{news_id}\0{_normalized_url(image_url)}" if news_id else _normalized_url(image_url)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
 def video_candidate_id_for(video_url: str) -> str:
@@ -209,6 +221,10 @@ class SourceRef(ContractModel):
     officiality: float = Field(default=0.0, ge=0.0, le=1.0)
     requires_review: bool = False
     review_reasons: list[ReviewReason] = Field(default_factory=list)
+    root_url: str | None = None
+    parent_url: str | None = None
+    navigation_kind: str = ""
+    navigation_text: str = ""
 
 
 class ScoreBreakdown(ContractModel):
@@ -222,10 +238,29 @@ class ScoreBreakdown(ContractModel):
     total: float = Field(ge=0.0, le=100.0)
 
 
+class ImageEvidence(ContractModel):
+    """Image-local provenance; never a classifier's derived verdict."""
+
+    page_url: str
+    container: str = ""
+    item_id: str = ""
+    role: str = "unknown"
+    text: str = ""
+    method: str = "dom"
+    relationship: str = "image attribute"
+    variant_of: str | None = None
+
+
 class ImageCandidate(ContractModel):
     id: str | None = None
     news_id: str = Field(min_length=1)
     image_url: str = Field(min_length=1)
+    media_source_url: str | None = None
+    downloaded_url: str | None = None
+    expected_width: int | None = Field(default=None, ge=1)
+    expected_height: int | None = Field(default=None, ge=1)
+    download_status: Literal["pending", "downloaded", "retryable_failed", "permanent_failed"] = "pending"
+    download_error_code: str | None = None
     source_url: str = Field(min_length=1)
     source_type: SourceType = SourceType.UNKNOWN
     image_type: ImageType = ImageType.UNKNOWN
@@ -240,14 +275,39 @@ class ImageCandidate(ContractModel):
     perceptual_hash: str | None = None
     downloadable: bool = False
     local_path: str | None = None
+    original_path: str | None = None
+    original_mime_type: str | None = None
+    original_byte_size: int | None = Field(default=None, ge=0)
+    original_sha256: str | None = None
+    original_width: int | None = Field(default=None, ge=1)
+    original_height: int | None = Field(default=None, ge=1)
+    output_mime_type: str | None = None
+    output_byte_size: int | None = Field(default=None, ge=0)
+    output_sha256: str | None = None
+    output_width: int | None = Field(default=None, ge=1)
+    output_height: int | None = Field(default=None, ge=1)
+    news_source_url: str | None = None
+    parent_source_url: str | None = None
+    image_alt: str | None = None
+    evidence: list[ImageEvidence] = Field(default_factory=list)
+    nearby_text: str | None = None
+    selection_reasons: list[str] = Field(default_factory=list)
+    animated_source: bool = False
+    animation_frame_index: int | None = Field(default=None, ge=0)
     review_reasons: list[ReviewReason] = Field(default_factory=list)
-    signals: dict[str, float | str | bool] = Field(default_factory=dict)
+    signals: dict[str, float | int | str | bool] = Field(default_factory=dict)
     score: ScoreBreakdown | None = None
     selected: bool = False
+    curation_status: ImageCurationStatus = ImageCurationStatus.UNSELECTED
 
     @model_validator(mode="after")
     def assign_stable_id(self) -> "ImageCandidate":
-        object.__setattr__(self, "id", candidate_id_for(self.image_url))
+        object.__setattr__(self, "id", candidate_id_for(self.image_url, self.news_id))
+        if self.signals.get("invalid_reason") or self.curation_status is ImageCurationStatus.INVALID:
+            object.__setattr__(self, "selected", False)
+            object.__setattr__(self, "curation_status", ImageCurationStatus.INVALID)
+        else:
+            object.__setattr__(self, "curation_status", ImageCurationStatus.SELECTED if self.selected else ImageCurationStatus.UNSELECTED)
         return self
 
     _published_at_aware = field_validator("published_at")(_aware)

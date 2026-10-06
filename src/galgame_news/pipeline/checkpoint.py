@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from .contracts import Checkpoint
+from ..config import CONCURRENCY_FIELDS, BrowserConfig, DEFAULT_REJECTED_IMAGE_TYPES
 
 
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -32,7 +33,23 @@ def config_hash(config, request=None) -> str:
             "llm_provider": request.llm_provider,
             "llm_model": request.llm_model,
         }
-    payload = {"config": config.model_dump(mode="json"), "request": behavior}
+        if request.use_socialdata_x:
+            behavior["use_socialdata_x"] = True
+    semantic_config = config.model_dump(mode="json")
+    # Added default-only fields must not strand historical download recovery.
+    # Explicit browser changes and existing/custom type rules remain hashed.
+    if semantic_config.get("browser") == BrowserConfig().model_dump(mode="json"):
+        semantic_config.pop("browser", None)
+    limits = semantic_config.get("selection", {}).get("type_limits", {})
+    if limits.get("decorative") == 0:
+        limits.pop("decorative")
+    rejected = semantic_config.get("image_types", {}).get("rejected_image_types_by_requirement", {})
+    for key, values in rejected.items():
+        if values == DEFAULT_REJECTED_IMAGE_TYPES.get(key):
+            rejected[key] = [value for value in values if value != "decorative"]
+    for field in CONCURRENCY_FIELDS:
+        semantic_config["network"].pop(field, None)
+    payload = {"config": semantic_config, "request": behavior}
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -80,6 +97,8 @@ def write_checkpoint(
     failures,
     source_map,
     result=None,
+    x_query_count=0,
+    media_cache_version=1,
     schema_version: int = CHECKPOINT_SCHEMA_VERSION,
     dedupe_videos=_dedupe_videos,
     merge_failures=_merge_failures,
@@ -93,6 +112,9 @@ def write_checkpoint(
         config_sha256=config_hash_value,
         issue=issue,
         completed_news_ids=sorted(completed_news_ids),
+        retryable_candidate_ids=[candidate.id for candidate in candidates if candidate.download_status in {"pending", "retryable_failed"}],
+        x_query_count=x_query_count,
+        media_cache_version=media_cache_version,
         candidates=list(candidates),
         videos=dedupe_videos(videos),
         failures=merge_failures(failures),
@@ -138,6 +160,8 @@ def validate_checkpoint_associations(checkpoint) -> None:
         raise ValueError("checkpoint completed news id is unknown")
     if not set(checkpoint.source_map).issubset(ids):
         raise ValueError("checkpoint source map news id is unknown")
+    if not set(checkpoint.retryable_candidate_ids).issubset({candidate.id for candidate in checkpoint.candidates}):
+        raise ValueError("checkpoint retry candidate id is unknown")
     for candidate in checkpoint.candidates:
         if candidate.news_id not in ids:
             raise ValueError("checkpoint candidate news id is unknown")

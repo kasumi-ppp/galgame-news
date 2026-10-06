@@ -44,7 +44,11 @@ class ImageRanker:
                 relevance = max(0.0, min(1.0, 0.55 * base_relevance + 0.45 * type_match))
             else:
                 relevance = base_relevance
-            if candidate.published_at is None:
+            if candidate.image_type in {ImageType.GAME_CG, ImageType.GAMEPLAY_SCREENSHOT}:
+                # Reusable in-game assets remain applicable to a current news
+                # item regardless of when the original gallery was published.
+                freshness = 0.5
+            elif candidate.published_at is None:
                 freshness = 0.0
                 if ReviewReason.UNKNOWN_PUBLISH_TIME not in candidate.review_reasons: candidate.review_reasons.append(ReviewReason.UNKNOWN_PUBLISH_TIME)
             else:
@@ -60,10 +64,17 @@ class ImageRanker:
                 quality = max(0.0, min(1.0, min(width / 1280.0, height / 720.0)))
             else:
                 quality = 0.5
+            visual_detail = candidate.signals.get("visible_detail_score")
+            if not isinstance(visual_detail, (int, float)):
+                visual_detail = candidate.signals.get("sharpness_score")
+            if isinstance(visual_detail, (int, float)):
+                # Resolution is a ceiling; measured detail breaks ties between
+                # same-news variants without rewarding upscaled thumbnails.
+                quality = 0.7 * quality + 0.3 * max(0.0, min(1.0, float(visual_detail)))
             duplicate_penalty = 1.0 if ReviewReason.HISTORICAL_DUPLICATE in candidate.review_reasons else 0.0
             risk_penalty = 1.0 if ReviewReason.ADULT_OR_UNKNOWN in candidate.review_reasons else 0.0
             total = 100 * (self.scoring.relevance * relevance + self.scoring.freshness * freshness + self.scoring.source_trust * trust + self.scoring.quality * quality - self.scoring.duplicate_penalty * duplicate_penalty - self.scoring.risk_penalty * risk_penalty)
             candidate.score = ScoreBreakdown(relevance=relevance, freshness=freshness, source_trust=trust, quality=quality, duplicate_penalty=duplicate_penalty, risk_penalty=risk_penalty, type_match=type_match, total=max(0.0, min(100.0, total)))
             ranked.append(candidate)
-        ranked.sort(key=lambda c: (-(c.score.total if c.score else 0), -(c.score.source_trust if c.score else 0), -(c.published_at.timestamp() if c.published_at else 0), -((c.width or 0) * (c.height or 0)), c.id or ""))
+        ranked.sort(key=lambda c: (-(c.score.total if c.score else 0), -(c.score.source_trust if c.score else 0), -float(c.signals.get("visible_detail_score", c.signals.get("sharpness_score", 0.0)) or 0.0), -((c.width or 0) * (c.height or 0)), c.id or ""))
         return ranked

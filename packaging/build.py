@@ -109,11 +109,12 @@ def _staged_runtime_files(source: Path) -> list[tuple[Path, Path]]:
 
 
 def _copy_tree_transactionally(source: Path, target: Path) -> None:
-    """Overlay staged files with rollback for every file touched by this run.
+    """Publish staged runtime files with rollback for every file touched.
 
-    Only staged runtime paths are considered.  Existing files at those exact
-    paths are copied into a system temporary rollback directory; no unknown
-    target files or ``output`` contents are traversed or removed.
+    The PyInstaller ``_internal`` tree is replaced as a unit so stale Qt
+    binaries cannot survive a rebuild.  Existing files at other staged paths
+    are copied into a system temporary rollback directory.  No unknown target
+    files or ``output`` contents are traversed or removed.
     """
 
     files = _staged_runtime_files(source)
@@ -123,7 +124,17 @@ def _copy_tree_transactionally(source: Path, target: Path) -> None:
     backups: list[tuple[Path, Path]] = []
     created_files: list[Path] = []
     created_directories: list[Path] = []
+    staged_internal = source / "_internal"
+    target_internal = target / "_internal"
+    internal_backup = rollback_root / "_internal"
+    internal_replaced = False
     try:
+        if staged_internal.is_dir() and target_internal.exists():
+            if not target_internal.is_dir():
+                raise IsADirectoryError(target_internal)
+            shutil.copytree(target_internal, internal_backup, symlinks=True)
+            internal_replaced = True
+            shutil.rmtree(target_internal)
         for _staged, relative in files:
             destination = target / relative
             if destination.exists() and not destination.is_file():
@@ -155,6 +166,13 @@ def _copy_tree_transactionally(source: Path, target: Path) -> None:
         for destination, backup in reversed(backups):
             try:
                 shutil.copy2(backup, destination)
+            except OSError:
+                pass
+        if internal_replaced:
+            try:
+                if target_internal.exists():
+                    shutil.rmtree(target_internal)
+                shutil.copytree(internal_backup, target_internal, symlinks=True)
             except OSError:
                 pass
         for directory in reversed(created_directories):

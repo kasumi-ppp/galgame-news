@@ -4,7 +4,7 @@ from pathlib import Path
 
 from galgame_news.config import load_config
 from galgame_news.curation.curator import ImageCurator
-from galgame_news.domain import EventType, ImageNeed, ImageCandidate, Issue, NewsItem, SourceType
+from galgame_news.domain import EventType, ImageNeed, ImageCandidate, ImageEvidence, Issue, NewsItem, SourceType
 
 
 NOW = datetime.now(timezone.utc)
@@ -138,8 +138,18 @@ def test_259_accuracy_fixture_covers_seven_news_without_network():
         if entry["key"] == "ousama":
             from galgame_news.curation.validation import placeholder_asset_reason
             assert placeholder_asset_reason(candidates[0]) == "placeholder_image"
-        if entry["key"] in {"yuriarashi", "phantom", "nekopara"}:
+        if entry["key"] in {"yuriarashi", "phantom"}:
             assert any(value.selected for value in candidates if "other" not in value.image_url.casefold() and "cbrimages" not in value.image_url)
+        if entry["key"] == "nekopara":
+            # The old fixture has only a filename and a page title. New local
+            # evidence rules retain it for review until a product item is known.
+            assert candidates[0].selected is False
+            assert "type_evidence_insufficient" in candidates[0].selection_reasons
+            candidates[0].evidence.append(ImageEvidence(page_url=candidates[0].source_url,
+                container="div.product-detail",item_id="nekopara-figure",role="goods",
+                text="NEKOPARA figure",method="dom",relationship="Product main image"))
+            ImageCurator(load_config()).curate(Issue(issue_id=fixture["issue_id"],input_path="fixture.docx",news_items=[news]),candidates)
+            assert candidates[0].selected
         assert all(value.selected is False for value in candidates if "other" in value.image_url.casefold() or "cbrimages" in value.image_url)
 
 

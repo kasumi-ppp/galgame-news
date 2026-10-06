@@ -8,7 +8,7 @@ from galgame_news.config import PrescanConfig, load_config
 def test_load_config_reads_repository_defaults():
     config = load_config()
     assert config.scoring.relevance == pytest.approx(0.50)
-    assert config.scoring.freshness == pytest.approx(0.20)
+    assert config.scoring.freshness == pytest.approx(0.00)
     assert config.filters.min_width == 300
     assert config.selection.max_images == 20
     assert config.search.max_candidates_per_source >= 100

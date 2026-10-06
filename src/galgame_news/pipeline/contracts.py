@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +73,12 @@ class CancellationToken:
                 self._pause_condition.wait()
         self.raise_if_cancelled()
 
+    async def wait_if_paused_async(self) -> None:
+        """Yield the loop while the existing thread-safe flag is paused."""
+        while self.is_paused and not self.is_cancelled:
+            await asyncio.sleep(0.05)
+        self.raise_if_cancelled()
+
     @property
     def is_cancelled(self) -> bool:
         return self._event.is_set()
@@ -118,6 +125,9 @@ class Checkpoint(BaseModel):
     config_sha256: str = Field(min_length=1)
     issue: Issue
     completed_news_ids: list[str] = Field(default_factory=list)
+    retryable_candidate_ids: list[str] = Field(default_factory=list)
+    x_query_count: int = Field(default=0, ge=0)
+    media_cache_version: Literal[0, 1] = 0
     candidates: list[ImageCandidate] = Field(default_factory=list)
     videos: list[VideoCandidate] = Field(default_factory=list)
     failures: list[FailureRecord] = Field(default_factory=list)
@@ -139,6 +149,7 @@ class TaskRequest:
     output_dir: Path | str
     offline: bool = False
     no_videos: bool = False
+    use_socialdata_x: bool = False
     config_path: Path | str | None = None
     history_db: Path | str | None = None
     max_images: int | None = None

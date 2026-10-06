@@ -13,10 +13,12 @@ from .credentials import (
     KeyringCredentialStore,
 )
 from .ffmpeg import FFmpegStatus, discover_ffmpeg, resolve_ffmpeg, resolve_ffmpeg_location
+from .browser import PLAYWRIGHT_VERSION, browser_install_commands, check_browser_runtime
 from .model import AppSettings, SettingsStore, default_app_data_dir
 
 __all__ = [
     "AppSettings",
+    "PLAYWRIGHT_VERSION",
     "CredentialBackend",
     "CredentialBundle",
     "CredentialStore",
@@ -26,6 +28,8 @@ __all__ = [
     "KeyringCredentialStore",
     "SettingsStore",
     "default_app_data_dir",
+    "browser_install_commands",
+    "check_browser_runtime",
     "discover_ffmpeg",
     "resolve_ffmpeg",
     "resolve_ffmpeg_location",

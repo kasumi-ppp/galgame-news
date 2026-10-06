@@ -18,12 +18,15 @@ def test_credentials_use_injected_backend_and_never_write_to_settings_files(tmp_
 
     store.set("brave_api_key", "brave-secret-123")
     store.set("x_bearer_token", "x-secret-456")
+    store.set("socialdata_api_key", "socialdata-secret-789")
 
     assert store.get("brave_api_key") == "brave-secret-123"
     assert store.get("x_bearer_token") == "x-secret-456"
+    assert store.get("socialdata_api_key") == "socialdata-secret-789"
     assert list(tmp_path.iterdir()) == []
     assert "brave-secret-123" not in repr(store)
     assert "x-secret-456" not in repr(store)
+    assert "socialdata-secret-789" not in repr(store)
     assert "brave-secret-123" not in repr(backend)
     assert "x-secret-456" not in repr(backend)
 

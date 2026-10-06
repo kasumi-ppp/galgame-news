@@ -12,8 +12,14 @@ from ...video.discovery import video_candidate
 
 def _candidate(news: NewsItem, image_url: str, source: SourceRef, context: CollectionContext) -> ImageCandidate:
     signals: dict[str, float | str | bool] = {"source_officiality": source.officiality}
-    if source.source_type in {SourceType.OFFICIAL_X, SourceType.DIRECT_IMAGE}:
-        signals["event_match"] = 1.0
+    if source.root_url:
+        signals["root_source_url"] = source.root_url
+    if source.parent_url:
+        signals["parent_source_url"] = source.parent_url
+    signals["source_discovery"] = source.discovered_via.value
+    if source.navigation_kind:
+        signals["navigation_kind"] = source.navigation_kind
+        signals["navigation_text"] = source.navigation_text
     return ImageCandidate(
         news_id=news.id or "",
         image_url=image_url,
@@ -21,6 +27,8 @@ def _candidate(news: NewsItem, image_url: str, source: SourceRef, context: Colle
         source_type=source.source_type,
         fetched_at=context.now,
         downloadable=True,
+        news_source_url=source.root_url or source.url,
+        parent_source_url=source.parent_url or source.url,
         review_reasons=list(source.review_reasons),
         signals=signals,
     )
@@ -44,16 +52,29 @@ def _upgrade_wix(url: str) -> str | None:
 def _upgrade_image_url(url: str) -> str | None:
     """Remove common CDN thumbnail transforms while preserving the original asset."""
 
-    upgraded = _upgrade_wix(url)
+    try:
+        upgraded = _upgrade_wix(url)
+    except ValueError:
+        return None
     if not upgraded:
         return None
     parts = urlsplit(upgraded)
     host = (parts.hostname or "").casefold()
+    if host == "pbs.twimg.com":
+        # Twitter profile images, cards and video previews use other paths.
+        # Only the public photo origin supports the name=orig convention.
+        if not _is_public_x_media(upgraded) or not parts.path.startswith("/media/"):
+            return upgraded
+        path = re.sub(r":(?:small|medium|large|orig|thumb)$", "", parts.path, flags=re.I)
+        query = [
+            (key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key.casefold() not in {"name", "width", "height"}
+        ]
+        query.append(("name", "orig"))
+        return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query), parts.fragment))
     path = re.sub(r"(?:[-_]\d{2,5}x\d{2,5})(?=\.[a-z0-9]{2,5}$)", "", parts.path, flags=re.I)
     query = parse_qsl(parts.query, keep_blank_values=True)
-    if host == "pbs.twimg.com":
-        query = [(key, "orig" if key.casefold() == "name" else value) for key, value in query if key.casefold() not in {"width", "height"}]
-    elif host in {"images.ctfassets.net", "i0.wp.com", "cdn.discordapp.com"}:
+    if host in {"images.ctfassets.net", "i0.wp.com", "cdn.discordapp.com"}:
         query = [(key, value) for key, value in query if key.casefold() not in {"w", "h", "width", "height", "resize", "fit", "crop", "q", "quality"}]
     elif "cloudinary.com" in host:
         path = re.sub(r"/(?:f_[^,/]+,?|q_[^,/]+,?|w_\d+,?|h_\d+,?|c_[^,/]+,?)+(?=/)", "", path, flags=re.I)
@@ -92,10 +113,20 @@ def _image_priority(url: str) -> int:
 
 
 def _is_public_x_media(url: str) -> bool:
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
     host = (parts.hostname or "").casefold()
     path = parts.path.casefold()
-    return host == "pbs.twimg.com" and (path.startswith("/media/") or path.startswith("/card_img/"))
+    return (
+        parts.scheme.casefold() == "https"
+        and parts.username is None and parts.password is None
+        and port in {None, 443} and host == "pbs.twimg.com"
+        and (path.startswith("/media/") or path.startswith("/card_img/"))
+        and not path.endswith("/")
+    )
 
 
 def _video_candidates(news_item: NewsItem, source_ref: SourceRef, urls: list[str], title: str = "") -> list:

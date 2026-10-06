@@ -42,6 +42,19 @@ class NetworkConfig(_ConfigModel):
     timeout_seconds: float = Field(gt=0)
     max_retries: int = Field(ge=0, le=10)
     user_agent: str = Field(min_length=1)
+    trust_env: bool = True
+    page_concurrency: int = Field(default=4, ge=1, le=64)
+    page_per_host: int = Field(default=2, ge=1, le=64)
+    image_concurrency: int = Field(default=8, ge=1, le=64)
+    image_per_host: int = Field(default=8, ge=1, le=64)
+    image_processing_threads: int = Field(default=2, ge=1, le=16)
+    socialdata_concurrency: int = Field(default=2, ge=1, le=16)
+
+
+CONCURRENCY_FIELDS = frozenset({
+    "page_concurrency", "page_per_host", "image_concurrency", "image_per_host",
+    "image_processing_threads", "socialdata_concurrency", "trust_env",
+})
 
 
 class SelectionConfig(_ConfigModel):
@@ -53,6 +66,7 @@ class SelectionConfig(_ConfigModel):
 
     @model_validator(mode="after")
     def type_limits_are_valid(self) -> "SelectionConfig":
+        self.type_limits.setdefault("decorative", 0)
         if any(not isinstance(value, int) or value < 0 for value in self.type_limits.values()):
             raise ValueError("selection.type_limits values must be non-negative integers")
         return self
@@ -82,6 +96,16 @@ class SearchConfig(_ConfigModel):
     max_candidates_per_source: int = Field(ge=20, le=2000)
 
 
+class VisualAnalysisConfig(_ConfigModel):
+    enabled: bool = False
+    mode: Literal["shadow"] = "shadow"
+    model_name: str = "ViT-B-32"
+    weights_path: str | None = None
+    device: str = "cpu"
+    batch_size: int = Field(default=8, ge=1, le=128)
+    cache_path: str = "cache/visual_analysis.json"
+
+
 DEFAULT_REJECTED_IMAGE_TYPES = {
     "cg": ["cover", "goods", "logo", "banner", "ui", "photo", "character_art", "announcement_art"],
     "announcement": ["logo", "banner", "ui", "photo", "goods", "cover"],
@@ -103,6 +127,7 @@ DEFAULT_TYPE_LIMITS = {
     "announcement_art": 3,
     "goods": 10,
     "background_art": 20,
+    "decorative": 0,
     "unknown": 0,
     "photo": 0,
     "logo": 0,
@@ -126,6 +151,13 @@ class ImageTypeConfig(_ConfigModel):
     )
 
 
+class BrowserConfig(_ConfigModel):
+    enabled: bool = True
+    timeout_seconds: float = Field(default=20.0, gt=0, le=60)
+    max_pages_per_news: int = Field(default=3, ge=0, le=3)
+    max_operations: int = Field(default=40, ge=0, le=40)
+
+
 class PrescanConfig(_ConfigModel):
     scoring: ScoringConfig
     filters: FilterConfig
@@ -133,7 +165,9 @@ class PrescanConfig(_ConfigModel):
     selection: SelectionConfig
     search: SearchConfig
     image_types: ImageTypeConfig = Field(default_factory=ImageTypeConfig)
+    visual_analysis: VisualAnalysisConfig = Field(default_factory=VisualAnalysisConfig)
     video: VideoConfig = Field(default_factory=VideoConfig)
+    browser: BrowserConfig = Field(default_factory=BrowserConfig)
 
 
 def _merge(base: dict, override: dict) -> dict:

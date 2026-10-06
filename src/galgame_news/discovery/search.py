@@ -3,11 +3,35 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterable
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from ..domain import DiscoveryMethod, NewsItem, SearchResult, SourceRef, SourceType
+
+
+def _search_queries(news_item: NewsItem) -> tuple[str, ...]:
+    base = " ".join(news_item.game_names or [news_item.title]).strip()
+    text = " ".join((news_item.title, news_item.body, *news_item.keywords))
+    if re.search(r"cg|ギャラリー|gallery|事件.?cg|画面公開|画像更新", text, re.I):
+        return tuple(dict.fromkeys((base, f"{base} CG gallery", f"{base} CG 画像")))
+    return (base,)
+
+
+def _merge_sources(*groups: Iterable[SourceRef], limit: int) -> list[SourceRef]:
+    merged: list[SourceRef] = []
+    seen: set[str] = set()
+    for group in groups:
+        for source in group:
+            parts = urlsplit(source.url)
+            key = f"{parts.scheme.casefold()}://{parts.netloc.casefold()}{parts.path}?{parts.query}"
+            if key not in seen:
+                seen.add(key)
+                merged.append(source)
+                if len(merged) >= limit:
+                    return merged
+    return merged
 
 
 def _to_sources(results: Iterable[Any], method: DiscoveryMethod) -> list[SourceRef]:
@@ -40,16 +64,24 @@ class DDGSSearchProvider:
         self.timeout = timeout
 
     def search(self, news_item: NewsItem) -> list[SourceRef]:
-        query = " ".join(news_item.game_names or [news_item.title])
         if self.search_fn is None:
             try:
                 from ddgs import DDGS
-                results = DDGS(timeout=self.timeout).text(query, max_results=self.max_results)
+                client = DDGS(timeout=self.timeout)
             except Exception:
                 return []
-        else:
-            results = self.search_fn(query, max_results=self.max_results)
-        return _to_sources(list(results)[: self.max_results], DiscoveryMethod.DDGS)
+        results: list[SourceRef] = []
+        for query in _search_queries(news_item):
+            try:
+                batch = (
+                    client.text(query, max_results=self.max_results)
+                    if self.search_fn is None
+                    else self.search_fn(query, max_results=self.max_results)
+                )
+                results.extend(_to_sources(list(batch)[: self.max_results], DiscoveryMethod.DDGS))
+            except Exception:
+                continue
+        return _merge_sources(results, limit=self.max_results * len(_search_queries(news_item)))
 
 
 class BraveSearchProvider:
@@ -61,23 +93,40 @@ class BraveSearchProvider:
     def search(self, news_item: NewsItem) -> list[SourceRef]:
         if not self.api_key and self.request_fn is None:
             return []
-        query = " ".join(news_item.game_names or [news_item.title])
-        if self.request_fn is not None:
-            payload = self.request_fn(query, api_key=self.api_key, count=self.max_results)
-        else:
-            import httpx
-            response = httpx.get("https://api.search.brave.com/res/v1/web/search", params={"q": query, "count": self.max_results}, headers={"X-Subscription-Token": self.api_key}, timeout=12)
-            response.raise_for_status()
-            payload = response.json()
-        results = payload.get("web", {}).get("results", []) if isinstance(payload, dict) else []
-        return _to_sources(results[: self.max_results], DiscoveryMethod.BRAVE)
+        batches: list[list[SourceRef]] = []
+        for query in _search_queries(news_item):
+            try:
+                if self.request_fn is not None:
+                    payload = self.request_fn(query, api_key=self.api_key, count=self.max_results)
+                else:
+                    import httpx
+                    response = httpx.get(
+                        "https://api.search.brave.com/res/v1/web/search",
+                        params={"q": query, "count": self.max_results},
+                        headers={"X-Subscription-Token": self.api_key},
+                        timeout=12,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                results = payload.get("web", {}).get("results", []) if isinstance(payload, dict) else []
+                batches.append(_to_sources(results[: self.max_results], DiscoveryMethod.BRAVE))
+            except Exception:
+                continue
+        return _merge_sources(*batches, limit=self.max_results * len(_search_queries(news_item)))
 
 
 class FallbackSearchProvider:
     def __init__(self, brave: BraveSearchProvider | None = None, ddgs: DDGSSearchProvider | None = None, *, max_results: int = 5, timeout: float = 5.0):
+        self.max_results = max_results
         self.brave = brave or BraveSearchProvider(max_results=max_results)
         self.ddgs = ddgs or DDGSSearchProvider(max_results=max_results, timeout=timeout)
 
     def search(self, news_item: NewsItem) -> list[SourceRef]:
-        results = self.brave.search(news_item)
-        return results or self.ddgs.search(news_item)
+        brave_results = self.brave.search(news_item)
+        queries = _search_queries(news_item)
+        if len(queries) > 1:
+            # CG-specific recall is important enough to query both existing
+            # providers, while other news keeps the original fallback cost.
+            ddgs_results = self.ddgs.search(news_item)
+            return _merge_sources(brave_results, ddgs_results, limit=self.max_results * 3)
+        return brave_results or self.ddgs.search(news_item)

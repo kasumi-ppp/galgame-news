@@ -80,7 +80,9 @@ class DesktopController(QObject):
         self.progress_page.stop_requested.connect(self.cancel_task)
         self.history_page.review_requested.connect(self.load_review)
         self.history_page.resume_requested.connect(self.resume_task)
-        self.review_page.retry_requested.connect(self.retry_news)
+        self.review_page.retry_requested.connect(self._retry_from_page)
+        self.retry_finished.connect(lambda *_: self.review_page.show_retry_result(True))
+        self.retry_failed.connect(self.review_page.show_retry_failure)
         self.settings_page.theme_changed.connect(self.apply_theme)
 
         self._thread: QThread | None = None
@@ -121,6 +123,7 @@ class DesktopController(QObject):
         output_dir: Path | str | None = None,
         offline: bool = False,
         no_videos: bool = False,
+        use_socialdata_x: bool = False,
         resume: bool = False,
         task_dir: Path | str | None = None,
         task_id: str | None = None,
@@ -142,6 +145,7 @@ class DesktopController(QObject):
                 output_dir=output_value,
                 offline=offline,
                 no_videos=no_videos,
+                use_socialdata_x=use_socialdata_x,
                 resume=resume,
                 task_dir=task_dir,
                 task_id=task_id or self.current_record.task_id,
@@ -157,6 +161,7 @@ class DesktopController(QObject):
         self._token = CancellationToken()
         try:
             runner = self.runner_factory()
+            self._configure_runner_browser(runner)
         except BaseException as exc:  # startup failures must not strand the UI in Running
             self._on_failed(exc)
             return False
@@ -199,6 +204,7 @@ class DesktopController(QObject):
             output_dir=output_dir,
             offline=bool(options.get("offline", False)),
             no_videos=bool(options.get("no_videos", False)),
+            use_socialdata_x=bool(options.get("use_socialdata_x", False)),
             config_path=options.get("config_path"),
             history_db=options.get("history_db"),
             max_images=options.get("max_images"),
@@ -373,6 +379,7 @@ class DesktopController(QObject):
                 {
                     "offline": request.offline,
                     "no_videos": request.no_videos,
+                    "use_socialdata_x": request.use_socialdata_x,
                     "config_path": str(request.config_path) if request.config_path else None,
                     "history_db": str(request.history_db) if request.history_db else None,
                     "max_images": request.max_images,
@@ -408,6 +415,7 @@ class DesktopController(QObject):
         ):
             return False
         runner = self.runner_factory()
+        self._configure_runner_browser(runner)
         retry = getattr(runner, "retry_news", None)
         if not callable(retry):
             return False
@@ -435,8 +443,38 @@ class DesktopController(QObject):
             self.retry_failed.emit(exc)
             return False
 
+    @Slot(str)
+    def _retry_from_page(self, news_id: str) -> bool:
+        """Give UI retries an outcome even when the public API returns early."""
+
+        failures = []
+
+        def note_failure(error):
+            failures.append(error)
+
+        self.retry_failed.connect(note_failure, Qt.ConnectionType.DirectConnection)
+        try:
+            success = self.retry_news(news_id)
+            if not success and not failures:
+                self.review_page.show_retry_result(False)
+            return success
+        except Exception as exc:
+            # Runner construction happens before retry_news's exception block.
+            # Route that UI failure through the existing diagnostic signal.
+            self.retry_failed.emit(exc)
+            return False
+        finally:
+            self.retry_failed.disconnect(note_failure)
+
     def apply_theme(self, theme: str) -> str:
         return apply_theme(theme)
+
+    def _configure_runner_browser(self, runner) -> None:
+        config = getattr(runner, "config", None)
+        if config is not None and hasattr(config, "browser"):
+            config = config.model_copy(deep=True)
+            config.browser.enabled = self.settings_store.load().browser_enabled
+            runner.config = config
 
     def persist_state(self) -> None:
         # SettingsPage saves the durable settings.  Refreshing history here is

@@ -21,7 +21,7 @@ class ValidationResult:
     mime_type: str | None = None
 
 
-MAGIC_MIME = {"jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+MAGIC_MIME = {"jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp", "avif": "image/avif"}
 
 _PLACEHOLDER_TERMS = (
     "now_printing", "now-printing", "no_image", "no-image", "noimage",
@@ -42,16 +42,11 @@ def placeholder_asset_reason(candidate: ImageCandidate) -> str | None:
 
 
 def meaningless_asset_reason(candidate: ImageCandidate) -> str | None:
+    """Reject non-image assets, not files whose semantic type may be useful."""
     path = urlsplit(candidate.image_url).path.casefold()
-    if path.endswith(".svg") or "profile_images" in path:
+    if path.endswith(".svg") or "profile_images" in path or "editorui/fonts" in path:
         return "invalid_material"
-    tokens = set(filter(None, re.split(r"[^a-z0-9]+", path)))
-    meaningless = {"logo", "favicon", "icon", "icons", "sprite", "button", "btn", "banner", "header", "footer", "thumbnail", "thumb", "capsule", "fonts", "editorui", "parastorage"}
-    return "meaningless_asset" if tokens & meaningless else None
-
-
-def _is_avif(data: bytes) -> bool:
-    return len(data) >= 16 and data[4:8] == b"ftyp" and (data[8:12] in {b"avif", b"avis"} or b"avif" in data[8:32])
+    return None
 
 
 class ImageValidator:
@@ -65,19 +60,16 @@ class ImageValidator:
         try:
             with Image.open(BytesIO(data)) as image:
                 actual = MAGIC_MIME.get((image.format or "").casefold())
+                if (image.format or "").casefold() == "avif":
+                    actual = "image/avif"
                 if not actual:
                     return ValidationResult(False, "invalid_magic")
-                if declared_mime and declared_mime.casefold().split(";", 1)[0].strip() != actual:
-                    return ValidationResult(False, "mime_mismatch")
                 image.verify()
             with Image.open(BytesIO(data)) as image:
                 width, height = image.size
+                image.load()
         except Exception:
-            if _is_avif(data) and (not declared_mime or declared_mime.casefold().split(";", 1)[0].strip() == "image/avif"):
-                return ValidationResult(True, mime_type="image/avif")
             return ValidationResult(False, "corrupt_image")
-        if width < self.min_width or height < self.min_height:
-            return ValidationResult(False, "image_too_small", width, height, actual)
-        if width * height < self.min_pixels:
-            return ValidationResult(False, "pixel_count_too_small", width, height, actual)
+        if width < 16 or height < 16:
+            return ValidationResult(False, "tracking_pixel", width, height, actual)
         return ValidationResult(True, width=width, height=height, mime_type=actual)

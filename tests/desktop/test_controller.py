@@ -78,6 +78,7 @@ def test_controller_persists_real_task_dir_and_resume_uses_it(qtbot, tmp_path: P
         input_path=input_path,
         issue_id="issue",
         output_dir=output_dir,
+        use_socialdata_x=True,
     ) is True
     running_record = controller.task_store.active_task
     assert running_record is not None
@@ -91,6 +92,7 @@ def test_controller_persists_real_task_dir_and_resume_uses_it(qtbot, tmp_path: P
     assert controller.resume_task(completed_record) is True
     qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
     assert requests[1].resume is True
+    assert requests[1].use_socialdata_x is True
     assert Path(requests[1].task_dir) == real_task
     assert Path(requests[1].output_dir) == output_dir
 
@@ -149,9 +151,9 @@ def test_controller_surfaces_runner_factory_failure_and_clears_running_state(
         assert controller.is_running is False
         assert controller.last_error is not None
         assert message in str(controller.last_error)
-        assert controller.progress_page.status_label.text() == "Failed"
+        assert controller.progress_page.status_label.text() == "执行失败"
         assert controller.progress_page.failed_label.text() == "1"
-        assert message in controller.progress_page.log.toPlainText()
+        assert message in controller.progress_page.technical_log.toPlainText()
         assert controller.new_task_page.start_button.isEnabled()
     finally:
         controller.close()
@@ -227,14 +229,14 @@ def test_controller_shows_failed_when_runner_returns_empty_news_failure(qtbot, t
             output_dir=tmp_path / "output",
         ) is True
         qtbot.waitUntil(
-            lambda: controller.progress_page.status_label.text() == "Failed"
+            lambda: controller.progress_page.status_label.text() == "执行失败"
             and not controller.is_running,
             timeout=2000,
         )
-        assert controller.progress_page.status_label.text() == "Failed"
+        assert controller.progress_page.status_label.text() == "执行失败"
         assert controller.progress_page.completed_label.text() == "0"
         assert controller.progress_page.total_label.text() == "0"
-        assert "No news items were recognized" in controller.progress_page.log.toPlainText()
+        assert "No news items were recognized" in controller.progress_page.technical_log.toPlainText()
     finally:
         controller.close()
         controller.task_store.close()

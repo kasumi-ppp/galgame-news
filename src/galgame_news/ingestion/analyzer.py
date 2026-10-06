@@ -43,7 +43,10 @@ def _parse_count(value: str) -> int:
 def _noun_count(sentence: str, noun: re.Match[str]) -> int | None:
     before = re.split(r"[，,；;。！？!?\n]", sentence[max(0, noun.start() - 32):noun.start()])[-1]
     after = re.split(r"[，,；;。！？!?\n]", sentence[noun.end():noun.end() + 32], maxsplit=1)[0]
-    preceding = re.search(rf"(?P<count>{COUNT_TOKEN_RE})\s*[{COUNTERS}](?:\s*(?:新|新規|新规))?\s*$", before)
+    preceding = re.search(
+        rf"(?P<count>{COUNT_TOKEN_RE})\s*[{COUNTERS}](?:\s*(?:新|新規|新规|特殊|场景|場景|事件|イベント))*\s*$",
+        before,
+    )
     if preceding:
         return _parse_count(preceding.group("count"))
     following = re.match(rf"\s*(?:更新|公开|公開|公布|新增|发布|發布)?(?:了)?\s*(?P<count>{COUNT_TOKEN_RE})\s*[{COUNTERS}]", after, re.I)
