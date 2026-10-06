@@ -1,0 +1,66 @@
+[scoring]
+relevance = 0.50
+freshness = 0.20
+source_trust = 0.20
+quality = 0.10
+duplicate_penalty = 0.0
+risk_penalty = 0.0
+
+[filters]
+min_width = 300
+min_height = 300
+min_pixels = 120000
+max_response_bytes = 5242880
+max_image_bytes = 12582912
+
+[network]
+timeout_seconds = 12.0
+max_retries = 3
+user_agent = "WeeklyGalgameImagePrescan/2.0"
+
+[selection]
+min_images = 5
+max_images = 20
+per_news_max = 20
+minimum_score = 0.0
+
+[selection.type_limits]
+game_cg = 20
+gameplay_screenshot = 10
+key_visual = 1
+cover = 1
+character_art = 4
+announcement_art = 3
+goods = 10
+background_art = 20
+unknown = 0
+photo = 0
+logo = 0
+banner = 0
+ui = 0
+
+[search]
+max_results = 5
+same_domain_depth = 1
+max_candidates_per_source = 500
+
+[image_types]
+banner_aspect_ratio = 3.0
+character_aspect_ratio = 1.8
+scene_aspect_ratio = 1.15
+minimum_gallery_group_size = 2
+minimum_type_confidence = 0.6
+unknown_requires_review = true
+fallback_penalty = 0.25
+auto_select_unknown = false
+max_unknown_per_news = 0
+rejected_image_types_by_requirement = { cg = ["cover", "goods", "logo", "banner", "ui", "photo", "character_art", "announcement_art"], announcement = ["logo", "banner", "ui", "photo", "goods", "cover"], goods = ["logo", "banner", "ui", "photo", "game_cg", "gameplay_screenshot", "key_visual", "character_art", "cover"], release = ["logo", "banner", "ui", "goods", "photo"], generic = ["logo", "banner", "ui"], unknown = ["logo", "banner", "ui"] }
+
+[video]
+enabled = true
+max_height = 1080
+max_duration_seconds = 600
+max_file_bytes = 1073741824
+max_per_news = 3
+preferred_container = "mp4"
+ffmpeg_location = ""

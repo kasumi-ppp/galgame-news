@@ -1,0 +1,175 @@
+"""New-task form with DOCX picker and drag/drop support."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtCore import Signal, Qt
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QScrollArea,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+from .ui import page_header, Starlight, icon
+
+
+class NewTaskPage(QWidget):
+    start_requested = Signal(object)
+    import_requested = Signal(str)
+
+    def __init__(self, default_output: Path | str | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("newTaskPage")
+        self.setAcceptDrops(True)
+        self.default_output = Path(default_output) if default_output else Path.cwd() / "output"
+
+        self.input_edit = QLineEdit()
+        self.input_edit.setPlaceholderText("将 DOCX 拖到这里，或点击选择文件")
+        self.input_edit.setObjectName("inputPathEdit")
+        browse = QPushButton("选择文件")
+        browse.setIcon(icon("file"))
+        browse.clicked.connect(self.choose_input)
+        input_row = QHBoxLayout()
+        input_row.addWidget(self.input_edit)
+        input_row.addWidget(browse)
+
+        self.issue_edit = QLineEdit()
+        self.issue_edit.setPlaceholderText("例如：226（选择文件后自动填写）")
+        self.issue_edit.setObjectName("issueEdit")
+        self.output_edit = QLineEdit(str(self.default_output))
+        output_browse = QPushButton("选择目录")
+        output_browse.clicked.connect(self.choose_output)
+        output_row = QHBoxLayout()
+        output_row.addWidget(self.output_edit)
+        output_row.addWidget(output_browse)
+
+        self.offline_checkbox = QCheckBox("离线模式：仅使用本地及已索引的来源")
+        self.no_videos_checkbox = QCheckBox("跳过视频，仅抓取图片")
+        self.socialdata_checkbox = QCheckBox("本次任务使用 SocialData 获取 X 媒体")
+        self.socialdata_checkbox.setToolTip("默认关闭；启用后按帖子查询，密钥从凭据库读取。")
+        self.socialdata_checkbox.setObjectName("useSocialDataXCheckbox")
+        self.start_button = QPushButton("开始抓取")
+        self.start_button.setProperty("primary", True)
+        self.start_button.setMinimumHeight(46)
+        self.start_button.setObjectName("startTaskButton")
+        self.start_button.clicked.connect(self.request_start)
+        self.import_button = QPushButton("导入历史结果")
+        self.import_button.clicked.connect(self.choose_import)
+        self.drop_hint = QLabel("拖入一份周报，开始整理本期配图")
+        self.drop_hint.setWordWrap(True)
+        self.drop_hint.setObjectName("muted")
+
+        drop_group = QGroupBox("周报文档")
+        drop_layout = QVBoxLayout(drop_group)
+        drop_layout.addWidget(Starlight())
+        drop_layout.addWidget(self.drop_hint)
+        drop_layout.addLayout(input_row)
+        destination = QGroupBox("任务信息")
+        form = QFormLayout(destination)
+        form.setVerticalSpacing(14)
+        form.addRow("本期期号", self.issue_edit)
+        form.addRow("输出目录", output_row)
+        options = QGroupBox("抓取选项")
+        options_layout = QVBoxLayout(options)
+        options_layout.addWidget(self.no_videos_checkbox)
+        options_layout.addWidget(self.offline_checkbox)
+        options_layout.addWidget(self.socialdata_checkbox)
+        notice = QLabel("X 图片保持最高优先级 · 原帖与原图链接保留在输出索引中")
+        notice.setObjectName("muted")
+        notice.setWordWrap(True)
+        options_layout.addWidget(notice)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 12, 8, 12)
+        layout.setSpacing(14)
+        layout.addWidget(page_header("新建任务", "导入周报，采集官网与 X 配图，再按新闻逐条审核。"))
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 4, 0)
+        content_layout.setSpacing(14)
+        content_layout.addWidget(drop_group)
+        content_layout.addWidget(destination)
+        content_layout.addWidget(options)
+        content_layout.addStretch()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+        actions = QHBoxLayout()
+        actions.addWidget(self.import_button)
+        actions.addStretch()
+        actions.addWidget(self.start_button)
+        layout.addLayout(actions)
+        layout.addStretch(1)
+
+    @staticmethod
+    def infer_issue(path: Path | str) -> str:
+        return Path(path).stem.strip() or "issue"
+
+    def set_input_path(self, path: Path | str) -> None:
+        selected = Path(path)
+        self.input_edit.setText(str(selected))
+        self.drop_hint.setText("已选择：" + selected.name)
+        if not self.issue_edit.text().strip():
+            self.issue_edit.setText(self.infer_issue(selected))
+
+    def set_busy(self, busy: bool) -> None:
+        self.start_button.setEnabled(not busy)
+        self.import_button.setEnabled(not busy)
+
+    def request_start(self) -> None:
+        payload = {
+            "input_path": Path(self.input_edit.text().strip()),
+            "issue_id": self.issue_edit.text().strip(),
+            "output_dir": Path(self.output_edit.text().strip() or self.default_output),
+            "offline": self.offline_checkbox.isChecked(),
+            "no_videos": self.no_videos_checkbox.isChecked(),
+            "use_socialdata_x": self.socialdata_checkbox.isChecked(),
+        }
+        if not payload["input_path"].name or not payload["issue_id"]:
+            self.drop_hint.setText("请选择 DOCX 文档并填写期号")
+            return
+        self.start_requested.emit(payload)
+
+    def request_import(self, path: Path | str) -> None:
+        self.import_requested.emit(str(path))
+
+    def choose_input(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择周报文档", "", "Word 文档 (*.docx)")
+        if path:
+            self.set_input_path(path)
+
+    def choose_output(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output_edit.text())
+        if path:
+            self.output_edit.setText(path)
+
+    def choose_import(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择历史结果目录", self.output_edit.text())
+        if path:
+            self.request_import(path)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if any(url.toLocalFile().casefold().endswith(".docx") for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt API
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.casefold().endswith(".docx"):
+                self.set_input_path(path)
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+
+__all__ = ["NewTaskPage"]
