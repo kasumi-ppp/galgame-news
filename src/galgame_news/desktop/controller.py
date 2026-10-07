@@ -124,6 +124,7 @@ class DesktopController(QObject):
         offline: bool = False,
         no_videos: bool = False,
         use_socialdata_x: bool = False,
+        selected_sections: list[str] | None = None,
         resume: bool = False,
         task_dir: Path | str | None = None,
         task_id: str | None = None,
@@ -146,6 +147,9 @@ class DesktopController(QObject):
                 offline=offline,
                 no_videos=no_videos,
                 use_socialdata_x=use_socialdata_x,
+                selected_sections=(
+                    ["x", "h", "z"] if selected_sections is None else selected_sections
+                ),
                 resume=resume,
                 task_dir=task_dir,
                 task_id=task_id or self.current_record.task_id,
@@ -153,6 +157,7 @@ class DesktopController(QObject):
         elif request.task_id:
             self.current_record = self.task_store.get_task(request.task_id)
         self.current_request = request
+        self._save_request_options(self.current_record, request)
         self.last_error = None
         self.last_result = None
         self.progress_page.reset()
@@ -205,6 +210,7 @@ class DesktopController(QObject):
             offline=bool(options.get("offline", False)),
             no_videos=bool(options.get("no_videos", False)),
             use_socialdata_x=bool(options.get("use_socialdata_x", False)),
+            selected_sections=options.get("selected_sections", ["x", "h", "z"]),
             config_path=options.get("config_path"),
             history_db=options.get("history_db"),
             max_images=options.get("max_images"),
@@ -373,23 +379,30 @@ class DesktopController(QObject):
             return
         self.current_record = updated
         if self.current_request is not None:
-            request = self.current_request
-            self.task_store.save_request_options(
-                updated,
-                {
-                    "offline": request.offline,
-                    "no_videos": request.no_videos,
-                    "use_socialdata_x": request.use_socialdata_x,
-                    "config_path": str(request.config_path) if request.config_path else None,
-                    "history_db": str(request.history_db) if request.history_db else None,
-                    "max_images": request.max_images,
-                    "llm_provider": request.llm_provider,
-                    "llm_model": request.llm_model,
-                },
-            )
+            self._save_request_options(updated, self.current_request)
         if self.review_record is not None and self.review_record.task_id == updated.task_id:
             self.review_record = updated
         self.history_page.refresh()
+
+    def _save_request_options(
+        self, record: TaskRecord | None, request: TaskRequest
+    ) -> None:
+        if record is None:
+            return
+        self.task_store.save_request_options(
+            record,
+            {
+                "offline": request.offline,
+                "no_videos": request.no_videos,
+                "use_socialdata_x": request.use_socialdata_x,
+                "selected_sections": list(request.selected_sections),
+                "config_path": str(request.config_path) if request.config_path else None,
+                "history_db": str(request.history_db) if request.history_db else None,
+                "max_images": request.max_images,
+                "llm_provider": request.llm_provider,
+                "llm_model": request.llm_model,
+            },
+        )
 
     def retry_news(self, news_id: object, official_url: str | None = None) -> bool:
         """Retry one news item into an isolated attempt and merge its data."""

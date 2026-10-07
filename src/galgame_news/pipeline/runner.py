@@ -18,7 +18,7 @@ from ..config import PrescanConfig, load_config
 from ..curation import ImageCurator, ImageDownloader
 from ..delivery.output import OutputManager
 from ..delivery.asset_paths import rebase_asset_paths
-from ..delivery.helpers import atomic_json_write
+from ..delivery.helpers import atomic_json_write, section_label, section_prefix
 from ..discovery.adapters import (
     DirectImageAdapter,
     DynamicPageAdapter,
@@ -59,6 +59,10 @@ from .download_state import DownloadJournal
 
 class _NoNewsItemsError(ValueError):
     """Raised when analysis produces no actionable news entries."""
+
+
+class _NoSelectedNewsItemsError(_NoNewsItemsError):
+    """The document has news, but none in the requested sections."""
 
 
 class PipelineRunner:
@@ -216,12 +220,14 @@ class PipelineRunner:
                     if checkpoint.result is None:
                         raise ValueError("completed checkpoint has no result")
                     self._emit(sink, failures, self._event("x_media_stats", task_id, issue.issue_id, payload=self._x_media_payload(candidates)))
+                    if not self._legacy_output and (raw_dir / "image_index.json").is_file():
+                        await self._network_runtime.call_sync(lambda: self._export_review_delivery(raw_dir, task_dir))
                     return TaskResult(
                         status="completed", task_id=task_id, task_dir=task_dir,
                         output_dir=raw_dir, checkpoint_path=checkpoint_path,
                         pipeline_result=checkpoint.result, resumed=True,
                     )
-                if checkpoint.status == "failed" and not repair_news:
+                if checkpoint.status == "failed" and not repair_news and not issue.news_items:
                     result = checkpoint.result or self._pipeline_result(issue, candidates, videos, failures)
                     return TaskResult(
                         status="failed", task_id=task_id, task_dir=task_dir,
@@ -303,9 +309,19 @@ class PipelineRunner:
                     raise _NoNewsItemsError(
                         "No news items were recognized; check the DOCX section and title formatting"
                     )
+                original_news_count = len(issue.news_items)
+                issue = issue.model_copy(update={"news_items": [
+                    item for item in issue.news_items
+                    if section_prefix(section_label(item)) in request.selected_sections
+                ]})
+                if not issue.news_items:
+                    raise _NoSelectedNewsItemsError("所选栏目没有可抓取的新闻，请重新选择抓取栏目")
                 await token.wait_if_paused_async()
                 self._emit(sink, failures, self._event(
                     "analyze_completed", task_id, issue.issue_id, message="news analyzed",
+                    payload={"selected_sections": list(request.selected_sections),
+                             "selected_news_count": len(issue.news_items),
+                             "document_news_count": original_news_count},
                 ))
                 await token.wait_if_paused_async()
                 self._write_checkpoint(
@@ -325,7 +341,8 @@ class PipelineRunner:
                     f"{phase}_failed", task_id, request.issue_id, message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"),
                 ))
                 failures.append(FailureRecord(
-                    stage=FailureStage.ANALYZE, code="no_news_items",
+                    stage=FailureStage.ANALYZE,
+                    code="no_selected_news_items" if isinstance(exc, _NoSelectedNewsItemsError) else "no_news_items",
                     message=(str(exc).strip() or f"执行失败（{type(exc).__name__}）"), retryable=False,
                 ))
                 result = self._pipeline_result(issue, candidates, videos, failures)
@@ -349,10 +366,25 @@ class PipelineRunner:
         self._download_journal = journal
         last_checkpoint = 0.0
 
-        def commit_checkpoint():
-            self._write_checkpoint(checkpoint_path, status="running", task_id=task_id, issue=issue,
+        async def commit_checkpoint():
+            await self._network_runtime.loop.run_in_executor(self._network_runtime.compat, lambda: self._write_checkpoint(checkpoint_path, status="running", task_id=task_id, issue=issue,
                 input_hash=input_hash, config_hash=config_hash, completed_news_ids=completed,
-                candidates=candidates, videos=videos, failures=failures, source_map=source_map)
+                candidates=candidates, videos=videos, failures=failures, source_map=source_map))
+
+        async def save_downloads(news_id, values):
+            # Persistence is serialized by this coordinator, including while
+            # paused; filesystem lock waits must not stall the network loop.
+            operation = self._network_runtime.loop.run_in_executor(
+                self._network_runtime.compat, journal.save, news_id, values,
+            )
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                await operation
+                raise
+            if journal.last_save_recovered:
+                self._emit(sink, failures, self._event("media_state_recovered", task_id, issue.issue_id,
+                    news_id=news_id, message="下载清单被占用，已保存恢复快照；图片下载继续"))
 
         def media_stats():
             self._emit(sink, failures, self._event("x_media_stats", task_id, issue.issue_id,
@@ -364,9 +396,9 @@ class PipelineRunner:
                 failures[:] = [value for value in failures if not (value.stage is FailureStage.DOWNLOAD and value.candidate_id == candidate.id)]
             elif failure is not None and failure not in failures:
                 failures.append(failure)
-            journal.save(candidate.news_id, candidates)
+            await save_downloads(candidate.news_id, candidates)
             if time.monotonic() - last_checkpoint >= 1.0 or token.is_paused or token.is_cancelled:
-                commit_checkpoint()
+                await commit_checkpoint()
                 last_checkpoint = time.monotonic()
             media_stats()
 
@@ -490,8 +522,8 @@ class PipelineRunner:
                                 ImageDownloader._apply_outcome(candidate, failure)
                                 failures.append(failure)
                 candidates = journal.merge(candidates, news_candidates)
-                journal.save(news.id, candidates)
-                commit_checkpoint()
+                await save_downloads(news.id, candidates)
+                await commit_checkpoint()
                 media_stats()
                 await token.wait_if_paused_async()
                 self._emit(sink, failures, self._event(
@@ -548,7 +580,7 @@ class PipelineRunner:
                     ))
 
                 completed.add(news.id)
-                journal.save(news.id, candidates)
+                await save_downloads(news.id, candidates)
                 media_stats()
                 self._write_checkpoint(
                     checkpoint_path, status="running", task_id=task_id, issue=issue,
@@ -593,7 +625,13 @@ class PipelineRunner:
             ))
             await token.wait_if_paused_async()
             try:
-                self._publish_output(result, raw_dir, task_dir)
+                publication = asyncio.create_task(self._network_runtime.call_sync(
+                    lambda: self._publish_output(result, raw_dir, task_dir)))
+                try:
+                    await asyncio.shield(publication)
+                except asyncio.CancelledError:
+                    await publication  # Finish the atomic swap before cleanup.
+                    raise
                 await token.wait_if_paused_async()
             except (CancellationRequested, asyncio.CancelledError):
                 raise
@@ -621,15 +659,8 @@ class PipelineRunner:
                 [*result.failures, *failures[failure_index:]]
             )
             await token.wait_if_paused_async()
-            failure_index = len(failures)
-            self._emit(sink, failures, self._event(
-                "task_completed", task_id, issue.issue_id, message="pipeline completed",
-            ))
-            result.failures = self._merge_failures(
-                [*result.failures, *failures[failure_index:]]
-            )
             for news in issue.news_items:
-                journal.save(news.id, result.all_candidates)
+                await save_downloads(news.id, result.all_candidates)
             published_ids = {value.id for value in result.all_candidates}
             if any(value.download_status == "downloaded" and value.id not in published_ids for value in candidates):
                 raise RuntimeError("已下载图片未进入发布索引，保留暂存文件")
@@ -647,6 +678,19 @@ class PipelineRunner:
                 source_map=source_map, result=result,
             )
             shutil.rmtree(task_dir / ".work", ignore_errors=True)
+            failure_index = len(failures)
+            self._emit(sink, failures, self._event(
+                "task_completed", task_id, issue.issue_id, message="pipeline completed",
+            ))
+            result.failures = self._merge_failures([*result.failures, *failures[failure_index:]])
+            if len(failures) > failure_index:
+                self._write_checkpoint(
+                    checkpoint_path, status="completed", task_id=task_id, issue=issue,
+                    input_hash=input_hash, config_hash=config_hash,
+                    completed_news_ids=completed, candidates=result.all_candidates,
+                    videos=result.videos, failures=result.failures,
+                    source_map=source_map, result=result,
+                )
             return TaskResult(
                 status="completed", task_id=task_id, task_dir=task_dir,
                 output_dir=raw_dir, checkpoint_path=checkpoint_path,
@@ -908,7 +952,14 @@ class PipelineRunner:
             raise
         if backup.exists():
             shutil.rmtree(backup, ignore_errors=True)
+        self._export_review_delivery(raw_dir, task_dir)
         return manifest
+
+    @staticmethod
+    def _export_review_delivery(raw_dir, task_dir):
+        from ..review.session import ReviewSession
+        return ReviewSession.from_output(raw_dir, task_root=task_dir,
+            state_path=task_dir / "review_state.json").export_final()
 
     @staticmethod
     def _rewrite_paths(result, old_root, new_root):

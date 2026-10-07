@@ -159,8 +159,16 @@ class TaskRequest:
     task_dir: Path | str | None = None
     checkpoint_path: Path | str | None = None
     task_id: str | None = None
+    selected_sections: list[Literal["x", "h", "z"]] = field(default_factory=lambda: ["x", "h", "z"])
 
     def __post_init__(self) -> None:
+        if not isinstance(self.selected_sections, (list, tuple, set, frozenset)):
+            raise ValueError("抓取栏目必须是新作、汉化、周报的选择列表")
+        if not self.selected_sections:
+            raise ValueError("请至少选择一个抓取栏目")
+        if any(value not in {"x", "h", "z"} for value in self.selected_sections):
+            raise ValueError("未知抓取栏目；仅支持新作、汉化、周报")
+        self.selected_sections = [value for value in ("x", "h", "z") if value in self.selected_sections]
         self.input_path = Path(self.input_path)
         self.output_dir = Path(self.output_dir)
         if self.config_path is not None:

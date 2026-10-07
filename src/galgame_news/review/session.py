@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import shutil
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -25,7 +26,7 @@ from ..domain import (
     candidate_id_for,
     video_candidate_id_for,
 )
-from ..delivery.helpers import atomic_json_write, item_names as canonical_item_names, safe_title
+from ..delivery.helpers import atomic_json_write, atomic_replace, item_names as canonical_item_names, safe_title
 from ..delivery.image_conversion import ImageConversionError, ImageConverter
 from ..delivery.asset_paths import recover_asset_path
 
@@ -727,15 +728,63 @@ class ReviewSession:
             return None
 
     def export_final(self) -> dict[str, Any]:
-        root = self.task_root
-        final_root = root / "final"
-        image_root = final_root / "images"
-        image_root.mkdir(parents=True, exist_ok=True)
+        final_root = self.task_root / "final"
+        final_root.mkdir(parents=True, exist_ok=True)
+        published = final_root / "images"
+        image_root = final_root / f".images-stage-{uuid.uuid4().hex}"
+        image_root.mkdir()
+        backup = final_root / f".images-backup-{uuid.uuid4().hex}"
+        if published.is_symlink():
+            image_root.rmdir()
+            raise ValueError("图片交付目录不能是符号链接")
+        previous = _read_json(final_root / "final_manifest.json", {})
+        previous_files = previous.get("files", []) if isinstance(previous, dict) else []
+        owned = {value for value in previous_files if isinstance(value, str)} if isinstance(previous_files, list) else set()
+        committed = False
+        # Preserve user-added files. Only the files named by the previous
+        # manifest are regenerated; repeated export never adds numbered copies.
+        if published.exists():
+            for source in published.rglob("*"):
+                if not source.is_file() or source.is_symlink() or not source.resolve().is_relative_to(published.resolve()):
+                    continue
+                relative = source.relative_to(published)
+                if (Path("images") / relative).as_posix() not in owned:
+                    target = image_root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+        try:
+            manifest = self._export_images_and_videos(image_root)
+            if published.exists():
+                atomic_replace(published, backup)
+            try:
+                atomic_replace(image_root, published)
+                self._atomic_json(final_root / "final_manifest.json", manifest)
+                committed = True
+            except Exception:
+                if backup.exists():
+                    if published.exists():
+                        atomic_replace(published, image_root)
+                    atomic_replace(backup, published)
+                elif published.exists():
+                    atomic_replace(published, image_root)
+                raise
+            return manifest
+        finally:
+            # If rollback itself failed, preserve both directories for recovery.
+            cleanup = (image_root, backup) if committed else (image_root,) if not backup.exists() else ()
+            for temporary in cleanup:
+                if temporary.exists() and not temporary.is_symlink() and temporary.resolve().is_relative_to(final_root.resolve()):
+                    shutil.rmtree(temporary, ignore_errors=True)
+
+    def _export_images_and_videos(self, image_root: Path) -> dict[str, Any]:
         folder_names = self._folder_names()
         files: list[str] = []
         image_ranks: dict[str, int] = {}
-        for candidate in self.images:
-            if self.decision(str(candidate.id)) is not ReviewDecision.ACCEPTED:
+        pending_ranks: dict[str, int] = {}
+        selected_count = pending_count = video_count = 0
+        for candidate in [*self.accepted_images(), *self.pending_images()]:
+            decision = self.decision(str(candidate.id))
+            if self._hard_filtered(candidate):
                 continue
             source = self._source_for(candidate)
             if source is None or not source.is_file():
@@ -745,13 +794,19 @@ class ReviewSession:
             if converted is None:
                 continue
             data, mime_type = converted
-            image_ranks[folder] = image_ranks.get(folder, 0) + 1
             extension = ".jpg" if mime_type == "image/jpeg" else ".png"
-            target = image_root / folder / f"{folder}.{image_ranks[folder]:02d}{extension}"
+            if decision is ReviewDecision.ACCEPTED:
+                image_ranks[folder] = image_ranks.get(folder, 0) + 1
+                target = image_root / folder / f"{folder}.{image_ranks[folder]:02d}{extension}"
+                selected_count += 1
+            else:
+                pending_ranks[folder] = pending_ranks.get(folder, 0) + 1
+                target = image_root / folder / "未候选" / f"{folder}.u{pending_ranks[folder]:02d}{extension}"
+                pending_count += 1
             target.parent.mkdir(parents=True, exist_ok=True)
             target = self._unique_target(target, source)
             target.write_bytes(data)
-            files.append(target.relative_to(final_root).as_posix())
+            files.append((Path("images") / target.relative_to(image_root)).as_posix())
 
         reserved: dict[str, set[str]] = {}
         for candidate in self.videos:
@@ -775,16 +830,17 @@ class ReviewSession:
             target = target_dir / name
             if target.resolve() != source.resolve():
                 shutil.copyfile(source, target)
-            files.append(target.relative_to(final_root).as_posix())
+            files.append((Path("images") / target.relative_to(image_root)).as_posix())
+            video_count += 1
 
         manifest = {
             "schema_version": 1,
             "issue_id": self._issue_id(),
             "files": files,
-            "image_count": sum(1 for value in files if not value.casefold().endswith((".mp4", ".webm", ".mov", ".mkv", ".avi"))),
-            "video_count": sum(1 for value in files if value.casefold().endswith((".mp4", ".webm", ".mov", ".mkv", ".avi"))),
+            "image_count": selected_count,
+            "pending_image_count": pending_count,
+            "video_count": video_count,
         }
-        self._atomic_json(final_root / "final_manifest.json", manifest)
         return manifest
 
     def _issue_id(self) -> str:

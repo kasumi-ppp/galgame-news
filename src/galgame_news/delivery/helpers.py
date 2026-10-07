@@ -6,8 +6,26 @@ import json
 import os
 import re
 import tempfile
+import time
 import unicodedata
 from pathlib import Path
+
+
+def is_windows_file_lock(error: OSError) -> bool:
+    return os.name == "nt" and getattr(error, "winerror", None) in {5, 32, 33}
+
+
+def atomic_replace(source: Path | str, destination: Path | str) -> None:
+    """Keep the old file intact while Windows readers release their handles."""
+    delays = (0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64)
+    for attempt in range(len(delays) + 1):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as error:
+            if not is_windows_file_lock(error) or attempt == len(delays):
+                raise
+            time.sleep(delays[attempt])
 
 
 def atomic_json_write(path: Path, payload, *, default=None, ensure_parent: bool = False) -> None:
@@ -24,7 +42,7 @@ def atomic_json_write(path: Path, payload, *, default=None, ensure_parent: bool 
                 kwargs["default"] = default
             json.dump(payload, handle, **kwargs)
             handle.write("\n")
-        os.replace(name, path)
+        atomic_replace(name, path)
     except Exception:
         try:
             os.unlink(name)

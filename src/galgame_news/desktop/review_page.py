@@ -54,7 +54,7 @@ class ReviewPage(QWidget):
         self.news_list.currentRowChanged.connect(lambda _: self.refresh())
         self.tabs = QTabWidget()
         self.tabs.setObjectName("reviewTabs")
-        for label in ("已选", "待复核", "已排除", "视频"):
+        for label in ("已选", "未候选／待复核", "已排除", "视频"):
             self.tabs.addTab(QWidget(), label)
         self.tabs.setCurrentIndex(1)
         self.tabs.setMaximumHeight(48)
@@ -113,10 +113,13 @@ class ReviewPage(QWidget):
         self.accept_button.setProperty("primary", True)
         self.reject_button = QPushButton("排除  R")
         self.pending_button = QPushButton("待复核  P")
-        self.export_button = QPushButton("导出已选媒体")
+        self.export_button = QPushButton("导出图片（含未候选）")
         self.export_button.setObjectName("primaryButton")
         self.export_button.setProperty("primary", True)
         self.export_button.setEnabled(False)
+        self.open_images_button = QPushButton("打开图片目录")
+        self.open_images_button.setEnabled(False)
+        self.open_images_button.clicked.connect(self.open_images_directory)
         self.export_status = QLabel()
         self.export_status.setObjectName("muted")
         self.export_status.setWordWrap(True)
@@ -201,6 +204,7 @@ class ReviewPage(QWidget):
         layout.addWidget(self.splitter, 1)
         export_row = QHBoxLayout()
         export_row.addWidget(self.export_status, 1)
+        export_row.addWidget(self.open_images_button)
         export_row.addWidget(self.export_button)
         layout.addLayout(export_row)
         self._shortcuts = []
@@ -221,6 +225,7 @@ class ReviewPage(QWidget):
         self.export_status.clear()
         self.operation_status.clear()
         self.export_button.setEnabled(session is not None and self.exporter.session is None)
+        self.open_images_button.setEnabled(session is not None)
         self.news_list.blockSignals(True)
         self.news_list.clear()
         self._news = {str(item["news_id"]): item for item in session.news_items} if session else {}
@@ -571,7 +576,7 @@ class ReviewPage(QWidget):
             return
         self._export_requested_count = len(self.session.accepted_images()) + len(self.session.accepted_videos())
         self.export_button.setEnabled(False)
-        self.export_status.setText("正在导出已选媒体…")
+        self.export_status.setText("正在导出已选媒体；未候选项目将保留为备选…")
         for button in (self.accept_button, self.reject_button, self.pending_button, self.retry_button):
             button.setEnabled(False)
 
@@ -582,8 +587,12 @@ class ReviewPage(QWidget):
         if manifest is not None:
             exported = int(manifest.get("image_count", 0)) + int(manifest.get("video_count", 0))
             skipped = max(0, self._export_requested_count - exported)
-            detail = f"；有 {skipped} 项未导出，请检查本地文件" if skipped else ""
-            self.export_status.setText(f"已导出 {manifest.get('image_count', 0)} 张图片、{manifest.get('video_count', 0)} 个视频{detail} · {session.task_root / 'final'}")
+            pending = int(manifest.get("pending_image_count", 0))
+            detail = f"；另有 {skipped} 项已选媒体未导出，请检查本地文件" if skipped else ""
+            self.export_status.setText(
+                f"已选 {manifest.get('image_count', 0)} 张图片、{manifest.get('video_count', 0)} 个视频；"
+                f"未候选备选 {pending} 张 · 图片目录：{session.task_root / 'final' / 'images'}{detail}"
+            )
             self.raw_details.setPlainText(json.dumps(manifest, ensure_ascii=False, indent=2))
         else:
             self.export_status.setText("导出失败，请展开技术详情查看原因")
@@ -596,6 +605,14 @@ class ReviewPage(QWidget):
     def _toggle_raw(self, checked: bool) -> None:
         self.raw_details.setVisible(checked)
         self.raw_toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
+
+    def open_images_directory(self) -> None:
+        if self.session is None:
+            return
+        root = self.session.task_root
+        candidates = (root / "final" / "images", self.session.output_dir / "images", root / "raw" / "images", root)
+        target = next((path for path in candidates if path.is_dir()), root)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt API
         if watched is self.media_list and event.type() in {QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress}:

@@ -56,6 +56,22 @@ class NewTaskPage(QWidget):
         self.socialdata_checkbox = QCheckBox("本次任务使用 SocialData 获取 X 媒体")
         self.socialdata_checkbox.setToolTip("默认关闭；启用后按帖子查询，密钥从凭据库读取。")
         self.socialdata_checkbox.setObjectName("useSocialDataXCheckbox")
+        self.section_checkboxes = {
+            "x": QCheckBox("新作"),
+            "h": QCheckBox("汉化"),
+            "z": QCheckBox("周报"),
+        }
+        self._busy = False
+        section_row = QHBoxLayout()
+        for checkbox in self.section_checkboxes.values():
+            checkbox.setChecked(True)
+            checkbox.stateChanged.connect(self._update_start_enabled)
+            section_row.addWidget(checkbox)
+        section_row.addStretch()
+        self.section_hint = QLabel("请至少选择一个抓取栏目")
+        self.section_hint.setObjectName("muted")
+        self.section_hint.setWordWrap(True)
+        self.section_hint.hide()
         self.start_button = QPushButton("开始抓取")
         self.start_button.setProperty("primary", True)
         self.start_button.setMinimumHeight(46)
@@ -79,6 +95,9 @@ class NewTaskPage(QWidget):
         form.addRow("输出目录", output_row)
         options = QGroupBox("抓取选项")
         options_layout = QVBoxLayout(options)
+        options_layout.addWidget(QLabel("抓取栏目"))
+        options_layout.addLayout(section_row)
+        options_layout.addWidget(self.section_hint)
         options_layout.addWidget(self.no_videos_checkbox)
         options_layout.addWidget(self.offline_checkbox)
         options_layout.addWidget(self.socialdata_checkbox)
@@ -121,10 +140,23 @@ class NewTaskPage(QWidget):
             self.issue_edit.setText(self.infer_issue(selected))
 
     def set_busy(self, busy: bool) -> None:
-        self.start_button.setEnabled(not busy)
+        self._busy = bool(busy)
+        self._update_start_enabled()
         self.import_button.setEnabled(not busy)
 
+    def _update_start_enabled(self, *_args) -> None:
+        has_sections = any(box.isChecked() for box in self.section_checkboxes.values())
+        self.section_hint.setVisible(not has_sections)
+        self.start_button.setEnabled(
+            not self._busy and has_sections
+        )
+
     def request_start(self) -> None:
+        selected_sections = [
+            key for key, checkbox in self.section_checkboxes.items() if checkbox.isChecked()
+        ]
+        if not selected_sections:
+            return
         payload = {
             "input_path": Path(self.input_edit.text().strip()),
             "issue_id": self.issue_edit.text().strip(),
@@ -132,6 +164,7 @@ class NewTaskPage(QWidget):
             "offline": self.offline_checkbox.isChecked(),
             "no_videos": self.no_videos_checkbox.isChecked(),
             "use_socialdata_x": self.socialdata_checkbox.isChecked(),
+            "selected_sections": selected_sections,
         }
         if not payload["input_path"].name or not payload["issue_id"]:
             self.drop_hint.setText("请选择 DOCX 文档并填写期号")

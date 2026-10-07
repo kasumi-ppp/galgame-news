@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import uuid
 from pathlib import Path
 
 from .contracts import Checkpoint
 from ..config import CONCURRENCY_FIELDS, BrowserConfig, DEFAULT_REJECTED_IMAGE_TYPES
+from ..delivery.helpers import atomic_json_write
 
 
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -35,6 +34,10 @@ def config_hash(config, request=None) -> str:
         }
         if request.use_socialdata_x:
             behavior["use_socialdata_x"] = True
+        sections = getattr(request, "selected_sections", ["x", "h", "z"])
+        normalized_sections = [value for value in ("x", "h", "z") if value in sections]
+        if normalized_sections != ["x", "h", "z"]:
+            behavior["selected_sections"] = normalized_sections
     semantic_config = config.model_dump(mode="json")
     # Added default-only fields must not strand historical download recovery.
     # Explicit browser changes and existing/custom type rules remain hashed.
@@ -124,12 +127,7 @@ def write_checkpoint(
     validate_checkpoint_associations(checkpoint)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
-    temporary.write_text(
-        json.dumps(checkpoint.model_dump(mode="json"), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    os.replace(temporary, destination)
+    atomic_json_write(destination, checkpoint.model_dump(mode="json"))
 
 
 def load_checkpoint(path: Path | str) -> Checkpoint:

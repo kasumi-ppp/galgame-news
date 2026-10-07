@@ -79,6 +79,7 @@ def test_controller_persists_real_task_dir_and_resume_uses_it(qtbot, tmp_path: P
         issue_id="issue",
         output_dir=output_dir,
         use_socialdata_x=True,
+        selected_sections=["x", "z"],
     ) is True
     running_record = controller.task_store.active_task
     assert running_record is not None
@@ -88,13 +89,64 @@ def test_controller_persists_real_task_dir_and_resume_uses_it(qtbot, tmp_path: P
     completed_record = controller.task_store.active_task
     assert completed_record is not None
     assert Path(completed_record.task_root) == real_task
+    assert controller.task_store.load_request_options(completed_record)["selected_sections"] == ["x", "z"]
 
     assert controller.resume_task(completed_record) is True
     qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
     assert requests[1].resume is True
     assert requests[1].use_socialdata_x is True
+    assert requests[1].selected_sections == ["x", "z"]
     assert Path(requests[1].task_dir) == real_task
     assert Path(requests[1].output_dir) == output_dir
+
+
+def test_controller_saves_request_options_before_starting_runner(qtbot, tmp_path: Path):
+    input_path = tmp_path / "issue.docx"
+    input_path.write_bytes(b"docx")
+    task_dir = tmp_path / "output" / "task"
+    requests: list[object] = []
+    controller = None
+
+    def factory():
+        record = controller.task_store.active_task
+        assert record is not None
+        options = controller.task_store.load_request_options(record)
+        assert options["selected_sections"] == ["h", "z"]
+        assert options["offline"] is True
+        return _ResultRunner([task_dir], requests)
+
+    controller = DesktopController(runner_factory=factory, app_data=tmp_path / "app")
+    qtbot.addWidget(controller.progress_page)
+
+    assert controller.start_task(
+        input_path=input_path,
+        issue_id="issue",
+        output_dir=tmp_path / "output",
+        offline=True,
+        selected_sections=["h", "z"],
+    ) is True
+    qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
+
+
+def test_controller_old_request_options_resume_with_all_sections(qtbot, tmp_path: Path):
+    input_path = tmp_path / "issue.docx"
+    input_path.write_bytes(b"docx")
+    output_dir = tmp_path / "output"
+    task_dir = output_dir / "legacy-task"
+    requests: list[object] = []
+    controller = DesktopController(
+        runner_factory=lambda: _ResultRunner([task_dir], requests),
+        app_data=tmp_path / "app",
+    )
+    qtbot.addWidget(controller.progress_page)
+    record = controller.task_store.create_task("issue", input_path, task_root=task_dir)
+    controller.task_store.save_request_options(record, {"offline": True})
+
+    assert controller.resume_task(record) is True
+    qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
+
+    assert requests[0].resume is True
+    assert requests[0].selected_sections == ["x", "h", "z"]
 
 
 def test_controller_allows_only_one_running_task(qtbot, tmp_path: Path):

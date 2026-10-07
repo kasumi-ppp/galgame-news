@@ -104,7 +104,14 @@ class HistoryPage(QWidget):
         if not record:
             return
         self.open_requested.emit(record)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.root_path)))
+        root = Path(record.root_path)
+        source = record.source_output_path
+        candidates = [root / "final" / "images"]
+        if source is not None:
+            candidates.append(source / "images")
+        candidates.extend((root / "raw" / "images", root))
+        target = next((path for path in candidates if path.is_dir()), root)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def remove_selected(self) -> bool:
         record = self.selected_record()
