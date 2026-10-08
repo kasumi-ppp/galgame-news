@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">周报图片采集工具箱</title>
+  <desc id="desc">淡紫色圆角底板上的图片卡片与确认标记</desc>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#f1edfb"/>
+  <rect x="26" y="24" width="76" height="66" rx="12" fill="#fff" stroke="#7d65b3" stroke-width="4"/>
+  <circle cx="79" cy="43" r="8" fill="#a8d4ed"/>
+  <path d="M32 80 51 55 68 75 80 61 96 80Z" fill="#b5a2d7"/>
+  <path d="M28 104H63" stroke="#7d65b3" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="93" cy="97" r="20" fill="#7d65b3"/>
+  <path d="m83 97 7 7 13-15" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
