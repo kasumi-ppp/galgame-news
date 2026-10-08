@@ -1,0 +1,154 @@
+"""Versioned checkpoint serialization and integrity helpers."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import uuid
+from pathlib import Path
+
+from .contracts import Checkpoint
+from ..config import CONCURRENCY_FIELDS
+
+
+CHECKPOINT_SCHEMA_VERSION = 1
+
+
+def sha256_path(path: Path | str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def config_hash(config, request=None) -> str:
+    behavior = {}
+    if request is not None:
+        behavior = {
+            "offline": request.offline,
+            "no_videos": request.no_videos,
+            "max_images": request.max_images,
+            "llm_provider": request.llm_provider,
+            "llm_model": request.llm_model,
+        }
+        if request.use_socialdata_x:
+            behavior["use_socialdata_x"] = True
+    semantic_config = config.model_dump(mode="json")
+    for field in CONCURRENCY_FIELDS:
+        semantic_config["network"].pop(field, None)
+    payload = {"config": semantic_config, "request": behavior}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _dedupe_videos(videos):
+    unique = {}
+    for video in videos or []:
+        unique.setdefault(video.id or video.video_url, video)
+    return list(unique.values())
+
+
+def _merge_failures(failures):
+    unique = {}
+    for failure in failures or []:
+        key = (
+            failure.stage.value,
+            failure.news_id,
+            failure.candidate_id,
+            failure.code,
+            failure.message,
+            failure.source_url,
+        )
+        if key not in unique:
+            unique[key] = failure
+        else:
+            current = unique[key]
+            occurrences = int(getattr(current, "occurrences", 1)) + int(
+                getattr(failure, "occurrences", 1)
+            )
+            unique[key] = current.model_copy(update={"occurrences": occurrences})
+    return list(unique.values())
+
+
+def write_checkpoint(
+    path: Path | str,
+    *,
+    status,
+    task_id,
+    issue,
+    input_hash,
+    config_hash_value,
+    completed_news_ids,
+    candidates,
+    videos,
+    failures,
+    source_map,
+    result=None,
+    schema_version: int = CHECKPOINT_SCHEMA_VERSION,
+    dedupe_videos=_dedupe_videos,
+    merge_failures=_merge_failures,
+) -> None:
+    checkpoint = Checkpoint(
+        schema_version=schema_version,
+        status=status,
+        task_id=task_id,
+        issue_id=issue.issue_id,
+        input_sha256=input_hash,
+        config_sha256=config_hash_value,
+        issue=issue,
+        completed_news_ids=sorted(completed_news_ids),
+        candidates=list(candidates),
+        videos=dedupe_videos(videos),
+        failures=merge_failures(failures),
+        source_map=source_map,
+        result=result,
+    )
+    validate_checkpoint_associations(checkpoint)
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    temporary.write_text(
+        json.dumps(checkpoint.model_dump(mode="json"), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, destination)
+
+
+def load_checkpoint(path: Path | str) -> Checkpoint:
+    return Checkpoint.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def validate_checkpoint(checkpoint, request, input_hash, config_hash_value, task_id, *, schema_version: int = CHECKPOINT_SCHEMA_VERSION) -> None:
+    if checkpoint.schema_version != schema_version:
+        raise ValueError("checkpoint schema mismatch")
+    if checkpoint.issue_id != request.issue_id or checkpoint.issue.issue_id != request.issue_id:
+        raise ValueError("checkpoint issue mismatch")
+    if checkpoint.task_id != task_id:
+        raise ValueError("checkpoint task mismatch")
+    if checkpoint.input_sha256 != input_hash:
+        raise ValueError("checkpoint input mismatch")
+    if checkpoint.config_sha256 != config_hash_value:
+        raise ValueError("checkpoint config mismatch")
+    validate_checkpoint_associations(checkpoint)
+    if checkpoint.status == "completed" and checkpoint.result is None:
+        raise ValueError("completed checkpoint has no result")
+
+
+def validate_checkpoint_associations(checkpoint) -> None:
+    ids = {item.id for item in checkpoint.issue.news_items}
+    if len(ids) != len(checkpoint.issue.news_items) or None in ids:
+        raise ValueError("checkpoint issue has invalid news ids")
+    if not set(checkpoint.completed_news_ids).issubset(ids):
+        raise ValueError("checkpoint completed news id is unknown")
+    if not set(checkpoint.source_map).issubset(ids):
+        raise ValueError("checkpoint source map news id is unknown")
+    for candidate in checkpoint.candidates:
+        if candidate.news_id not in ids:
+            raise ValueError("checkpoint candidate news id is unknown")
+    for video in checkpoint.videos:
+        if video.news_id not in ids:
+            raise ValueError("checkpoint video news id is unknown")
+    if checkpoint.result is not None and checkpoint.result.issue.issue_id != checkpoint.issue_id:
+        raise ValueError("checkpoint result issue mismatch")

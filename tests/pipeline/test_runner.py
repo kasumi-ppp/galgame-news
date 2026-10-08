@@ -379,7 +379,10 @@ def test_completed_resume_is_idempotent_and_preserves_published_files(tmp_path):
         lambda event: None,
         CancellationToken(),
     )
-    images = list((initial.output_dir / "images").rglob("*.jpg"))
+    images = [
+        *initial.output_dir.joinpath("images").rglob("*.jpg"),
+        *initial.output_dir.joinpath("images").rglob("*.png"),
+    ]
     assert images
     before = {path.relative_to(initial.output_dir): path.read_bytes() for path in images}
 
@@ -400,7 +403,14 @@ def test_completed_resume_is_idempotent_and_preserves_published_files(tmp_path):
     )
 
     assert resumed.status == "completed"
-    assert {path.relative_to(resumed.output_dir): path.read_bytes() for path in resumed.output_dir.rglob("*.jpg")} == before
+    resumed_images = [
+        *resumed.output_dir.joinpath("images").rglob("*.jpg"),
+        *resumed.output_dir.joinpath("images").rglob("*.png"),
+    ]
+    assert {path.relative_to(resumed.output_dir): path.read_bytes() for path in resumed_images} == before
+    initial_originals = {path.relative_to(initial.output_dir): path.read_bytes() for path in (initial.output_dir / "originals").rglob("*") if path.is_file()}
+    resumed_originals = {path.relative_to(resumed.output_dir): path.read_bytes() for path in (resumed.output_dir / "originals").rglob("*") if path.is_file()}
+    assert resumed_originals == initial_originals
 
 
 @pytest.mark.parametrize(

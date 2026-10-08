@@ -78,6 +78,8 @@ def test_controller_persists_real_task_dir_and_resume_uses_it(qtbot, tmp_path: P
         input_path=input_path,
         issue_id="issue",
         output_dir=output_dir,
+        use_socialdata_x=True,
+        selected_sections=["x", "z"],
     ) is True
     running_record = controller.task_store.active_task
     assert running_record is not None
@@ -87,12 +89,77 @@ def test_controller_persists_real_task_dir_and_resume_uses_it(qtbot, tmp_path: P
     completed_record = controller.task_store.active_task
     assert completed_record is not None
     assert Path(completed_record.task_root) == real_task
+    assert controller.task_store.load_request_options(completed_record)["selected_sections"] == ["x", "z"]
+    assert requests[0].images_only is False
 
     assert controller.resume_task(completed_record) is True
     qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
     assert requests[1].resume is True
+    assert requests[1].use_socialdata_x is True
+    assert requests[1].selected_sections == ["x", "z"]
     assert Path(requests[1].task_dir) == real_task
     assert Path(requests[1].output_dir) == output_dir
+
+
+def test_controller_saves_request_options_before_starting_runner(qtbot, tmp_path: Path):
+    input_path = tmp_path / "issue.docx"
+    input_path.write_bytes(b"docx")
+    task_dir = tmp_path / "output" / "task"
+    requests: list[object] = []
+    controller = None
+
+    def factory():
+        record = controller.task_store.active_task
+        assert record is not None
+        options = controller.task_store.load_request_options(record)
+        assert options["selected_sections"] == ["h", "z"]
+        assert options["offline"] is True
+        return _ResultRunner([task_dir], requests)
+
+    controller = DesktopController(runner_factory=factory, app_data=tmp_path / "app")
+    qtbot.addWidget(controller.progress_page)
+
+    assert controller.start_task(
+        input_path=input_path,
+        issue_id="issue",
+        output_dir=tmp_path / "output",
+        offline=True,
+        selected_sections=["h", "z"],
+    ) is True
+    qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
+
+
+def test_controller_old_request_options_resume_with_all_sections(qtbot, tmp_path: Path):
+    input_path = tmp_path / "issue.docx"
+    input_path.write_bytes(b"docx")
+    output_dir = tmp_path / "output"
+    task_dir = output_dir / "legacy-task"
+    requests: list[object] = []
+    controller = DesktopController(
+        runner_factory=lambda: _ResultRunner([task_dir], requests),
+        app_data=tmp_path / "app",
+    )
+    qtbot.addWidget(controller.progress_page)
+    record = controller.task_store.create_task("issue", input_path, task_root=task_dir)
+    controller.task_store.save_request_options(record, {"offline": True, "images_only": True})
+
+    assert controller.resume_task(record) is True
+    qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
+
+    assert requests[0].resume is True
+    assert requests[0].selected_sections == ["x", "h", "z"]
+    assert requests[0].images_only is False
+
+
+def test_task_request_legacy_images_only_flag_is_read_but_ignored(tmp_path: Path):
+    request = TaskRequest(
+        input_path=tmp_path / "issue.docx",
+        issue_id="issue",
+        output_dir=tmp_path / "output",
+        images_only=True,
+    )
+
+    assert request.images_only is False
 
 
 def test_controller_allows_only_one_running_task(qtbot, tmp_path: Path):
@@ -149,9 +216,9 @@ def test_controller_surfaces_runner_factory_failure_and_clears_running_state(
         assert controller.is_running is False
         assert controller.last_error is not None
         assert message in str(controller.last_error)
-        assert controller.progress_page.status_label.text() == "Failed"
+        assert controller.progress_page.status_label.text() == "执行失败"
         assert controller.progress_page.failed_label.text() == "1"
-        assert message in controller.progress_page.log.toPlainText()
+        assert message in controller.progress_page.technical_log.toPlainText()
         assert controller.new_task_page.start_button.isEnabled()
     finally:
         controller.close()
@@ -227,14 +294,14 @@ def test_controller_shows_failed_when_runner_returns_empty_news_failure(qtbot, t
             output_dir=tmp_path / "output",
         ) is True
         qtbot.waitUntil(
-            lambda: controller.progress_page.status_label.text() == "Failed"
+            lambda: controller.progress_page.status_label.text() == "执行失败"
             and not controller.is_running,
             timeout=2000,
         )
-        assert controller.progress_page.status_label.text() == "Failed"
+        assert controller.progress_page.status_label.text() == "执行失败"
         assert controller.progress_page.completed_label.text() == "0"
         assert controller.progress_page.total_label.text() == "0"
-        assert "No news items were recognized" in controller.progress_page.log.toPlainText()
+        assert "No news items were recognized" in controller.progress_page.technical_log.toPlainText()
     finally:
         controller.close()
         controller.task_store.close()

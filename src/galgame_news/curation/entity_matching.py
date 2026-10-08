@@ -13,6 +13,7 @@ import unicodedata
 from urllib.parse import unquote, urlsplit
 
 from ..domain import ImageCandidate, NewsItem, SourceType
+from .image_typing import _official_news_linked_gallery as _linked_gallery_evidence, _product_card_evidence
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,36 @@ def _domain(value: str) -> str:
     return (urlsplit(value).hostname or "").casefold().rstrip(".")
 
 
+def _source_key(value: str) -> tuple[str, str, str, str]:
+    parts = urlsplit(value.strip())
+    return (parts.scheme.casefold(), parts.netloc.casefold(), parts.path.rstrip("/"), parts.query)
+
+
+def _work_aliases(names: list[str]) -> list[str]:
+    """Include the parent work when a news item names a particular chapter."""
+    aliases = list(names)
+    for name in names:
+        chapter = r"(?:chapter|ch\.?)[\s:：-]*[0-9０-９]+\b"
+        parents = (
+            re.split(rf"\s*{chapter}", name, maxsplit=1, flags=re.I)[0],
+            re.sub(rf"^\s*{chapter}\s*", "", name, flags=re.I),
+        )
+        for parent in parents:
+            parent = parent.strip(" ＊*:-：")
+            if parent and parent != name and len(_compact(parent)) >= 4:
+                aliases.append(parent)
+    return list(dict.fromkeys(aliases))
+
+
+def _publisher_home(path: str) -> bool:
+    return path.casefold().rstrip("/") in {"", "/", "/index.html", "/index.htm", "/home", "/home.html"}
+
+
+def _official_news_linked_gallery(news: NewsItem, candidate: ImageCandidate) -> bool:
+    """Recognize a gallery reached from this news item's own official source."""
+    return _linked_gallery_evidence(news, candidate)
+
+
 def _app_ids(values: list[str]) -> set[str]:
     found: set[str] = set()
     for value in values:
@@ -47,14 +78,43 @@ def _app_ids(values: list[str]) -> set[str]:
     return found
 
 
+def _official_news_linked_goods(news: NewsItem, candidate: ImageCandidate) -> bool:
+    """Bind product-card evidence to an official navigation path from this news.
+
+    A publisher may sell goods for many works.  The page title by itself is
+    never enough: the candidate must come from a product card on a page reached
+    through this news item's explicitly linked official goods/shop/event route.
+    """
+    if candidate.source_type is not SourceType.OFFICIAL_SITE:
+        return False
+    root_url = candidate.signals.get("root_source_url") or candidate.news_source_url
+    if not isinstance(root_url, str) or not any(_source_key(root_url) == _source_key(url) for url in news.source_urls):
+        return False
+    goods_context = news.event_type.value == "goods" or bool(re.search(r"周边|周邊|商品|グッズ|通贩|通販|复刻|復刻|goods|merchandise", news.title + " " + news.body, re.I))
+    if not goods_context:
+        return False
+    if candidate.signals.get("navigation_kind") not in {"goods", "shop", "event"}:
+        # A product card on the news's explicitly supplied catalogue is also
+        # a direct association; it need not first navigate to its detail page.
+        def same_explicit_page(value):
+            a, b = urlsplit(value), urlsplit(candidate.source_url)
+            return ((a.hostname or "").removeprefix("www.") == (b.hostname or "").removeprefix("www.")
+                    and a.path.rstrip("/") == b.path.rstrip("/") and a.query == b.query)
+        if not any(same_explicit_page(url) for url in news.source_urls):
+            return False
+        if not re.search(r"/(?:item|goods|shop|store|catalog|product)(?:s)?(?:/|[._-])", urlsplit(candidate.source_url).path, re.I):
+            return False
+    return _product_card_evidence(candidate)
+
+
 class EntityMatcher:
     """Match a candidate to a news item's game using page-local evidence."""
 
     _TEXT_SIGNAL_KEYS = {
         "page_title", "title", "alt", "nearby_text", "caption", "description",
-        "game_slug", "entity", "game_name", "brand", "original_url",
+        "game_slug", "entity", "game_name", "brand", "original_url", "tweet_text",
     }
-    _NUMERIC_EVIDENCE = ("game_match", "organization_match", "page_match", "event_match", "character_match", "cg_match")
+    _NUMERIC_EVIDENCE = ("game_match", "organization_match", "page_match", "event_match", "character_match")
     _NON_GAME_MEDIA_MARKERS = (
         "tv guide", "where to watch", "/movies/", "/movie/", "/anime/",
         "streaming", "episode guide", "film review", "/folklore", "folklore",
@@ -129,12 +189,15 @@ class EntityMatcher:
         return stem
 
     def match(self, news: NewsItem, candidate: ImageCandidate) -> EntityMatchResult:
+        linked_official_gallery = _official_news_linked_gallery(news, candidate)
+        linked_official_work = _linked_gallery_evidence(news, candidate, require_gallery=False)
+        linked_official_goods = _official_news_linked_goods(news, candidate)
         aliases = [str(name) for name in news.game_names if str(name).strip()]
         # A title often contains the canonical game name even when an older
         # parser did not populate game_names.
         title_aliases = re.findall(r"《([^》]+)》|\[([^\]]+)\]", news.title)
         aliases.extend(next((part for part in pair if part), "") for pair in title_aliases)
-        aliases = list(dict.fromkeys(name for name in aliases if name))
+        aliases = _work_aliases(list(dict.fromkeys(name for name in aliases if name)))
 
         url_values = [candidate.image_url, candidate.source_url]
         text_values: list[str] = list(url_values)
@@ -143,6 +206,10 @@ class EntityMatcher:
             if key in self._TEXT_SIGNAL_KEYS:
                 text_values.append(str(value))
                 page_values.append(str(value))
+        for value in (candidate.news_source_url, candidate.parent_source_url, candidate.image_alt, candidate.nearby_text):
+            if value:
+                text_values.append(value)
+                page_values.append(value)
         evidence = " ".join(unquote(value) for value in text_values)
         compact_evidence = _compact(evidence)
         page_text = _compact(" ".join(page_values))
@@ -171,8 +238,15 @@ class EntityMatcher:
         if news_ids and candidate_ids and not news_ids.isdisjoint(candidate_ids):
             return EntityMatchResult(True, 0.98, supporting_signals=("steam_app_id_match",), official_domain_match=official_domain_match)
 
+        if candidate.source_type is SourceType.DIRECT_IMAGE and any(
+            _source_key(candidate.source_url) == _source_key(url) for url in news.source_urls
+        ):
+            return EntityMatchResult(True, 0.9, supporting_signals=("image_linked_from_news_source",), official_domain_match=official_domain_match)
+
         conflicts: list[str] = []
-        for key in ("entity_conflict", "conflicting_entity", "other_game_name", "other_title"):
+        # entity_conflict is a derived result written by ImageCurator; feeding
+        # it back into a later curation pass makes old false positives sticky.
+        for key in ("conflicting_entity", "other_game_name", "other_title"):
             value = candidate.signals.get(key)
             if value not in (None, False, "", 0):
                 conflicts.append(str(value) if value is not True else key)
@@ -192,17 +266,48 @@ class EntityMatcher:
         # A third-party page title that clearly names another work is a
         # contradiction, not merely missing evidence.  Generic words such as
         # "CG" or "image" are deliberately ignored.
-        if page_values:
-            page_title = page_values[0]
+        page_title = str(candidate.signals.get("page_title") or candidate.signals.get("title") or "")
+        title_has_work = any(_compact(alias) in _compact(page_title) for alias in aliases if _compact(alias))
+        product_path = bool(re.search(r"/(?:products?|games?|titles?|works?)/", urlsplit(candidate.source_url).path, re.I))
+        page_is_publisher_home = _publisher_home(urlsplit(candidate.source_url).path)
+        brand_boilerplate = bool(re.search(r"official\s*web\s*site|公式サイト", page_title, re.I))
+        # A publisher's homepage title names the brand, not a competing game.
+        # A distinct titled work page can contradict the news work; image alt
+        # text and navigation labels are not page titles.
+        title_can_conflict = (
+            candidate.source_type is not SourceType.OFFICIAL_SITE
+            or product_path
+            or (not page_is_publisher_home and not brand_boilerplate)
+        )
+        if page_title and not (linked_official_gallery or linked_official_work or linked_official_goods) and not title_has_work and title_can_conflict:
             title_tokens = re.findall(r"[A-Z][A-Za-z0-9]{2,}|\d[\w-]{2,}|[\u3040-\u30ff\u4e00-\u9fff]{2,}", page_title)
-            if title_tokens and not any(_compact(alias) in page_text for alias in aliases):
-                generic = {"CG", "GAME", "IMAGE", "SCREENSHOT", "OFFICIAL", "GALLERY", "公式", "公式サイト", "官方网站", "画像", "画像一覧", "画像公開", "ギャラリー", "ゲーム", "作品", "トップ", "ニュース", "新着"}
+            if title_tokens:
+                generic = {"CG", "GAME", "IMAGE", "SCREENSHOT", "OFFICIAL", "GALLERY", "GRAPHIC", "WEB", "SITE", "CHAPTER", "公式", "公式サイト", "官方网站", "画像", "画像一覧", "画像公開", "ギャラリー", "ゲーム", "作品", "トップ", "ニュース", "新着"}
                 other = [token for token in title_tokens if token.casefold() not in {word.casefold() for word in generic}]
+                if candidate.source_type is SourceType.OFFICIAL_SITE:
+                    publisher = {_compact(name) for name in news.organizations}
+                    other = [token for token in other if _compact(token) not in publisher]
                 if other:
                     conflicts.extend(other)
         if conflicts:
             return EntityMatchResult(False, 1.0, conflicting_entities=tuple(dict.fromkeys(conflicts)), supporting_signals=tuple(dict.fromkeys(supporting)), official_domain_match=official_domain_match)
 
+        if linked_official_goods:
+            return EntityMatchResult(
+                True,
+                0.88,
+                supporting_signals=("official_news_linked_goods", "product_card_evidence", "official_source_chain"),
+                official_domain_match=official_domain_match,
+            )
+
+        root_path = urlsplit(str(candidate.signals.get("root_source_url") or "")).path
+        if linked_official_gallery and (title_has_work or not _publisher_home(root_path)):
+            return EntityMatchResult(
+                True,
+                0.92,
+                supporting_signals=("official_news_linked_gallery", "official_domain_match"),
+                official_domain_match=official_domain_match,
+            )
         matched: list[str] = []
         for alias in aliases:
             normalized = _compact(alias)
@@ -226,19 +331,18 @@ class EntityMatcher:
 
         if any(key in supporting for key in ("game_match", "organization_match", "page_match", "event_match")):
             return EntityMatchResult(True, 0.9, supporting_signals=tuple(dict.fromkeys([*supporting, "explicit_entity_signal"])), official_domain_match=official_domain_match)
-        if candidate.source_type is SourceType.OFFICIAL_SITE and supporting and set(supporting).issubset({"cg_match"}):
-            return EntityMatchResult(True, 0.86, supporting_signals=tuple(dict.fromkeys([*supporting, "official_cg_signal"])), official_domain_match=official_domain_match)
-
-        if official_domain_match and candidate.source_type in {SourceType.OFFICIAL_SITE, SourceType.OFFICIAL_X, SourceType.STEAM}:
-            return EntityMatchResult(True, 0.9, supporting_signals=tuple(dict.fromkeys([*supporting, "official_source"])), official_domain_match=True)
-        # Legacy resolver results may identify an official game page without
-        # copying the original document URL into NewsItem.  Keep that source
-        # usable, but expose the weak evidence so callers can lower priority.
+        if linked_official_work and not _publisher_home(root_path):
+            return EntityMatchResult(
+                True, 0.9, supporting_signals=("official_news_linked_work", "official_domain_match"),
+                official_domain_match=official_domain_match,
+            )
+        # A shared official domain is provenance only. It cannot establish
+        # that this particular image belongs to the news item's game.
         if candidate.source_type is SourceType.OFFICIAL_SITE and candidate_domain and not supporting:
             compact_aliases = [_compact(alias) for alias in aliases]
             if any(((alias.isascii() and len(alias) <= 3) or (not alias.isascii() and len(alias) <= 2)) and alias in compact_evidence for alias in compact_aliases):
                 return EntityMatchResult(None, 0.0, supporting_signals=("short_name_needs_context",), official_domain_match=official_domain_match)
-            return EntityMatchResult(True, 0.68, supporting_signals=("official_source_without_name",), official_domain_match=False)
+            return EntityMatchResult(None, 0.0, supporting_signals=("official_source_without_name",), official_domain_match=official_domain_match)
         # VNDB screenshots are retained as a trusted-database fallback for
         # legacy issues; they remain lower-trust and are still subject to the
         # image-type gate and review metadata.

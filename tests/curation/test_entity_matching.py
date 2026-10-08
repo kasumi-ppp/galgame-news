@@ -28,6 +28,9 @@ def make_candidate(url, *, source_url=None, source_type=SourceType.UNVERIFIED, s
         source_url=source_url or url,
         source_type=source_type,
         fetched_at=NOW,
+        width=1280,
+        height=720,
+        downloadable=True,
         signals=signals or {},
     )
 
@@ -83,7 +86,7 @@ def test_short_name_requires_context():
     assert EntityMatcher().match(news, official_without_context).matched is None
 
 
-def test_same_official_domain_is_high_confidence():
+def test_same_official_domain_is_provenance_not_game_identity():
     news = make_news(source_urls=["https://publisher.example/mono/news/cg"])
     candidate = make_candidate(
         "https://publisher.example/mono/gallery/cg01.jpg",
@@ -91,9 +94,32 @@ def test_same_official_domain_is_high_confidence():
         source_type=SourceType.OFFICIAL_SITE,
     )
     result = EntityMatcher().match(news, candidate)
-    assert result.matched is True
+    assert result.matched is None
     assert result.official_domain_match is True
-    assert result.confidence >= 0.9
+    assert result.confidence == 0.0
+
+
+def test_official_news_linked_game_gallery_survives_parent_brand_title_conflict():
+    root = "https://hook-net.jp/smee/one/"
+    news = make_news(game_names=["One Night After"], source_urls=[root])
+    news.title = "《One Night After》CG更新"
+    candidate = make_candidate(
+        "http://www.hook-net.jp/smee/one/_assets/images/gallery/full/gallery_n_009.png",
+        source_url="http://www.hook-net.jp/smee/one/gallery/",
+        source_type=SourceType.OFFICIAL_SITE,
+        signals={
+            "root_source_url": root,
+            "gallery_path": True,
+            "page_title": "GALLERY | SMEE 15th Project | ワンナイトアフター - SMEE",
+            "entity_conflict": "SMEE,15th,Project,ワンナイトアフター",
+        },
+    )
+    candidate.news_id = news.id
+
+    result = EntityMatcher().match(news, candidate)
+
+    assert result.matched is True
+    assert "official_news_linked_gallery" in result.supporting_signals
 
 
 def test_steam_app_id_mismatch_is_a_conflict():
@@ -202,11 +228,48 @@ def test_brand_page_without_specific_game_evidence_requires_review():
     assert "uncertain_match" in {reason.value for reason in candidate.review_reasons}
 
 
+def test_publisher_homepage_brand_title_is_unknown_not_a_different_game():
+    news = make_news(game_names=["花鐘カナデ＊グラム Chapter:4 綾世奏"], source_urls=["https://nanawind.jp/"])
+    candidate = make_candidate(
+        "https://nanawind.jp/assets/brand.jpg",
+        source_url="https://nanawind.jp/",
+        source_type=SourceType.OFFICIAL_SITE,
+        signals={"page_title": "ナナウィンド[NanaWind] Official Web Site", "alt": "誕生日"},
+    )
+    result = EntityMatcher().match(news, candidate)
+    assert result.matched is None
+    assert result.conflicting_entities == ()
+
+
+def test_chapter_news_matches_parent_work_on_official_graphic_page():
+    news = make_news(game_names=["花鐘カナデ＊グラム Chapter:4 綾世奏"], source_urls=["https://nanawind.jp/"])
+    candidate = make_candidate(
+        "https://nanawind.jp/product/prj06/chapter4/images/cg01.jpg",
+        source_url="https://nanawind.jp/product/prj06/chapter4/",
+        source_type=SourceType.OFFICIAL_SITE,
+        signals={"page_title": "Chapter:4 -綾世奏- | 花鐘カナデ＊グラム", "root_source_url": "https://nanawind.jp/", "gallery_path": True},
+    )
+    result = EntityMatcher().match(news, candidate)
+    assert result.matched is True
+    assert result.confidence >= 0.8
+
+
+def test_official_different_product_page_remains_a_conflict():
+    news = make_news(game_names=["花鐘カナデ＊グラム"], source_urls=["https://nanawind.jp/"])
+    candidate = make_candidate(
+        "https://nanawind.jp/product/other/images/cg01.jpg",
+        source_url="https://nanawind.jp/product/other/",
+        source_type=SourceType.OFFICIAL_SITE,
+        signals={"page_title": "OTHER GAME | NanaWind", "root_source_url": "https://nanawind.jp/", "gallery_path": True},
+    )
+    assert EntityMatcher().match(news, candidate).matched is False
+
+
 def test_conflicting_game_name_is_rejected():
     news = make_news()
     candidate = make_candidate(
         "https://news.example/images/other-cg01.jpg",
-        signals={"page_title": "PHANTOM - unrelated game", "entity_conflict": "PHANTOM"},
+        signals={"page_title": "PHANTOM - unrelated game"},
     )
     result = EntityMatcher().match(news, candidate)
     assert result.matched is False
@@ -230,8 +293,9 @@ def test_entity_exception_can_be_isolated_by_curator(monkeypatch):
 
     item = make_news()
     item.image_need = ImageNeed.EXPLICIT_NEW_IMAGE
-    bad = make_candidate("https://publisher.example/bad-cg.jpg", source_type=SourceType.OFFICIAL_SITE, signals={"cg_match": 1.0})
-    good = make_candidate("https://publisher.example/good-cg.jpg", source_type=SourceType.OFFICIAL_SITE, signals={"cg_match": 1.0})
+    source_proof = {"page_title": "MONOCHROME SERENADE CG", "root_source_url": item.source_urls[0]}
+    bad = make_candidate("https://publisher.example/bad-cg.jpg", source_type=SourceType.OFFICIAL_SITE, signals=source_proof)
+    good = make_candidate("https://publisher.example/good-cg.jpg", source_type=SourceType.OFFICIAL_SITE, signals=source_proof)
     bad.news_id = good.news_id = item.id
     original = entity_matching.EntityMatcher.match
 

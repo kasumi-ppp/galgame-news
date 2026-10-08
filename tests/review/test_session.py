@@ -3,17 +3,36 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from galgame_news.domain import ImageCandidate, ImageType, SourceType
 from galgame_news.review.session import ReviewDecision, ReviewSession
 
 
+def _jpeg_bytes(color=(80, 120, 160)):
+    stream = BytesIO()
+    Image.new("RGB", (40, 30), color).save(stream, format="JPEG")
+    return stream.getvalue()
+
+
+def test_new_evidence_and_media_state_survive_defensive_loading(tmp_path):
+    data = _candidate(tmp_path,"evidence")
+    evidence = {"page_url":data["source_url"],"container":"section#gallery","item_id":"1","role":"background_art","text":"背景CG","method":"dom","relationship":"srcset","variant_of":None}
+    data.update(evidence=[evidence, {"page_url":None}], download_status="downloaded", downloaded_url=data["image_url"], media_source_url=data["image_url"], expected_width=1280, expected_height=720)
+    candidate, _ = ReviewSession._coerce_image(data)
+    assert candidate is not None
+    assert [e.model_dump() for e in candidate.evidence] == [evidence]
+    assert candidate.download_status == "downloaded"
+    assert candidate.media_source_url == data["image_url"]
+
+
 def _candidate(tmp_path, name, *, selected=False, image_type=ImageType.GAME_CG, relevance=0.5, review=False):
     source = tmp_path / f"{name}.jpg"
-    source.write_bytes(name.encode())
+    source.write_bytes(_jpeg_bytes())
     payload = {
         "id": name,
         "news_id": "n1",
@@ -60,7 +79,7 @@ def _write_output(tmp_path, candidates, *, review_required=None):
     return output
 
 
-def test_session_initializes_decisions_and_sorts_failed_candidates_by_relevance(tmp_path):
+def test_session_initializes_decisions_and_keeps_semantic_images_reviewable(tmp_path):
     accepted = _candidate(tmp_path, "accepted", selected=True, relevance=0.2)
     low = _candidate(tmp_path, "low", relevance=0.4, review=True)
     high = _candidate(tmp_path, "high", relevance=0.9, review=True)
@@ -71,8 +90,8 @@ def test_session_initializes_decisions_and_sorts_failed_candidates_by_relevance(
 
     assert session.decision("accepted") is ReviewDecision.ACCEPTED
     assert session.decision("high") is ReviewDecision.PENDING
-    assert session.decision("logo") is ReviewDecision.REJECTED
-    assert [item.id for item in session.pending_images("n1")] == ["high", "low"]
+    assert session.decision("logo") is ReviewDecision.PENDING
+    assert [item.id for item in session.pending_images("n1")] == ["logo", "high", "low"]
 
 
 def test_review_state_is_atomic_and_survives_reopen(tmp_path):
@@ -97,9 +116,10 @@ def test_export_final_uses_x_prefix_and_does_not_modify_raw(tmp_path):
 
     manifest = session.export_final()
 
-    target = task_root / "final" / "images" / "x1" / "x1.01.jpg"
-    assert target.read_bytes() == b"accepted"
-    assert manifest["files"] == ["images/x1/x1.01.jpg"]
+    target = task_root / "final" / "images" / "x1" / "x1.01.png"
+    with Image.open(target) as image:
+        assert image.format == "PNG"
+    assert manifest["files"] == ["images/x1/x1.01.png"]
     assert json.loads((output / "image_index.json").read_text(encoding="utf-8")) == raw_before
 
 
@@ -117,7 +137,7 @@ def test_export_final_reuses_category_aliases_and_manifest_appearance_order(tmp_
     for item in items:
         name = f"{item['news_id']}-image"
         source = output / f"{name}.jpg"
-        source.write_bytes(name.encode("utf-8"))
+        source.write_bytes(_jpeg_bytes())
         payload = _candidate(tmp_path, name, selected=True)
         payload["news_id"] = item["news_id"]
         payload["local_path"] = str(source)
@@ -137,11 +157,11 @@ def test_export_final_reuses_category_aliases_and_manifest_appearance_order(tmp_
     manifest = session.export_final()
 
     assert set(manifest["files"]) == {
-        "images/h1/h1.01.jpg",
-        "images/x1/x1.01.jpg",
-        "images/h2/h2.01.jpg",
-        "images/z1/z1.01.jpg",
-        "images/z2/z2.01.jpg",
+        "images/h1/h1.01.png",
+        "images/x1/x1.01.png",
+        "images/h2/h2.01.png",
+        "images/z1/z1.01.png",
+        "images/z2/z2.01.png",
     }
 
 
@@ -244,6 +264,29 @@ def test_old_json_is_loaded_defensively_and_deduplicated_by_stable_id(tmp_path):
     assert [item.id for item in session.images] == ["legacy-id"]
     assert session.videos == []
     assert session.decision("legacy-id") is ReviewDecision.PENDING
+
+
+def test_legacy_same_url_across_news_gets_independent_review_identity(tmp_path):
+    first = _candidate(tmp_path, "first", review=True)
+    second = _candidate(tmp_path, "second", review=True)
+    for item in (first, second):
+        item["id"] = "legacy-url-only-id"
+        item["image_url"] = "https://cdn.example/shared.jpg"
+    second["news_id"] = "n2"
+    output = _write_output(tmp_path, [first, second], review_required=[first, second])
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"decisions": {"legacy-url-only-id": "accepted"}}), encoding="utf-8")
+
+    session = ReviewSession.from_output(output, state_path=state_path)
+
+    assert len(session.images) == 2
+    first_id, second_id = [str(value.id) for value in session.images]
+    assert first_id != second_id
+    # The old URL-only decision was ambiguous, so it is not applied to either item.
+    assert session.decision(first_id) is ReviewDecision.PENDING
+    assert session.decision(second_id) is ReviewDecision.PENDING
+    session.set_decision(first_id, ReviewDecision.ACCEPTED)
+    assert session.decision(second_id) is ReviewDecision.PENDING
 
 
 def test_retry_merge_adds_new_candidates_without_overwriting_raw_or_duplicates(tmp_path):

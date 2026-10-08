@@ -6,7 +6,7 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from galgame_news.domain import EventType, ImageNeed, NewsDraft
-from galgame_news.ingestion.analyzer import OpenAINewsAnalyzer, RuleBasedNewsAnalyzer
+from galgame_news.ingestion.analyzer import OpenAINewsAnalyzer, RuleBasedNewsAnalyzer, detect_image_need
 from galgame_news.ingestion.docx_parser import DocxDocumentParser
 
 
@@ -141,6 +141,10 @@ def test_rule_analyzer_does_not_treat_future_feature_cg_as_new_image():
 
     assert item.event_type is EventType.RELEASE
     assert item.image_need is ImageNeed.UNKNOWN
+
+
+def test_special_scene_cg_publication_is_an_explicit_image_need():
+    assert detect_image_need("官方公布了一张特殊场景CG，现已在官网开放查看。") == (ImageNeed.EXPLICIT_NEW_IMAGE, 1)
 
 
 def test_optional_llm_without_configuration_returns_rule_result_without_network():

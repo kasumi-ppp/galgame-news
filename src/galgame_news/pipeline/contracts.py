@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +73,12 @@ class CancellationToken:
                 self._pause_condition.wait()
         self.raise_if_cancelled()
 
+    async def wait_if_paused_async(self) -> None:
+        """Yield the loop while the existing thread-safe flag is paused."""
+        while self.is_paused and not self.is_cancelled:
+            await asyncio.sleep(0.05)
+        self.raise_if_cancelled()
+
     @property
     def is_cancelled(self) -> bool:
         return self._event.is_set()
@@ -118,6 +125,9 @@ class Checkpoint(BaseModel):
     config_sha256: str = Field(min_length=1)
     issue: Issue
     completed_news_ids: list[str] = Field(default_factory=list)
+    retryable_candidate_ids: list[str] = Field(default_factory=list)
+    x_query_count: int = Field(default=0, ge=0)
+    media_cache_version: Literal[0, 1] = 0
     candidates: list[ImageCandidate] = Field(default_factory=list)
     videos: list[VideoCandidate] = Field(default_factory=list)
     failures: list[FailureRecord] = Field(default_factory=list)
@@ -139,6 +149,7 @@ class TaskRequest:
     output_dir: Path | str
     offline: bool = False
     no_videos: bool = False
+    use_socialdata_x: bool = False
     config_path: Path | str | None = None
     history_db: Path | str | None = None
     max_images: int | None = None
@@ -148,8 +159,19 @@ class TaskRequest:
     task_dir: Path | str | None = None
     checkpoint_path: Path | str | None = None
     task_id: str | None = None
+    selected_sections: list[Literal["x", "h", "z"]] = field(default_factory=lambda: ["x", "h", "z"])
+    # Deprecated compatibility field: older serialized requests may still
+    # supply it, but a request can no longer opt into deleting task internals.
+    images_only: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.selected_sections, (list, tuple, set, frozenset)):
+            raise ValueError("抓取栏目必须是新作、汉化、周报的选择列表")
+        if not self.selected_sections:
+            raise ValueError("请至少选择一个抓取栏目")
+        if any(value not in {"x", "h", "z"} for value in self.selected_sections):
+            raise ValueError("未知抓取栏目；仅支持新作、汉化、周报")
+        self.selected_sections = [value for value in ("x", "h", "z") if value in self.selected_sections]
         self.input_path = Path(self.input_path)
         self.output_dir = Path(self.output_dir)
         if self.config_path is not None:
@@ -162,6 +184,9 @@ class TaskRequest:
             self.checkpoint_path = Path(self.checkpoint_path)
         if not self.issue_id.strip():
             raise ValueError("issue_id must not be empty")
+        # Keep accepting the legacy keyword so older callers and request files
+        # remain readable, while ensuring it cannot trigger output cleanup.
+        self.images_only = False
 
 
 @dataclass(slots=True)
@@ -172,9 +197,10 @@ class TaskResult:
     task_id: str
     task_dir: Path
     output_dir: Path
-    checkpoint_path: Path
+    checkpoint_path: Path | None
     pipeline_result: PipelineResult
     resumed: bool = False
+    images_only: bool = False
 
     @property
     def result(self) -> PipelineResult:

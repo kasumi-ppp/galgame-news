@@ -5,12 +5,15 @@ from __future__ import annotations
 from typing import Any, Literal, Protocol
 
 
-CredentialName = Literal["brave_api_key", "x_bearer_token"]
+CredentialName = Literal["brave_api_key", "x_bearer_token", "twitterapi_api_key", "socialdata_api_key"]
 _SERVICE_NAME = "galgame-news-toolbox"
-_NAMES: set[str] = {"brave_api_key", "x_bearer_token"}
+_NAMES: set[str] = {"brave_api_key", "x_bearer_token", "twitterapi_api_key", "socialdata_api_key"}
 _ALIASES = {
     "BRAVE_SEARCH_API_KEY": "brave_api_key",
     "X_BEARER_TOKEN": "x_bearer_token",
+    "TWITTERAPI_KEY": "twitterapi_api_key",
+    "TWITTERAPI_IO_KEY": "twitterapi_api_key",
+    "SOCIALDATA_API_KEY": "socialdata_api_key",
 }
 
 
@@ -88,11 +91,19 @@ class KeyringCredentialBackend:
 class CredentialBundle:
     """Read-only runtime credentials whose repr and state serialization redact values."""
 
-    __slots__ = ("_brave_api_key", "_x_bearer_token")
+    __slots__ = ("_brave_api_key", "_x_bearer_token", "_twitterapi_api_key", "_socialdata_api_key")
 
-    def __init__(self, brave_api_key: str | None, x_bearer_token: str | None) -> None:
+    def __init__(
+        self,
+        brave_api_key: str | None,
+        x_bearer_token: str | None,
+        twitterapi_api_key: str | None = None,
+        socialdata_api_key: str | None = None,
+    ) -> None:
         self._brave_api_key = brave_api_key
         self._x_bearer_token = x_bearer_token
+        self._twitterapi_api_key = twitterapi_api_key
+        self._socialdata_api_key = socialdata_api_key
 
     @property
     def brave_api_key(self) -> str | None:
@@ -102,8 +113,16 @@ class CredentialBundle:
     def x_bearer_token(self) -> str | None:
         return self._x_bearer_token
 
+    @property
+    def twitterapi_api_key(self) -> str | None:
+        return self._twitterapi_api_key
+
+    @property
+    def socialdata_api_key(self) -> str | None:
+        return self._socialdata_api_key
+
     def __repr__(self) -> str:
-        return "CredentialBundle(brave_api_key=<redacted>, x_bearer_token=<redacted>)"
+        return "CredentialBundle(brave_api_key=<redacted>, x_bearer_token=<redacted>, twitterapi_api_key=<redacted>, socialdata_api_key=<redacted>)"
 
     __str__ = __repr__
 
@@ -162,8 +181,25 @@ class CredentialStore:
     def get_x_bearer_token(self) -> str | None:
         return self.get("x_bearer_token")
 
+    def set_twitterapi_api_key(self, value: str) -> None:
+        self.set("twitterapi_api_key", value)
+
+    def get_twitterapi_api_key(self) -> str | None:
+        return self.get("twitterapi_api_key")
+
+    def set_socialdata_api_key(self, value: str) -> None:
+        self.set("socialdata_api_key", value)
+
+    def get_socialdata_api_key(self) -> str | None:
+        return self.get("socialdata_api_key")
+
     def read(self) -> CredentialBundle:
-        return CredentialBundle(self.get_brave_api_key(), self.get_x_bearer_token())
+        return CredentialBundle(
+            self.get_brave_api_key(),
+            self.get_x_bearer_token(),
+            self.get_twitterapi_api_key(),
+            self.get_socialdata_api_key(),
+        )
 
     def __repr__(self) -> str:
         return "CredentialStore(<redacted>)"

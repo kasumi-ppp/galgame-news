@@ -27,6 +27,12 @@ dev = [
 build = [
   "PyInstaller==6.11.1",
 ]
+visual = [
+  "open_clip_torch>=2.24",
+]
+browser = [
+  "playwright==1.63.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

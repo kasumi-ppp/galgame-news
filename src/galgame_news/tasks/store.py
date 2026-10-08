@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..delivery.asset_paths import resolve_review_index_root
+
 
 _TASK_SCHEMA_VERSION = 1
 _SAFE_COMPONENT = re.compile(r"[^0-9A-Za-z._-]+")
@@ -86,6 +88,13 @@ class TaskRecord:
     def source_output_path(self) -> Path | None:
         return Path(self.source_output) if self.source_output else None
 
+    @property
+    def images_only(self) -> bool:
+        root = self.root_path
+        return (not self.imported and (root / "final" / "images").is_dir()
+                and not (root / "raw" / "image_index.json").is_file()
+                and not (root / "checkpoint.json").is_file())
+
 
 @dataclass
 class RetryAttempt:
@@ -130,6 +139,14 @@ class TaskStore:
         self._connection = sqlite3.connect(self.catalog_path)
         self._connection.row_factory = sqlite3.Row
         self._initialize_catalog()
+        # Run only at startup, never during an active worker's directory switch.
+        from ..pipeline.compact_output import recover_interrupted_compaction
+        for record in self.list_tasks():
+            if not record.imported:
+                try:
+                    recover_interrupted_compaction(record.root_path, task_id=record.task_id)
+                except (OSError, ValueError):
+                    pass  # Leave all data untouched for a later recovery.
 
     def _initialize_catalog(self) -> None:
         self._connection.executescript(
@@ -277,6 +294,7 @@ class TaskStore:
         source = Path(output_dir).expanduser()
         if not source.is_dir():
             raise FileNotFoundError(source)
+        source = resolve_review_index_root(source)
         inferred_issue = issue_id or self._infer_issue_id(source) or source.name or "imported"
         task_id = uuid.uuid4().hex
         if task_root is not None:
@@ -361,7 +379,7 @@ class TaskStore:
         self._connection.commit()
         return self.get_task(task_id)
 
-    def update_task_root(self, task: TaskRecord | str, task_root: Path | str) -> TaskRecord | None:
+    def update_task_root(self, task: TaskRecord | str, task_root: Path | str, *, materialize: bool = True) -> TaskRecord | None:
         """Bind a catalog row to the pipeline's per-run directory.
 
         A desktop task is catalogued before the worker starts so it is visible
@@ -390,8 +408,9 @@ class TaskStore:
             created_at=record.created_at,
             active=record.active,
         )
-        self._materialize_task_root(root)
-        self._initialize_task_state(Path(bound.state_path), bound)
+        if materialize:
+            self._materialize_task_root(root)
+            self._initialize_task_state(Path(bound.state_path), bound)
         self._connection.execute(
             "UPDATE tasks SET task_root = ?, state_path = ? WHERE task_id = ?",
             (bound.task_root, bound.state_path, bound.task_id),

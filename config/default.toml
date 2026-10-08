@@ -1,8 +1,8 @@
 [scoring]
 relevance = 0.50
-freshness = 0.20
+freshness = 0.00
 source_trust = 0.20
-quality = 0.10
+quality = 0.30
 duplicate_penalty = 0.0
 risk_penalty = 0.0
 
@@ -17,6 +17,13 @@ max_image_bytes = 12582912
 timeout_seconds = 12.0
 max_retries = 3
 user_agent = "WeeklyGalgameImagePrescan/2.0"
+trust_env = true
+page_concurrency = 4
+page_per_host = 2
+image_concurrency = 8
+image_per_host = 8
+image_processing_threads = 2
+socialdata_concurrency = 2
 
 [selection]
 min_images = 5
@@ -33,6 +40,7 @@ character_art = 4
 announcement_art = 3
 goods = 10
 background_art = 20
+decorative = 0
 unknown = 0
 photo = 0
 logo = 0
@@ -41,8 +49,14 @@ ui = 0
 
 [search]
 max_results = 5
-same_domain_depth = 1
+same_domain_depth = 3
 max_candidates_per_source = 500
+
+[browser]
+enabled = true
+timeout_seconds = 20.0
+max_pages_per_news = 3
+max_operations = 40
 
 [image_types]
 banner_aspect_ratio = 3.0
@@ -55,6 +69,15 @@ fallback_penalty = 0.25
 auto_select_unknown = false
 max_unknown_per_news = 0
 rejected_image_types_by_requirement = { cg = ["cover", "goods", "logo", "banner", "ui", "photo", "character_art", "announcement_art"], announcement = ["logo", "banner", "ui", "photo", "goods", "cover"], goods = ["logo", "banner", "ui", "photo", "game_cg", "gameplay_screenshot", "key_visual", "character_art", "cover"], release = ["logo", "banner", "ui", "goods", "photo"], generic = ["logo", "banner", "ui"], unknown = ["logo", "banner", "ui"] }
+
+[visual_analysis]
+enabled = false
+mode = "shadow"
+model_name = "ViT-B-32"
+weights_path = ""
+device = "cpu"
+batch_size = 8
+cache_path = "cache/visual_analysis.json"
 
 [video]
 enabled = true

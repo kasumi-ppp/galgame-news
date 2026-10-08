@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from galgame_news.domain import (
     EventType,
     ImageCandidate,
+    ImageCurationStatus,
     ImageNeed,
     Issue,
     IssueDraft,
@@ -64,7 +65,23 @@ def test_image_candidate_derives_stable_id_and_rejects_empty_unknowns():
     )
     assert len(candidate.id) == 16
     assert candidate.selected is False
+    assert candidate.curation_status is ImageCurationStatus.UNSELECTED
     assert candidate.review_reasons == []
+
+    same_url_other_news = ImageCandidate(
+        news_id="news-2",
+        image_url="https://official.example/cg/01.jpg",
+        source_url="https://official.example/news/2",
+        source_type=SourceType.OFFICIAL_SITE,
+        fetched_at=datetime.now(timezone.utc),
+    )
+    assert candidate.id != same_url_other_news.id
+
+    candidate.selected = True
+    assert candidate.curation_status is ImageCurationStatus.SELECTED
+    candidate.signals["invalid_reason"] = "corrupt_image"
+    candidate.curation_status = ImageCurationStatus.INVALID
+    assert candidate.selected is False
 
     with pytest.raises(ValidationError):
         SourceRef(
@@ -74,6 +91,35 @@ def test_image_candidate_derives_stable_id_and_rejects_empty_unknowns():
             discovered_via=DiscoveryMethod.DOCUMENT,
             officiality=0.5,
         )
+
+
+def test_image_candidate_tracks_original_and_review_assets_without_breaking_legacy_json():
+    candidate = ImageCandidate(
+        news_id="news-asset",
+        image_url="https://cdn.example/source.webp",
+        source_url="https://official.example/news",
+        fetched_at=datetime.now(timezone.utc),
+        original_path="assets/original.webp",
+        original_mime_type="image/webp",
+        output_mime_type="image/png",
+        output_sha256="a" * 64,
+        news_source_url="https://official.example/news",
+        parent_source_url="https://official.example/gallery",
+        image_alt="Game Alpha event CG",
+        selection_reasons=["entity_match"]
+    )
+    dumped = candidate.model_dump(mode="json")
+    assert dumped["original_path"] == "assets/original.webp"
+    assert dumped["output_mime_type"] == "image/png"
+    assert dumped["image_alt"] == "Game Alpha event CG"
+    legacy = ImageCandidate.model_validate({
+        "news_id": "legacy",
+        "image_url": "https://cdn.example/old.jpg",
+        "source_url": "https://official.example/news",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    })
+    assert legacy.original_path is None
+    assert legacy.output_mime_type is None
 
 
 def test_issue_draft_and_issue_keep_deterministic_schema_version():

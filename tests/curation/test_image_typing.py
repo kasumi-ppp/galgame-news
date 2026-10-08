@@ -27,6 +27,7 @@ def make_news(*, title="新CG公开", body="官方公开了一张新CG。", even
         event_type=event_type,
         image_need=image_need,
         game_names=["Example Game"],
+        source_urls=["https://official.example/news/cg"],
     )
 
 
@@ -105,6 +106,103 @@ def test_gallery_page_horizontal_art_is_game_cg_without_extra_adapter_signal():
     assert result.image_type is ImageType.GAME_CG
 
 
+def test_official_news_linked_gallery_for_cg_update_has_auto_select_confidence():
+    root = "https://hook-net.jp/smee/one/"
+    item = make_news(title="《One Night After》CG更新", body="官网更新了 CG 图片。")
+    item.source_urls = [root]
+    result = classify(
+        "http://www.hook-net.jp/smee/one/_assets/images/gallery/full/gallery_n_009.png",
+        news=item,
+        source_url="http://www.hook-net.jp/smee/one/gallery/",
+        signals={
+            "root_source_url": root,
+            "gallery_path": True,
+            "page_title": "GALLERY | SMEE 15th Project | ワンナイトアフター - SMEE",
+        },
+    )
+
+    assert result.image_type is ImageType.GAME_CG
+    assert result.confidence >= 0.8
+    assert evaluate(item, result).auto_select is True
+
+
+def test_fragment_gallery_scene_has_auto_select_confidence_but_logo_does_not():
+    root = "https://liar.co.jp/tasogare/index.html#GALLERY"
+    item = make_news(title="《誰ソ彼のシェイプシフター》CG更新", body="官网更新了 CG。")
+    item.source_urls = [root]
+    cg = classify(
+        "https://liar.co.jp/tasogare/images/sample-cg_01.jpg",
+        news=item,
+        source_url="https://liar.co.jp/tasogare/index.html",
+        signals={"root_source_url": root, "gallery_path": True, "page_title": "誰ソ彼のシェイプシフター"},
+    )
+    logo = classify(
+        "https://liar.co.jp/tasogare/images/logo.png",
+        news=item,
+        source_url="https://liar.co.jp/tasogare/index.html",
+        signals={"root_source_url": root, "gallery_path": False, "page_title": "誰ソ彼のシェイプシフター"},
+    )
+    assert cg.image_type is ImageType.GAME_CG
+    assert cg.confidence >= 0.8
+    assert evaluate(item, cg).auto_select is True
+    assert logo.image_type is ImageType.LOGO
+    assert evaluate(item, logo).accepted is False
+
+
+def test_publisher_home_gallery_requires_reached_work_page_title():
+    item = make_news(title="《花鐘カナデ＊グラム Chapter:4 綾世奏》官网更新", body="官方公布了一张特殊场景CG。")
+    item.game_names = ["花鐘カナデ＊グラム Chapter:4 綾世奏"]
+    item.source_urls = ["https://nanawind.jp/"]
+    signals = {"root_source_url": "https://nanawind.jp/", "gallery_path": True}
+    related = classify(
+        "https://nanawind.jp/product/prj06/chapter4/images/cg01.jpg",
+        news=item,
+        source_url="https://nanawind.jp/product/prj06/chapter4/",
+        signals={**signals, "page_title": "Chapter:4 | 花鐘カナデ＊グラム"},
+    )
+    unrelated = classify(
+        "https://nanawind.jp/product/prj07/other/images/cg01.jpg",
+        news=item,
+        source_url="https://nanawind.jp/product/prj07/other/",
+        signals={**signals, "page_title": "Other Game"},
+    )
+    assert related.image_type is ImageType.GAME_CG
+    assert related.confidence >= 0.8
+    assert unrelated.confidence < 0.8
+
+
+def test_quiz_promotion_is_not_promoted_to_cg_by_generic_graphic_css():
+    item = make_news(title="《花鐘カナデ＊グラム》CG更新", body="官网更新 CG。")
+    item.game_names = ["花鐘カナデ＊グラム"]
+    item.source_urls = ["https://nanawind.jp/"]
+    result = classify(
+        "https://nanawind.jp/product/prj06/chapter4/images/quiz.jpg",
+        news=item,
+        source_url="https://nanawind.jp/product/prj06/chapter4/",
+        signals={"root_source_url": "https://nanawind.jp/", "gallery_path": True, "page_title": "花鐘カナデ＊グラム"},
+    )
+    assert result.image_type is ImageType.ANNOUNCEMENT_ART
+    assert evaluate(item, result).accepted is False
+
+
+def test_game_gallery_cg_under_product_route_is_not_mistaken_for_goods():
+    item = make_news(title="《アンスリウム》CG 更新", body="官网更新了一张 CG。")
+    item.source_urls = ["https://circus.example/product/clown/anthurium/"]
+    result = classify(
+        "https://circus.example/product/clown/anthurium/rc/gallery/event-01.jpg",
+        news=item,
+        source_url="https://circus.example/product/clown/anthurium/",
+        signals={
+            "page_title": "アンスリウム-i entrust to you-",
+            "alt": "イベントCG 1",
+            "root_source_url": "https://circus.example/product/clown/anthurium/",
+        },
+    )
+
+    assert result.image_type is ImageType.GAME_CG
+    assert evaluate(item, result).accepted
+
+
 def test_steam_screenshot_is_gameplay_screenshot_not_store_art():
     result = classify(
         "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1/ss_01.jpg",
@@ -180,6 +278,17 @@ def test_cg_news_accepts_game_cg_and_rejects_non_visual_chrome_and_products():
         assert decision.rejection_reason
 
 
+def test_cg_update_with_release_date_still_rejects_character_art():
+    item = make_news(
+        title="《Sweet Starlight Sisters》CG更新",
+        body="官方公开一张游戏 CG，预计明年发售。",
+        event_type=EventType.RELEASE,
+    )
+    character = classify("https://official.example/game/character201.png", news=item)
+    assert character.image_type is ImageType.CHARACTER_ART
+    assert evaluate(item, character).accepted is False
+
+
 def test_cg_news_only_allows_key_visual_as_fallback():
     item = make_news()
     result = classify("https://official.example/assets/keyvisual_main.jpg", news=item)
@@ -198,6 +307,29 @@ def test_announcement_art_is_not_silently_accepted_as_cg():
     assert not evaluate(item, result).accepted
 
 
+def test_anniversary_goods_news_keeps_goods_as_a_valid_intent():
+    item = make_news(
+        title="Example Game 10th Anniversary goods collection",
+        body="New goods and commemorative items are now available.",
+        event_type=EventType.GOODS,
+    )
+    goods = classify("https://official.example/shop/tapestry.jpg", news=item)
+    assert goods.image_type is ImageType.GOODS
+    decision = evaluate(item, goods)
+    assert decision.accepted
+    assert decision.type_match == 1.0
+
+
+def test_gallery_and_wide_aspect_are_weak_cg_evidence():
+    item = make_news()
+    result = classify("https://official.example/gallery/image-01.jpg", news=item, width=1800, height=600)
+    assert result.image_type is ImageType.GAME_CG
+    assert result.confidence < 0.8
+    decision = evaluate(item, result)
+    assert decision.requires_review
+    assert decision.auto_select is False
+
+
 def test_unknown_requires_manual_review():
     item = make_news(title="新情报", body="官方发布了新情报。")
     result = classify("https://cdn.example/assets/asset-01.jpg", news=item, source_url="https://official.example/news")
@@ -212,7 +344,7 @@ def test_explicit_cg_unknown_is_retained_but_never_auto_selected():
     from galgame_news.curation.curator import ImageCurator
 
     item = make_news()
-    unknown = make_candidate("https://official.example/assets/asset-01.jpg", news_id=item.id)
+    unknown = make_candidate("https://official.example/assets/asset-01.jpg", news_id=item.id, signals={"page_title": "Example Game official"})
     issue = Issue(issue_id="252", input_path="252.docx", news_items=[item])
     result = ImageCurator(load_config()).curate(issue, [unknown])
 
@@ -222,19 +354,35 @@ def test_explicit_cg_unknown_is_retained_but_never_auto_selected():
     assert ReviewReason.IMAGE_TYPE_REVIEW in unknown.review_reasons
 
 
+def test_animated_image_is_retained_for_review_but_never_automatically_selected():
+    from galgame_news.curation.curator import ImageCurator
+
+    item = make_news()
+    animated = make_candidate(
+        "https://official.example/gallery/event01.gif",
+        news_id=item.id,
+        signals={"page_title": "Example Game event CG", "animated_source": True, "game_match": 1.0},
+    )
+    result = ImageCurator(load_config()).curate(Issue(issue_id="252", input_path="252.docx", news_items=[item]), [animated])
+    assert animated in result.candidates
+    assert animated.selected is False
+    assert animated.signals["auto_select"] is False
+    assert "animated_source_requires_review" in animated.selection_reasons
+
+
 def test_cg_key_visual_is_fallback_only_when_no_preferred_type_exists():
     from galgame_news.curation.curator import ImageCurator
 
     item = make_news()
-    key_visual = make_candidate("https://official.example/assets/keyvisual_main.jpg", news_id=item.id)
-    game_cg = make_candidate("https://official.example/gallery/cg01.jpg", source_url="https://official.example/gallery", news_id=item.id, signals={"cg_match": 1.0})
+    key_visual = make_candidate("https://official.example/assets/keyvisual_main.jpg", news_id=item.id, signals={"page_title": "Example Game official"})
+    game_cg = make_candidate("https://official.example/gallery/cg01.jpg", source_url="https://official.example/gallery", news_id=item.id, signals={"cg_match": 1.0, "page_title": "Example Game CG", "root_source_url": item.source_urls[0]})
     issue = Issue(issue_id="252", input_path="252.docx", news_items=[item])
 
     with_preferred = ImageCurator(load_config()).curate(issue, [key_visual, game_cg])
     assert game_cg.selected is True
     assert key_visual.selected is False
 
-    only_fallback = make_candidate("https://official.example/assets/keyvisual_only.jpg", news_id=item.id)
+    only_fallback = make_candidate("https://official.example/assets/keyvisual_only.jpg", news_id=item.id, signals={"page_title": "Example Game official"})
     result = ImageCurator(load_config()).curate(issue, [only_fallback])
     assert only_fallback.selected is True
     assert result.selection_shortfall == 4
@@ -244,7 +392,7 @@ def test_generic_and_unknown_requirements_do_not_auto_select_unknown_by_default(
     from galgame_news.curation.curator import ImageCurator
 
     item = make_news(title="新情报", body="官方发布了新情报。", image_need=ImageNeed.UNKNOWN)
-    unknown = make_candidate("https://official.example/assets/asset-01.jpg", news_id=item.id)
+    unknown = make_candidate("https://official.example/assets/asset-01.jpg", news_id=item.id, signals={"page_title": "Example Game official"})
     result = ImageCurator(load_config()).curate(Issue(issue_id="252", input_path="252.docx", news_items=[item]), [unknown])
 
     assert unknown.image_type is ImageType.UNKNOWN
@@ -259,7 +407,7 @@ def test_unknown_auto_selection_can_be_enabled_by_toml_override(tmp_path):
     config_path.write_text("[image_types]\nauto_select_unknown = true\nmax_unknown_per_news = 1\n", encoding="utf-8")
     config = load_config(config_path)
     item = make_news(title="新情报", body="官方发布了新情报。", image_need=ImageNeed.UNKNOWN)
-    unknown = make_candidate("https://official.example/assets/asset-01.jpg", news_id=item.id)
+    unknown = make_candidate("https://official.example/assets/asset-01.jpg", news_id=item.id, signals={"page_title": "Example Game official"})
     result = ImageCurator(config).curate(Issue(issue_id="252", input_path="252.docx", news_items=[item]), [unknown])
 
     assert unknown.selected is True
@@ -375,14 +523,15 @@ def test_252_offline_fixture_keeps_screenshot_and_rejects_chrome_and_goods():
     assert by_name["steam_share_image.jpg"].image_type is ImageType.UI
     assert "steam_share_image.jpg" not in selected_names
     assert by_name["ss_01.jpg"].image_type is ImageType.GAMEPLAY_SCREENSHOT
-    assert by_name["ss_01.jpg"].selected
+    assert by_name["ss_01.jpg"].selected is False
+    assert by_name["ss_01.jpg"].signals["source_linked"] is False
     assert by_name["keyvisual_main.jpg"].image_type is ImageType.KEY_VISUAL
     assert by_name["keyvisual_main.jpg"].signals["fallback_only"] is True
     assert "goods_tapestry.jpg" not in selected_names
     assert "logo.png" not in selected_names
     assert "bnr_main.jpg" not in selected_names
     assert not by_name["keyvisual_main.jpg"].selected
-    assert sum(candidate.selected for candidate in result.candidates) == 1
+    assert sum(candidate.selected for candidate in result.candidates) == 0
     assert any(f.code == "image_type_rejected" and "goods" in f.message for f in result.failures)
 
 

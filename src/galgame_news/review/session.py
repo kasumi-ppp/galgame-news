@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import filecmp
 import json
-import os
 import re
 import shutil
-import tempfile
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
 
+from PIL import Image
+
 from ..domain import (
     ImageCandidate,
+    ImageEvidence,
     ImageType,
     ScoreBreakdown,
     SourceType,
@@ -24,7 +27,10 @@ from ..domain import (
     candidate_id_for,
     video_candidate_id_for,
 )
-from ..delivery.output import OutputManager
+from ..delivery.helpers import atomic_json_write, atomic_replace, item_names as canonical_item_names, safe_title
+from ..delivery.image_conversion import ImageConversionError, ImageConverter
+from ..delivery.asset_paths import recover_asset_path, resolve_review_index_root
+from ..curation.review_filter import reviewable_pending_images
 
 
 class ReviewDecision(str, Enum):
@@ -112,9 +118,7 @@ def _review_ids(payload: Any) -> set[str]:
 
 
 def _safe_title(value: Any, fallback: str) -> str:
-    text = str(value or "")
-    text = re.sub(r'[\\/:*?"<>|]', "", text).strip().rstrip(".")
-    return text or fallback
+    return safe_title(value, fallback)
 
 
 class ReviewSession:
@@ -143,6 +147,7 @@ class ReviewSession:
         raw_types: dict[str, str],
         review_ids: set[str],
         failed_ids: set[str],
+        ambiguous_image_ids: set[str] | None = None,
     ):
         self.output_dir = output_dir
         self.task_root = task_root or state_path.parent
@@ -154,6 +159,7 @@ class ReviewSession:
         self._raw_types = raw_types
         self._review_ids = review_ids
         self._failed_ids = failed_ids
+        self._ambiguous_image_ids = ambiguous_image_ids or set()
         self._decisions: dict[str, ReviewDecision] = {}
         self._image_by_id = {str(item.id): item for item in images}
         self._video_by_id = {str(item.id): item for item in videos}
@@ -166,9 +172,7 @@ class ReviewSession:
         state_path: Path | str | None = None,
         task_root: Path | str | None = None,
     ) -> "ReviewSession":
-        root = Path(output_dir).expanduser()
-        if root.is_file():
-            root = root.parent
+        root = resolve_review_index_root(output_dir)
         managed_root = Path(task_root).expanduser() if task_root is not None else None
         if state_path is not None:
             state = Path(state_path).expanduser()
@@ -181,6 +185,8 @@ class ReviewSession:
 
         image_payload = _read_json(root / "image_index.json", {})
         video_payload = _read_json(root / "video_index.json", {})
+        if not image_payload and not video_payload:
+            raise ValueError("审核索引为空或无法读取，请重新选择有效的任务结果目录。")
         review_payload = _read_json(root / "review_required.json", [])
         failed_payload = _read_json(root / "failed_items.json", [])
         image_items = _items(image_payload, ("candidates", "images", "image_candidates"))
@@ -193,18 +199,30 @@ class ReviewSession:
         videos: list[VideoCandidate] = []
         source_paths: dict[str, Path] = {}
         raw_types: dict[str, str] = {}
-        seen_images: set[str] = set()
+        seen_images: dict[str, str] = {}
+        ambiguous_image_ids: set[str] = set()
         seen_videos: set[str] = set()
         for raw in image_items:
             candidate, stable_id = cls._coerce_image(raw)
-            if candidate is None or stable_id in seen_images:
+            if candidate is None:
                 continue
-            seen_images.add(stable_id)
+            previous_news_id = seen_images.get(stable_id)
+            if previous_news_id is not None and previous_news_id == candidate.news_id:
+                continue
+            if previous_news_id is not None:
+                # Legacy indexes used URL-only image IDs. Re-key a cross-news
+                # collision locally so review choices stay independent.
+                ambiguous_image_ids.add(stable_id)
+                stable_id = candidate_id_for(candidate.image_url, candidate.news_id)
+                object.__setattr__(candidate, "id", stable_id)
+                if stable_id in seen_images:
+                    continue
+            seen_images[stable_id] = candidate.news_id
             images.append(candidate)
             raw_types[stable_id] = " ".join(
                 [str(raw.get("image_type", "")), *[str(value) for value in raw.get("review_reasons", [])]]
             ).casefold()
-            source = cls._source_path(raw.get("local_path"), root)
+            source = cls._resolve_image_path(candidate, root)
             if source is not None:
                 source_paths[stable_id] = source
         for raw in video_items:
@@ -214,8 +232,9 @@ class ReviewSession:
             seen_videos.add(stable_id)
             videos.append(candidate)
             raw_types[stable_id] = str(raw.get("media_type", "")).casefold()
-            source = cls._source_path(raw.get("local_path"), root)
+            source = cls._resolve_asset_path(raw.get("local_path"), root, candidate.sha256)
             if source is not None:
+                object.__setattr__(candidate, "local_path", str(source))
                 source_paths[stable_id] = source
 
         session = cls(
@@ -229,6 +248,7 @@ class ReviewSession:
             raw_types=raw_types,
             review_ids=review_ids,
             failed_ids=failed_ids,
+            ambiguous_image_ids=ambiguous_image_ids,
         )
         session._initialize_decisions()
         return session
@@ -270,6 +290,51 @@ class ReviewSession:
                     result.add(str(value["candidate_id"]))
         return result
 
+    @classmethod
+    def _resolve_asset_path(cls, value: Any, root: Path, expected_hash: str | None) -> Path | None:
+        if not value or ".." in Path(str(value)).parts:
+            return None
+        source = recover_asset_path(value, root, expected_hash)
+        if source is not None or any(part.casefold() == ".work" for part in Path(str(value)).parts):
+            return source
+        # Existing legacy imports can explicitly reference assets outside the
+        # index folder. Keep that contract, without using it for stage recovery.
+        source = cls._source_path(value, root)
+        if source is not None and expected_hash:
+            try:
+                if hashlib.sha256(source.read_bytes()).hexdigest() != str(expected_hash).casefold():
+                    return None
+            except OSError:
+                return None
+        return source
+
+    @classmethod
+    def _resolve_image_path(cls, candidate: ImageCandidate, root: Path) -> Path | None:
+        resolved: dict[str, Path] = {}
+        for name, expected_hash in (
+            ("local_path", candidate.output_sha256 or candidate.sha256),
+            ("original_path", candidate.original_sha256 or candidate.sha256),
+        ):
+            recorded = getattr(candidate, name)
+            recovered_stage = bool(recorded and any(part.casefold() == ".work" for part in Path(str(recorded)).parts))
+            source = cls._resolve_asset_path(recorded, root, expected_hash)
+            if source is None:
+                object.__setattr__(candidate, name, None)
+                continue
+            if recovered_stage:
+                try:
+                    with Image.open(source) as image:
+                        image.verify()
+                    # verify() checks the container; load() also forces pixel decode.
+                    with Image.open(source) as image:
+                        image.load()
+                except Exception:
+                    object.__setattr__(candidate, name, None)
+                    continue
+            object.__setattr__(candidate, name, str(source))
+            resolved[name] = source
+        return resolved.get("local_path") or resolved.get("original_path")
+
     @staticmethod
     def _source_path(value: Any, root: Path) -> Path | None:
         if not value:
@@ -288,12 +353,20 @@ class ReviewSession:
     def _coerce_image(cls, raw: dict[str, Any]) -> tuple[ImageCandidate | None, str]:
         data = dict(raw)
         image_url = str(data.get("image_url") or data.get("url") or "")
-        stable_id = str(data.get("id") or (candidate_id_for(image_url) if image_url else _stable_fallback(data, "image")))
         news_id = str(data.get("news_id") or data.get("newsId") or "")
+        stable_id = str(data.get("id") or (candidate_id_for(image_url, news_id) if image_url else _stable_fallback(data, "image")))
         if not news_id:
             return None, stable_id
         score_data = data.get("score") if isinstance(data.get("score"), dict) else {}
         total = _clamp(score_data.get("total", data.get("total", 0.0)), 0.0, 100.0)
+        raw_signals = data.get("signals") if isinstance(data.get("signals"), dict) else {}
+        evidence = []
+        if isinstance(data.get("evidence"), list):
+            for item in data["evidence"]:
+                try:
+                    evidence.append(ImageEvidence.model_validate(item))
+                except (TypeError, ValueError):
+                    continue
         score = {
             "relevance": _clamp(score_data.get("relevance", data.get("relevance", total / 100.0)), 0.0, 1.0),
             "freshness": _clamp(score_data.get("freshness", 0.0), 0.0, 1.0),
@@ -322,10 +395,36 @@ class ReviewSession:
             "perceptual_hash": data.get("perceptual_hash"),
             "downloadable": bool(data.get("downloadable", False)),
             "local_path": str(data["local_path"]) if data.get("local_path") else None,
+            "original_path": str(data["original_path"]) if data.get("original_path") else None,
+            "original_mime_type": data.get("original_mime_type"),
+            "original_byte_size": data.get("original_byte_size"),
+            "original_sha256": data.get("original_sha256"),
+            "original_width": data.get("original_width"),
+            "original_height": data.get("original_height"),
+            "output_mime_type": data.get("output_mime_type"),
+            "output_byte_size": data.get("output_byte_size"),
+            "output_sha256": data.get("output_sha256"),
+            "output_width": data.get("output_width"),
+            "output_height": data.get("output_height"),
+            "news_source_url": data.get("news_source_url"),
+            "parent_source_url": data.get("parent_source_url"),
+            "image_alt": data.get("image_alt"),
+            "nearby_text": data.get("nearby_text"),
+            "evidence": evidence,
+            "download_status": data.get("download_status", "pending"),
+            "download_error_code": data.get("download_error_code"),
+            "downloaded_url": data.get("downloaded_url"),
+            "media_source_url": data.get("media_source_url"),
+            "expected_width": data.get("expected_width"),
+            "expected_height": data.get("expected_height"),
+            "selection_reasons": data.get("selection_reasons", []),
+            "animated_source": bool(data.get("animated_source", False)),
+            "animation_frame_index": data.get("animation_frame_index"),
             "review_reasons": [str(item) for item in data.get("review_reasons", []) if item is not None] if isinstance(data.get("review_reasons", []), list) else [],
-            "signals": data.get("signals", {}) if isinstance(data.get("signals"), dict) else {},
+            "signals": raw_signals,
             "score": score,
             "selected": bool(data.get("selected", False)),
+            "curation_status": data.get("curation_status", raw_signals.get("candidate_status", "unselected")),
         }
         try:
             candidate = ImageCandidate.model_validate(payload)
@@ -385,7 +484,7 @@ class ReviewSession:
             self._decisions[str(candidate.id)] = self._initial_video_decision(candidate)
         persisted = self._read_state()
         for media_id, value in persisted.items():
-            if media_id in self._decisions:
+            if media_id in self._decisions and media_id not in self._ambiguous_image_ids:
                 try:
                     self._decisions[media_id] = ReviewDecision(value)
                 except ValueError:
@@ -398,22 +497,10 @@ class ReviewSession:
         return source is not None and source.is_file()
 
     def _hard_filtered(self, candidate: ImageCandidate) -> bool:
-        raw_type = self._raw_types.get(str(candidate.id), "")
-        image_type = getattr(candidate.image_type, "value", str(candidate.image_type)).casefold()
-        raw_tokens = set(re.split(r"[\s,;|]+", raw_type))
-        if raw_tokens & (self._HARD_IMAGE_TYPES | {"low_quality", "image_too_small", "pixel_count_too_small"}) or image_type in self._HARD_IMAGE_TYPES:
-            return True
         signals = candidate.signals if isinstance(candidate.signals, dict) else {}
-        if signals.get("low_quality") is True or signals.get("hard_filtered") is True:
-            return True
-        reasons = {str(getattr(value, "value", value)).casefold() for value in candidate.review_reasons}
-        if reasons & {"logo", "favicon", "icon", "ui", "low_quality", "image_too_small", "pixel_count_too_small"}:
-            return True
-        width, height = candidate.width, candidate.height
-        if width is not None and height is not None:
-            if width < self._LOW_QUALITY_MIN_WIDTH or height < self._LOW_QUALITY_MIN_HEIGHT or width * height < self._LOW_QUALITY_MIN_PIXELS:
-                return True
-        return False
+        # Semantic type and editorial quality may reject auto-selection, but
+        # must not hide an otherwise usable local image from a human reviewer.
+        return signals.get("invalid_file") is True
 
     def _initial_image_decision(self, candidate: ImageCandidate) -> ReviewDecision:
         if self._hard_filtered(candidate):
@@ -440,27 +527,14 @@ class ReviewSession:
 
     def _persist(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=f".{self.state_path.name}.", suffix=".tmp", dir=self.state_path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(
-                    {
-                        "schema_version": 1,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                        "decisions": {key: value.value for key, value in sorted(self._decisions.items())},
-                    },
-                    handle,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                handle.write("\n")
-            os.replace(temp_name, self.state_path)
-        except Exception:
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-            raise
+        atomic_json_write(
+            self.state_path,
+            {
+                "schema_version": 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "decisions": {key: value.value for key, value in sorted(self._decisions.items())},
+            },
+        )
 
     def decision(self, media_id: str) -> ReviewDecision:
         return self._decisions.get(str(media_id), ReviewDecision.REJECTED)
@@ -476,8 +550,9 @@ class ReviewSession:
         def key(candidate: ImageCandidate):
             score = candidate.score
             return (
-                -(score.relevance if score else 0.0),
                 -(score.total if score else 0.0),
+                -(score.source_trust if score else 0.0),
+                -((candidate.width or 0) * (candidate.height or 0)),
                 str(candidate.id),
             )
 
@@ -487,7 +562,9 @@ class ReviewSession:
         values = [candidate for candidate in self.images if self.decision(str(candidate.id)) is ReviewDecision.PENDING]
         if news_id is not None:
             values = [candidate for candidate in values if candidate.news_id == news_id]
-        return self._sorted_pending(values)
+        return self._sorted_pending(reviewable_pending_images(
+            values, accepted=self.accepted_images(news_id)
+        ))
 
     def failed_images(self, news_id: str | None = None) -> list[ImageCandidate]:
         values = [candidate for candidate in self.pending_images(news_id) if str(candidate.id) in self._failed_ids or bool(candidate.review_reasons)]
@@ -602,7 +679,7 @@ class ReviewSession:
         # Use the same canonical naming policy as raw output.  Manifest order
         # is the editorial appearance order; sorting by global sequence would
         # renumber categories when legacy manifests contain non-monotonic IDs.
-        names = OutputManager.item_names(self.news_items)
+        names = canonical_item_names(self.news_items)
         counters = {
             prefix: sum(name.startswith(prefix) for name in names.values())
             for prefix in ("x", "h", "z")
@@ -634,31 +711,195 @@ class ReviewSession:
                 return candidate
             index += 1
 
+    @staticmethod
+    def _verified_final_image(candidate: ImageCandidate, source: Path) -> tuple[bytes, str] | None:
+        try:
+            data = source.read_bytes()
+            with Image.open(source) as image:
+                actual = (image.format or "").upper()
+                image.verify()
+            mime = "image/png" if actual == "PNG" else "image/jpeg" if actual == "JPEG" else None
+            extension_matches = source.suffix.casefold() in ({".png"} if actual == "PNG" else {".jpg", ".jpeg"} if actual == "JPEG" else set())
+            metadata_matches = candidate.output_mime_type == mime and extension_matches
+            hash_matches = not candidate.output_sha256 or hashlib.sha256(data).hexdigest() == candidate.output_sha256
+            if mime and metadata_matches and hash_matches:
+                return data, mime
+            converted = ImageConverter().convert(data, candidate)
+            return converted.data, converted.mime_type
+        except ImageConversionError:
+            return None
+        except Exception:
+            return None
+
     def export_final(self) -> dict[str, Any]:
-        root = self.task_root
-        final_root = root / "final"
-        image_root = final_root / "images"
-        image_root.mkdir(parents=True, exist_ok=True)
+        final_root = self.task_root / "final"
+        final_root.mkdir(parents=True, exist_ok=True)
+        published = final_root / "images"
+        image_root = final_root / f".images-stage-{uuid.uuid4().hex}"
+        image_root.mkdir()
+        backup = final_root / f".images-backup-{uuid.uuid4().hex}"
+        if published.is_symlink():
+            image_root.rmdir()
+            raise ValueError("图片交付目录不能是符号链接")
+        previous = _read_json(final_root / "final_manifest.json", {})
+        previous_files = previous.get("files", []) if isinstance(previous, dict) else []
+        owned = {value for value in previous_files if isinstance(value, str)} if isinstance(previous_files, list) else set()
+        committed = False
+        # Preserve user-added files. Only the files named by the previous
+        # manifest are regenerated; repeated export never adds numbered copies.
+        if published.exists():
+            for source in published.rglob("*"):
+                if not source.is_file() or source.is_symlink() or not source.resolve().is_relative_to(published.resolve()):
+                    continue
+                relative = source.relative_to(published)
+                if (Path("images") / relative).as_posix() not in owned:
+                    target = image_root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+        try:
+            manifest = self._export_images_and_videos(image_root)
+            if published.exists():
+                try:
+                    atomic_replace(published, backup)
+                except PermissionError:
+                    # Explorer/preview readers can lock the directory even
+                    # when individual files can still be replaced safely.
+                    self._publish_files_in_place(image_root, published, backup, owned, manifest)
+                    committed = True
+                    return manifest
+            try:
+                atomic_replace(image_root, published)
+                self._atomic_json(final_root / "final_manifest.json", manifest)
+                committed = True
+            except Exception:
+                if backup.exists():
+                    if published.exists():
+                        atomic_replace(published, image_root)
+                    atomic_replace(backup, published)
+                elif published.exists():
+                    atomic_replace(published, image_root)
+                raise
+            return manifest
+        finally:
+            # If rollback itself failed, preserve both directories for recovery.
+            cleanup = (image_root, backup) if committed else (image_root,) if not backup.exists() else ()
+            for temporary in cleanup:
+                if temporary.exists() and not temporary.is_symlink() and temporary.resolve().is_relative_to(final_root.resolve()):
+                    shutil.rmtree(temporary, ignore_errors=True)
+
+    def _publish_files_in_place(
+        self, staged: Path, published: Path, backup: Path,
+        owned: set[str], manifest: dict[str, Any],
+    ) -> None:
+        """Replace files transactionally without renaming the open directory."""
+        backup.mkdir()
+        manifest_path = published.parent / "final_manifest.json"
+        had_manifest = manifest_path.is_file()
+        if had_manifest:
+            shutil.copyfile(manifest_path, backup / "final_manifest.json")
+        updates = {path.relative_to(staged): path for path in staged.rglob("*") if path.is_file()}
+        obsolete: set[Path] = set()
+        for value in owned:
+            path = Path(value)
+            if path.is_absolute() or path.drive or ".." in path.parts or not path.parts or path.parts[0] != "images":
+                raise ValueError("旧导出清单包含不安全的图片路径")
+            relative = Path(*path.parts[1:])
+            if relative.parts and relative not in updates:
+                obsolete.add(relative)
+        changed: list[tuple[Path, bool]] = []
+        try:
+            for relative in sorted(set(updates) | obsolete, key=lambda value: value.as_posix()):
+                target = published / relative
+                # Do not traverse links/junctions or touch files outside this task.
+                if not target.resolve().is_relative_to(published.resolve()):
+                    raise ValueError("图片导出路径超出当前任务")
+                for part in (target, *target.parents):
+                    if part == published.parent:
+                        break
+                    if part.is_symlink() or getattr(part, "is_junction", lambda: False)():
+                        raise ValueError("图片导出路径不能包含链接或目录联接")
+                source = updates.get(relative)
+                existed = target.is_file()
+                if source is not None and existed and filecmp.cmp(source, target, shallow=False):
+                    continue
+                if target.exists() and not existed:
+                    raise ValueError(f"图片文件位置被目录占用：{target}")
+                if existed:
+                    saved = backup / "files" / relative
+                    saved.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(target, saved)
+                if source is None:
+                    if existed:
+                        target.unlink()
+                        changed.append((relative, existed))
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_replace(source, target)
+                    changed.append((relative, existed))
+            self._atomic_json(manifest_path, manifest)
+        except Exception as error:
+            rollback_errors: list[str] = []
+            for relative, existed in reversed(changed):
+                target = published / relative
+                try:
+                    if existed:
+                        restore = backup / f".restore-{uuid.uuid4().hex}"
+                        shutil.copyfile(backup / "files" / relative, restore)
+                        atomic_replace(restore, target)
+                    elif target.exists():
+                        target.unlink()
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            try:
+                if had_manifest:
+                    saved_manifest = backup / "final_manifest.json"
+                    if not manifest_path.is_file() or not filecmp.cmp(saved_manifest, manifest_path, shallow=False):
+                        restore = backup / f".manifest-restore-{uuid.uuid4().hex}"
+                        shutil.copyfile(saved_manifest, restore)
+                        atomic_replace(restore, manifest_path)
+                elif manifest_path.exists():
+                    manifest_path.unlink()
+            except OSError as rollback_error:
+                rollback_errors.append(str(rollback_error))
+            if rollback_errors:
+                raise RuntimeError(f"导出失败且部分文件无法回滚，恢复备份已保留：{backup}；请关闭占用图片的程序后重试。") from error
+            # Old files are restored; the enclosing cleanup can remove staging.
+            shutil.rmtree(backup, ignore_errors=True)
+            if isinstance(error, PermissionError):
+                raise PermissionError("图片文件被占用或无写入权限。原有图片已恢复，请关闭预览/图片编辑程序后重试导出。") from error
+            raise
+
+    def _export_images_and_videos(self, image_root: Path) -> dict[str, Any]:
         folder_names = self._folder_names()
         files: list[str] = []
         image_ranks: dict[str, int] = {}
-        for candidate in self.images:
-            if self.decision(str(candidate.id)) is not ReviewDecision.ACCEPTED:
+        pending_ranks: dict[str, int] = {}
+        selected_count = pending_count = video_count = 0
+        for candidate in [*self.accepted_images(), *self.pending_images()]:
+            decision = self.decision(str(candidate.id))
+            if self._hard_filtered(candidate):
                 continue
             source = self._source_for(candidate)
             if source is None or not source.is_file():
                 continue
             folder = folder_names.get(str(candidate.news_id), f"x{candidate.news_id}")
-            image_ranks[folder] = image_ranks.get(folder, 0) + 1
-            extension = self._media_extension(candidate, source, default=".jpg")
-            if extension == ".jpeg":
-                extension = ".jpg"
-            target = image_root / folder / f"{folder}.{image_ranks[folder]:02d}{extension}"
+            converted = self._verified_final_image(candidate, source)
+            if converted is None:
+                continue
+            data, mime_type = converted
+            extension = ".jpg" if mime_type == "image/jpeg" else ".png"
+            if decision is ReviewDecision.ACCEPTED:
+                image_ranks[folder] = image_ranks.get(folder, 0) + 1
+                target = image_root / folder / f"{folder}.{image_ranks[folder]:02d}{extension}"
+                selected_count += 1
+            else:
+                pending_ranks[folder] = pending_ranks.get(folder, 0) + 1
+                target = image_root / folder / "未候选" / f"{folder}.u{pending_ranks[folder]:02d}{extension}"
+                pending_count += 1
             target.parent.mkdir(parents=True, exist_ok=True)
             target = self._unique_target(target, source)
-            if target.resolve() != source.resolve():
-                shutil.copyfile(source, target)
-            files.append(target.relative_to(final_root).as_posix())
+            target.write_bytes(data)
+            files.append((Path("images") / target.relative_to(image_root)).as_posix())
 
         reserved: dict[str, set[str]] = {}
         for candidate in self.videos:
@@ -682,16 +923,17 @@ class ReviewSession:
             target = target_dir / name
             if target.resolve() != source.resolve():
                 shutil.copyfile(source, target)
-            files.append(target.relative_to(final_root).as_posix())
+            files.append((Path("images") / target.relative_to(image_root)).as_posix())
+            video_count += 1
 
         manifest = {
             "schema_version": 1,
             "issue_id": self._issue_id(),
             "files": files,
-            "image_count": sum(1 for value in files if not value.casefold().endswith((".mp4", ".webm", ".mov", ".mkv", ".avi"))),
-            "video_count": sum(1 for value in files if value.casefold().endswith((".mp4", ".webm", ".mov", ".mkv", ".avi"))),
+            "image_count": selected_count,
+            "pending_image_count": pending_count,
+            "video_count": video_count,
         }
-        self._atomic_json(final_root / "final_manifest.json", manifest)
         return manifest
 
     def _issue_id(self) -> str:
@@ -703,7 +945,7 @@ class ReviewSession:
 
     @staticmethod
     def _media_extension(candidate: ImageCandidate | VideoCandidate, source: Path, *, default: str) -> str:
-        mime_type = getattr(candidate, "mime_type", None)
+        mime_type = getattr(candidate, "output_mime_type", None) or getattr(candidate, "mime_type", None)
         if isinstance(mime_type, str) and "/" in mime_type:
             suffix = mime_type.split("/", 1)[1].split(";", 1)[0].strip().casefold()
             if suffix == "jpeg":
@@ -721,16 +963,4 @@ class ReviewSession:
 
     @staticmethod
     def _atomic_json(path: Path, payload: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-            os.replace(temp_name, path)
-        except Exception:
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-            raise
+        atomic_json_write(path, payload, ensure_parent=True)

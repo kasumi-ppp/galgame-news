@@ -21,6 +21,10 @@ class ImageAllocator:
         self.type_limits = dict(type_limits) if type_limits is not None else None
 
     def _type_limit(self, candidate: ImageCandidate) -> int | None:
+        if candidate.signals.get("x_api_photo") is True or candidate.signals.get("socialdata_photo") is True:
+            return None
+        if candidate.signals.get("localization_qualified") is True and candidate.image_type is ImageType.GAMEPLAY_SCREENSHOT:
+            return self.per_news_max
         if candidate.image_type is ImageType.UNKNOWN and self.max_unknown_per_news is not None:
             return self.max_unknown_per_news
         if self.type_limits is None:
@@ -40,7 +44,17 @@ class ImageAllocator:
                 continue
             if candidate.score is None or candidate.score.total >= self.minimum_score:
                 groups[candidate.news_id].append(candidate)
-        for group in groups.values(): group.sort(key=lambda c: (-(c.score.total if c.score else 0), c.id or ""))
+        for group in groups.values(): group.sort(key=lambda c: (
+            not (c.signals.get("x_api_photo") is True or c.signals.get("socialdata_photo") is True),
+            -int(c.signals.get("localization_rank_priority", 0)),
+            # Keep the existing score/trust/resolution order for all other
+            # types, while ensuring a suitable CG beats background art.
+            c.image_type is ImageType.BACKGROUND_ART,
+            -(c.score.total if c.score else 0),
+            -(c.score.source_trust if c.score else 0),
+            -((c.width or 0) * (c.height or 0)),
+            c.id or "",
+        ))
         for news_id, group in list(groups.items()):
             preferred = [candidate for candidate in group if candidate.signals.get("fallback_only") is not True]
             if preferred:

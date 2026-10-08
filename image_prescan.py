@@ -1,24 +1,21 @@
-"""Backward-compatible entry point for the legacy image prescan script.
+"""Retired compatibility entry point for the former image prescan tool."""
 
-The maintained implementation lives in ``src/galgame_news``.  This module
-keeps the historical imports and command invocation working while the old
-single-file implementation is archived under ``legacy/``.
-"""
+from __future__ import annotations
 
-from legacy import image_prescan_legacy as _legacy
+import sys
 
-# Preserve the historical module surface, including private helpers that
-# existing tests and integrations may patch.
-globals().update(
-    {
-        name: value
-        for name, value in vars(_legacy).items()
-        if name not in {"__name__", "__package__", "__loader__", "__spec__"}
-    }
-)
+
+USAGE = "python -m galgame_news run INPUT.docx --issue ISSUE --output output/ISSUE"
+
+
+def main(_argv: list[str] | None = None) -> int:
+    print(
+        "image_prescan.py is retired. Use the maintained toolbox entry point:\n"
+        f"  {USAGE}",
+        file=sys.stderr,
+    )
+    return 2
 
 
 if __name__ == "__main__":
-    from legacy.image_prescan_legacy import main
-
-    main()
+    raise SystemExit(main(sys.argv[1:]))

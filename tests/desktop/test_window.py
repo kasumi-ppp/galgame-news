@@ -16,11 +16,11 @@ def test_main_window_has_five_pages_and_switches_navigation(qtbot, tmp_path: Pat
     assert window.nav_list is window.navigation
     assert window.stacked_widget is window.pages
     assert [window.navigation.item(i).text() for i in range(5)] == [
-        "New Task",
-        "Progress",
-        "Review",
-        "History",
-        "Settings",
+        "新建任务",
+        "抓取进度",
+        "图片审核",
+        "历史任务",
+        "设置",
     ]
     window.navigation.setCurrentRow(2)
     assert window.pages.currentWidget() is window.review_page

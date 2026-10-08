@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtWidgets import QApplication
+
 from galgame_news.desktop.settings_page import SettingsPage
 from galgame_news.desktop.thumbnail_cache import ThumbnailCache
 from galgame_news.settings import AppSettings, InMemoryCredentialBackend, CredentialStore, SettingsStore
@@ -24,13 +26,17 @@ def test_thumbnail_cache_is_lazy_and_bounded(tmp_path: Path):
     assert cache.contains("a") is False
 
 
-def test_settings_page_persists_theme_and_credential(tmp_path: Path, qtbot):
+def test_settings_page_persists_theme_and_credential(tmp_path: Path):
+    app = QApplication.instance() or QApplication([])
     store = SettingsStore(app_data=tmp_path / "app")
     credentials = CredentialStore(InMemoryCredentialBackend())
     page = SettingsPage(settings_store=store, credential_store=credentials)
-    qtbot.addWidget(page)
-    page.theme_combo.setCurrentText("Dark")
+    page.theme_combo.setCurrentIndex(page.theme_combo.findData("dark"))
     page.brave_edit.setText("secret")
+    page.socialdata_edit.setText("socialdata-secret")
     page.save()
     assert store.load().theme == "dark"
     assert credentials.get("brave_api_key") == "secret"
+    assert credentials.get("socialdata_api_key") == "socialdata-secret"
+    page.close()
+    app.processEvents()

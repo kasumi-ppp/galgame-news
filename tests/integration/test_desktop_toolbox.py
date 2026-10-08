@@ -466,7 +466,8 @@ def _write_251_fixture(root: Path) -> Path:
     news_items = []
     for news_id, sequence, section, prefix in news:
         source = root / f"{prefix}-source.jpg"
-        source.write_bytes(prefix.encode("ascii"))
+        # Imported legacy files must still be valid, decodable originals.
+        Image.new("RGB", (800, 600), "red").save(source, format="JPEG")
         candidate = ImageCandidate(
             news_id=news_id,
             image_url=f"https://cdn.example/{prefix}.jpg",
@@ -531,9 +532,9 @@ def test_import_251_style_fixture_is_read_only_and_exports_xhz_names(qtbot, tmp_
         assert session is not None
         manifest = session.export_final()
         assert set(manifest["files"]) == {
-            "images/x1/x1.01.jpg",
-            "images/h1/h1.01.jpg",
-            "images/z1/z1.01.jpg",
+            "images/x1/x1.01.png",
+            "images/h1/h1.01.png",
+            "images/z1/z1.01.png",
         }
         assert record.imported is True
         after = {
@@ -542,7 +543,9 @@ def test_import_251_style_fixture_is_read_only_and_exports_xhz_names(qtbot, tmp_
             if path.is_file()
         }
         assert after == before
-        assert (record.root_path / "final" / "images" / "x1" / "x1.01.jpg").read_bytes() == b"x1"
+        assert session.task_root.parent == fixture.parent
+        with Image.open(session.task_root / "final" / "images" / "x1" / "x1.01.png") as image:
+            assert image.format == "PNG" and image.size == (800, 600)
     finally:
         controller.close()
         store.close()
