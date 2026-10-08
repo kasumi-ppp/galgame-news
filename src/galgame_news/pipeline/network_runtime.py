@@ -28,6 +28,9 @@ class SyncHttpBridge:
     def get(self, url, *, cookies=None):
         return self.runtime.submit(self.client.get(url, cookies=cookies))
 
+    def post_json(self, url, payload):
+        return self.runtime.submit(self.client.post_json(url, payload))
+
     def validate_url(self, url):
         self.client.validate_url(url)
 
@@ -92,6 +95,9 @@ class TaskNetworkRuntime:
         return await self._timed("resolve", resolve_async(resolver, news, self.page_client, self.call_sync))
 
     async def collect_many(self, news, sources, request):
+        if not getattr(self.runner, "_localization_service", None):
+            from ..localization.service import LocalizationImageService
+            self.runner._localization_service = LocalizationImageService(self.page_bridge)
         async def collect(source):
             try:
                 return await self.call_sync(lambda: self.runner._collect(news, source, request=request))
@@ -100,6 +106,12 @@ class TaskNetworkRuntime:
             except Exception as exc:
                 return exc
         results = await self._timed("collect", asyncio.gather(*(collect(source) for source in sources)))
+        from ..delivery.helpers import section_prefix, section_label
+        if section_prefix(section_label(news)) == "h":
+            for result in results:
+                if isinstance(result, Exception):
+                    continue
+                self.runner._bind_localization_context(news, result.candidates)
         if self.runner.adapter_factory is not None or request.offline:
             return results
         # Merge on the coordinator in source order. Rendering never starts

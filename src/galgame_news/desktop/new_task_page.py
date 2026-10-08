@@ -53,6 +53,7 @@ class NewTaskPage(QWidget):
 
         self.offline_checkbox = QCheckBox("离线模式：仅使用本地及已索引的来源")
         self.no_videos_checkbox = QCheckBox("跳过视频，仅抓取图片")
+        self.no_videos_checkbox.setChecked(True)
         self.socialdata_checkbox = QCheckBox("本次任务使用 SocialData 获取 X 媒体")
         self.socialdata_checkbox.setToolTip("默认关闭；启用后按帖子查询，密钥从凭据库读取。")
         self.socialdata_checkbox.setObjectName("useSocialDataXCheckbox")
@@ -101,7 +102,7 @@ class NewTaskPage(QWidget):
         options_layout.addWidget(self.no_videos_checkbox)
         options_layout.addWidget(self.offline_checkbox)
         options_layout.addWidget(self.socialdata_checkbox)
-        notice = QLabel("X 图片保持最高优先级 · 原帖与原图链接保留在输出索引中")
+        notice = QLabel("任务完成后保留完整输出：raw、索引、检查点、缓存、审核状态与 final 图片交付，便于审核和恢复。")
         notice.setObjectName("muted")
         notice.setWordWrap(True)
         options_layout.addWidget(notice)

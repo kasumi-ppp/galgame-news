@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import filecmp
 import json
 import re
 import shutil
@@ -28,7 +29,8 @@ from ..domain import (
 )
 from ..delivery.helpers import atomic_json_write, atomic_replace, item_names as canonical_item_names, safe_title
 from ..delivery.image_conversion import ImageConversionError, ImageConverter
-from ..delivery.asset_paths import recover_asset_path
+from ..delivery.asset_paths import recover_asset_path, resolve_review_index_root
+from ..curation.review_filter import reviewable_pending_images
 
 
 class ReviewDecision(str, Enum):
@@ -170,9 +172,7 @@ class ReviewSession:
         state_path: Path | str | None = None,
         task_root: Path | str | None = None,
     ) -> "ReviewSession":
-        root = Path(output_dir).expanduser()
-        if root.is_file():
-            root = root.parent
+        root = resolve_review_index_root(output_dir)
         managed_root = Path(task_root).expanduser() if task_root is not None else None
         if state_path is not None:
             state = Path(state_path).expanduser()
@@ -185,6 +185,8 @@ class ReviewSession:
 
         image_payload = _read_json(root / "image_index.json", {})
         video_payload = _read_json(root / "video_index.json", {})
+        if not image_payload and not video_payload:
+            raise ValueError("审核索引为空或无法读取，请重新选择有效的任务结果目录。")
         review_payload = _read_json(root / "review_required.json", [])
         failed_payload = _read_json(root / "failed_items.json", [])
         image_items = _items(image_payload, ("candidates", "images", "image_candidates"))
@@ -560,7 +562,9 @@ class ReviewSession:
         values = [candidate for candidate in self.images if self.decision(str(candidate.id)) is ReviewDecision.PENDING]
         if news_id is not None:
             values = [candidate for candidate in values if candidate.news_id == news_id]
-        return self._sorted_pending(values)
+        return self._sorted_pending(reviewable_pending_images(
+            values, accepted=self.accepted_images(news_id)
+        ))
 
     def failed_images(self, news_id: str | None = None) -> list[ImageCandidate]:
         values = [candidate for candidate in self.pending_images(news_id) if str(candidate.id) in self._failed_ids or bool(candidate.review_reasons)]
@@ -755,7 +759,14 @@ class ReviewSession:
         try:
             manifest = self._export_images_and_videos(image_root)
             if published.exists():
-                atomic_replace(published, backup)
+                try:
+                    atomic_replace(published, backup)
+                except PermissionError:
+                    # Explorer/preview readers can lock the directory even
+                    # when individual files can still be replaced safely.
+                    self._publish_files_in_place(image_root, published, backup, owned, manifest)
+                    committed = True
+                    return manifest
             try:
                 atomic_replace(image_root, published)
                 self._atomic_json(final_root / "final_manifest.json", manifest)
@@ -775,6 +786,88 @@ class ReviewSession:
             for temporary in cleanup:
                 if temporary.exists() and not temporary.is_symlink() and temporary.resolve().is_relative_to(final_root.resolve()):
                     shutil.rmtree(temporary, ignore_errors=True)
+
+    def _publish_files_in_place(
+        self, staged: Path, published: Path, backup: Path,
+        owned: set[str], manifest: dict[str, Any],
+    ) -> None:
+        """Replace files transactionally without renaming the open directory."""
+        backup.mkdir()
+        manifest_path = published.parent / "final_manifest.json"
+        had_manifest = manifest_path.is_file()
+        if had_manifest:
+            shutil.copyfile(manifest_path, backup / "final_manifest.json")
+        updates = {path.relative_to(staged): path for path in staged.rglob("*") if path.is_file()}
+        obsolete: set[Path] = set()
+        for value in owned:
+            path = Path(value)
+            if path.is_absolute() or path.drive or ".." in path.parts or not path.parts or path.parts[0] != "images":
+                raise ValueError("旧导出清单包含不安全的图片路径")
+            relative = Path(*path.parts[1:])
+            if relative.parts and relative not in updates:
+                obsolete.add(relative)
+        changed: list[tuple[Path, bool]] = []
+        try:
+            for relative in sorted(set(updates) | obsolete, key=lambda value: value.as_posix()):
+                target = published / relative
+                # Do not traverse links/junctions or touch files outside this task.
+                if not target.resolve().is_relative_to(published.resolve()):
+                    raise ValueError("图片导出路径超出当前任务")
+                for part in (target, *target.parents):
+                    if part == published.parent:
+                        break
+                    if part.is_symlink() or getattr(part, "is_junction", lambda: False)():
+                        raise ValueError("图片导出路径不能包含链接或目录联接")
+                source = updates.get(relative)
+                existed = target.is_file()
+                if source is not None and existed and filecmp.cmp(source, target, shallow=False):
+                    continue
+                if target.exists() and not existed:
+                    raise ValueError(f"图片文件位置被目录占用：{target}")
+                if existed:
+                    saved = backup / "files" / relative
+                    saved.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(target, saved)
+                if source is None:
+                    if existed:
+                        target.unlink()
+                        changed.append((relative, existed))
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_replace(source, target)
+                    changed.append((relative, existed))
+            self._atomic_json(manifest_path, manifest)
+        except Exception as error:
+            rollback_errors: list[str] = []
+            for relative, existed in reversed(changed):
+                target = published / relative
+                try:
+                    if existed:
+                        restore = backup / f".restore-{uuid.uuid4().hex}"
+                        shutil.copyfile(backup / "files" / relative, restore)
+                        atomic_replace(restore, target)
+                    elif target.exists():
+                        target.unlink()
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            try:
+                if had_manifest:
+                    saved_manifest = backup / "final_manifest.json"
+                    if not manifest_path.is_file() or not filecmp.cmp(saved_manifest, manifest_path, shallow=False):
+                        restore = backup / f".manifest-restore-{uuid.uuid4().hex}"
+                        shutil.copyfile(saved_manifest, restore)
+                        atomic_replace(restore, manifest_path)
+                elif manifest_path.exists():
+                    manifest_path.unlink()
+            except OSError as rollback_error:
+                rollback_errors.append(str(rollback_error))
+            if rollback_errors:
+                raise RuntimeError(f"导出失败且部分文件无法回滚，恢复备份已保留：{backup}；请关闭占用图片的程序后重试。") from error
+            # Old files are restored; the enclosing cleanup can remove staging.
+            shutil.rmtree(backup, ignore_errors=True)
+            if isinstance(error, PermissionError):
+                raise PermissionError("图片文件被占用或无写入权限。原有图片已恢复，请关闭预览/图片编辑程序后重试导出。") from error
+            raise
 
     def _export_images_and_videos(self, image_root: Path) -> dict[str, Any]:
         folder_names = self._folder_names()

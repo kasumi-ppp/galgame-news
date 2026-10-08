@@ -33,6 +33,7 @@ class ReviewPage(QWidget):
         self._news: dict[str, dict[str, Any]] = {}
         self._row_paths = {}
         self._icon_rows: set[int] = set()
+        self._refresh_generation = 0
         self._current_pixmap = QPixmap()
         self._preview_key = ""
         self._retry_context: tuple[int, str] | None = None
@@ -223,6 +224,10 @@ class ReviewPage(QWidget):
         self.cache.clear()
         self.zoom_factor = 1.0
         self.export_status.clear()
+        if session is not None:
+            self.export_status.setText(
+                f"来源目录：{session.output_dir}\n导出目录：{session.task_root / 'final' / 'images'}"
+            )
         self.operation_status.clear()
         self.export_button.setEnabled(session is not None and self.exporter.session is None)
         self.open_images_button.setEnabled(session is not None)
@@ -280,8 +285,38 @@ class ReviewPage(QWidget):
             badges.append("失败")
         return badges
 
-    def refresh(self) -> None:
+    @staticmethod
+    def _localization_summary(candidate: Any) -> str | None:
+        provenance = getattr(candidate, "localization_provenance", None)
+        signals = getattr(candidate, "signals", {}) or {}
+
+        def field(name: str) -> str:
+            value = getattr(provenance, name, None) if provenance is not None else None
+            if value in (None, ""):
+                value = signals.get(f"localization_{name}", "")
+            return str(value or "")
+
+        source = field("source").casefold()
+        work_id = field("work_id")
+        if not source and not work_id:
+            return None
+        source_label = {"steam": "Steam", "vndb": "VNDB"}.get(source, source or "未知来源")
+        binding_label = {"confirmed": "当前作品", "reference": "关联参考"}.get(field("binding").casefold(), "待确认")
+        resolution_label = {"full": "原图", "thumbnail": "缩略图"}.get(field("resolution").casefold(), "尺寸待确认")
+        parts = [f"汉化来源：{source_label}"]
+        if work_id:
+            parts.append(f"作品 ID {work_id}")
+        parts.extend((binding_label, resolution_label))
+        return " · ".join(parts)
+
+    def refresh(self, preserve_scroll: bool = False) -> None:
+        self._refresh_generation += 1
+        refresh_generation = self._refresh_generation
+        session = self.session
+        view = (id(session), self._news_filter(), self.tabs.currentIndex())
+        scroll_value = self.media_list.verticalScrollBar().value() if preserve_scroll else 0
         previous = str(self._selected().id) if self._selected() else ""
+        previous_row = self.media_list.currentRow()
         self.images.invalidate()
         self._preview_key = ""
         self.media_list.blockSignals(True)
@@ -289,7 +324,7 @@ class ReviewPage(QWidget):
         self._items = self._visible_candidates()
         self._row_paths = {}
         self._icon_rows.clear()
-        current = 0
+        current = min(max(previous_row, 0), max(0, len(self._items) - 1)) if preserve_scroll else 0
         for row, candidate in enumerate(self._items):
             title = self._title(candidate)
             kind = "视频" if getattr(candidate, "video_url", None) else image_type_label(getattr(candidate, "image_type", None))
@@ -313,6 +348,15 @@ class ReviewPage(QWidget):
         else:
             self._clear_details()
         self._schedule_thumbnails()
+        if preserve_scroll:
+            def restore_scroll() -> None:
+                if (refresh_generation != self._refresh_generation or self.session is not session
+                        or view != (id(self.session), self._news_filter(), self.tabs.currentIndex())):
+                    return
+                bar = self.media_list.verticalScrollBar()
+                bar.setValue(min(scroll_value, bar.maximum()))
+
+            QTimer.singleShot(0, restore_scroll)
 
     def _selected(self) -> Any | None:
         row = self.media_list.currentRow()
@@ -358,9 +402,11 @@ class ReviewPage(QWidget):
         reason_text = "；".join(dict.fromkeys(reason_label(value) for value in reasons)) or "暂无额外复核原因"
         kind = "视频" if is_video else image_type_label(getattr(candidate, "image_type", None))
         decision = status_label(self.session.decision(str(candidate.id))) if self.session else ""
+        localization_summary = self._localization_summary(candidate)
         self.metadata.setText(f"{self._title(candidate)[:180]}\n{kind} · {decision} · {getattr(candidate, 'width', None) or '—'} × {getattr(candidate, 'height', None) or '—'}"
                               + (f" · 评分 {score:.1f}" if score is not None else "")
                               + (f"\n{' · '.join(self._badges(candidate))}" if self._badges(candidate) else "")
+                              + (f"\n{localization_summary}" if localization_summary else "")
                               + f"\n复核依据：{reason_text}")
         payload = candidate.model_dump(mode="json") if hasattr(candidate, "model_dump") else {"id": str(candidate.id)}
         payload["resolved_local_path"] = str(path) if path else None
@@ -480,7 +526,7 @@ class ReviewPage(QWidget):
         for candidate in self._selected_items():
             self.session.set_decision(str(candidate.id), decision)
             self.decision_changed.emit(str(candidate.id), decision.value)
-        self.refresh()
+        self.refresh(preserve_scroll=True)
 
     def _selected_items(self) -> list[Any]:
         rows = sorted({index.row() for index in self.media_list.selectedIndexes()})
@@ -590,8 +636,9 @@ class ReviewPage(QWidget):
             pending = int(manifest.get("pending_image_count", 0))
             detail = f"；另有 {skipped} 项已选媒体未导出，请检查本地文件" if skipped else ""
             self.export_status.setText(
-                f"已选 {manifest.get('image_count', 0)} 张图片、{manifest.get('video_count', 0)} 个视频；"
-                f"未候选备选 {pending} 张 · 图片目录：{session.task_root / 'final' / 'images'}{detail}"
+                f"已导出 {manifest.get('image_count', 0)} 张图片、{manifest.get('video_count', 0)} 个视频；"
+                f"未候选备选 {pending} 张{detail}\n来源目录：{session.output_dir}"
+                f"\n导出目录：{session.task_root / 'final' / 'images'}"
             )
             self.raw_details.setPlainText(json.dumps(manifest, ensure_ascii=False, indent=2))
         else:
@@ -610,7 +657,11 @@ class ReviewPage(QWidget):
         if self.session is None:
             return
         root = self.session.task_root
-        candidates = (root / "final" / "images", self.session.output_dir / "images", root / "raw" / "images", root)
+        source = self.session.output_dir
+        candidates = []
+        if source.name.casefold() == "raw":
+            candidates.append(source.parent / "final" / "images")
+        candidates.extend((source / "images", root / "final" / "images", root / "raw" / "images", source))
         target = next((path for path in candidates if path.is_dir()), root)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 

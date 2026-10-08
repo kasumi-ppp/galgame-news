@@ -10,6 +10,22 @@ from typing import Any
 from pydantic import BaseModel
 
 
+def resolve_review_index_root(value: Path | str) -> Path:
+    """Resolve only documented task layouts; never search other tasks."""
+    root = Path(value).expanduser().resolve()
+    if root.is_file():
+        root = root.parent
+    candidates = [root, root / "raw"]
+    if root.name.casefold() == "images" and root.parent.name.casefold() in {"raw", "final"}:
+        candidates.append(root.parent.parent / "raw")
+    elif root.name.casefold() == "final":
+        candidates.append(root.parent / "raw")
+    for candidate in candidates:
+        if any((candidate / name).is_file() for name in ("image_index.json", "video_index.json")):
+            return candidate
+    raise ValueError("此目录没有图片审核索引。请选择任务结果目录或其中的 raw 目录；仅保留 final/images 的结果请直接打开图片文件夹人工选择。")
+
+
 def rebase_asset_paths(value: Any, old_root: Path, new_root: Path) -> Any:
     """Rebase recorded paths under old_root, retaining relative manifest entries.
 

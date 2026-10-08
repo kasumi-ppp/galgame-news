@@ -90,6 +90,7 @@ def test_controller_persists_real_task_dir_and_resume_uses_it(qtbot, tmp_path: P
     assert completed_record is not None
     assert Path(completed_record.task_root) == real_task
     assert controller.task_store.load_request_options(completed_record)["selected_sections"] == ["x", "z"]
+    assert requests[0].images_only is False
 
     assert controller.resume_task(completed_record) is True
     qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
@@ -140,13 +141,25 @@ def test_controller_old_request_options_resume_with_all_sections(qtbot, tmp_path
     )
     qtbot.addWidget(controller.progress_page)
     record = controller.task_store.create_task("issue", input_path, task_root=task_dir)
-    controller.task_store.save_request_options(record, {"offline": True})
+    controller.task_store.save_request_options(record, {"offline": True, "images_only": True})
 
     assert controller.resume_task(record) is True
     qtbot.waitUntil(lambda: not controller.is_running, timeout=2000)
 
     assert requests[0].resume is True
     assert requests[0].selected_sections == ["x", "h", "z"]
+    assert requests[0].images_only is False
+
+
+def test_task_request_legacy_images_only_flag_is_read_but_ignored(tmp_path: Path):
+    request = TaskRequest(
+        input_path=tmp_path / "issue.docx",
+        issue_id="issue",
+        output_dir=tmp_path / "output",
+        images_only=True,
+    )
+
+    assert request.images_only is False
 
 
 def test_controller_allows_only_one_running_task(qtbot, tmp_path: Path):

@@ -198,6 +198,7 @@ def test_ui_retry_factory_error_emits_existing_failure_and_raw_detail(qtbot, tmp
     qtbot.addWidget(controller.review_page)
     output = tmp_path / "output"
     output.mkdir()
+    (output / "image_index.json").write_text('{"candidates": []}', encoding="utf-8")
     controller.review_record = controller.task_store.create_task("226", tmp_path / "226.docx")
     controller.review_page.set_session(ReviewSession.from_output(output))
     controller.review_page.retry_url_edit.setText("https://official.test/news")

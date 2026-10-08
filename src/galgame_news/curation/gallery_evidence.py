@@ -9,6 +9,7 @@ from .dedup import _confirmed_visual_duplicate
 
 
 DERIVED_SIGNALS = frozenset({
+    "localization_qualified", "localization_rank_priority",
     "image_type_supporting_signals", "type_match", "auto_select", "fallback_only",
     "entity_match", "entity_match_confidence", "entity_match_evidence", "entity_conflict",
     "official_domain_match", "source_tier", "source_is_official", "source_linked",

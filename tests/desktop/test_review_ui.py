@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QAbstractItemView
 from galgame_news.desktop.async_images import AsyncImages, ImageRequest, _Decode
 from galgame_news.desktop.review_page import ReviewPage
 from galgame_news.domain import ReviewReason, SourceType
+from galgame_news.desktop.i18n import reason_label
 from galgame_news.review import ReviewDecision, ReviewSession
 
 
@@ -35,7 +36,7 @@ def test_chinese_grid_and_news_filter_keep_tab_mapping(qtbot, tmp_path):
     qtbot.addWidget(page)
     page.set_session(session)
     assert page.splitter.count() == 3
-    assert [page.tabs.tabText(index) for index in range(4)] == ["已选", "待复核", "已排除", "视频"]
+    assert [page.tabs.tabText(index) for index in range(4)] == ["已选", "未候选／待复核", "已排除", "视频"]
     assert page.media_list.viewMode() is page.media_list.ViewMode.IconMode
     assert page.media_list.selectionMode() is QAbstractItemView.SelectionMode.ExtendedSelection
     assert page.media_list.count() == 3
@@ -307,7 +308,8 @@ def test_export_result_from_previous_session_is_not_shown(qtbot, tmp_path):
     page.export_final()
     page.set_session(second)
     qtbot.waitUntil(lambda: page.exporter.session is None)
-    assert page.export_status.text() == ""
+    assert str(second.output_dir) in page.export_status.text()
+    assert str(first.output_dir) not in page.export_status.text()
     assert page.export_button.isEnabled()
     assert str(first.output_dir) not in page.raw_details.toPlainText()
 
@@ -329,6 +331,24 @@ def test_long_title_and_all_risk_badges_do_not_show_raw_codes(qtbot, tmp_path):
     assert len(page.media_list.item(0).text()) < 100
     assert "uncertain_match" in page.raw_details.toPlainText()
     assert page.source_button.text() == "打开来源"
+
+
+def test_localization_provenance_uses_chinese_labels(qtbot, tmp_path):
+    session = session_at(tmp_path / "output", 1)
+    session.images[0].signals.update({
+        "localization_source": "steam", "localization_work_id": "3419820",
+        "localization_binding": "reference", "localization_resolution": "thumbnail",
+    })
+    page = ReviewPage()
+    qtbot.addWidget(page)
+    page.set_session(session)
+    assert "汉化来源：Steam" in page.metadata.text()
+    assert "作品 ID 3419820" in page.metadata.text()
+    assert "关联参考" in page.metadata.text()
+    assert "缩略图" in page.metadata.text()
+    assert reason_label("localization_manual_review_required") == "保留此图供人工复核，不自动入选"
+    assert reason_label("localization_binding_conflict") == "作品绑定存在冲突"
+    assert reason_label("localization_full_native_screenshot") == "已确认当前作品的原图游戏截图"
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])

@@ -5,6 +5,7 @@ local binaries.  This file never downloads or vendors FFmpeg.
 """
 
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 
 SPEC_ROOT = Path(SPECPATH).resolve()
@@ -59,8 +60,8 @@ a = Analysis(
     [str(SPEC_ROOT / "desktop_entry.py")],
     pathex=[str(SRC_ROOT)],
     binaries=[],
-    datas=_data_files(),
-    hiddenimports=[],
+    datas=_data_files() + collect_data_files("playwright"),
+    hiddenimports=collect_submodules("keyring.backends") + ["playwright.sync_api", "playwright.async_api"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

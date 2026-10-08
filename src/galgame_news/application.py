@@ -14,6 +14,7 @@ from .domain import PipelineResult, ReviewReason, SourceType
 from .ingestion import DocxDocumentParser, OpenAINewsAnalyzer, RuleBasedNewsAnalyzer
 from .delivery.history import SQLiteHistoryStore
 from .pipeline import CancellationToken, PipelineRunner, TaskRequest
+from .delivery.helpers import section_prefix, section_label
 
 
 class Application:
@@ -40,6 +41,9 @@ class Application:
 
     def run(self, input_path: Path | str, *, issue_id: str, output_dir: Path | str) -> PipelineResult:
         def adapter_factory(news, source, config):
+            host = (urlsplit(source.url).hostname or "").casefold()
+            if section_prefix(section_label(news)) == "h" and host in {"vndb.org", "www.vndb.org", "store.steampowered.com"}:
+                return runner._localization_service
             path = urlsplit(source.url).path.casefold()
             if source.source_type is SourceType.VIDEO:
                 return VideoAdapter()

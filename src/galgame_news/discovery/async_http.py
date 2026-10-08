@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import inspect
+import json
 from pathlib import Path
 import re
 import time
@@ -24,6 +25,9 @@ class AsyncHttpResponse:
     headers: Mapping[str, str]
     url: str
     encoding: str | None = None
+
+    def json(self) -> Any:
+        return json.loads(self.text)
 
     @property
     def text(self) -> str:
@@ -199,6 +203,21 @@ class AsyncHttpClient:
             target.unlink(missing_ok=True)
             raise
 
+    async def post_json(self, url: str, payload: dict) -> AsyncHttpResponse:
+        """Public VNDB queries use the same limits, proxy and cancellation gates.
+
+        POST redirects are refused so query bodies never leave the API origin.
+        Retries/rate limiting belong to the task's VNDB query coordinator.
+        """
+        if urlsplit(url).hostname != "api.vndb.org" or not url.startswith("https://api.vndb.org/kana/"):
+            raise UnsafeUrlError("unsupported public JSON API endpoint")
+        await self._validate_url(url)
+        response = await self._fetch(url, {"user-agent": self.user_agent, "content-type": "application/json"},
+                                     self.max_response_bytes, None, method="POST", payload=payload)
+        if 300 <= response.status_code < 400:
+            raise UnsafeUrlError("public JSON API redirect refused")
+        return response
+
     async def _request(self, url: str, cookies: dict[str, str], cap: int, target: Path | None, *, max_retries: int | None = None) -> AsyncHttpResponse:
         current = url
         original_host = urlsplit(url).hostname
@@ -246,7 +265,7 @@ class AsyncHttpClient:
             return response
         raise UnsafeUrlError("too many HTTP redirects")
 
-    async def _fetch(self, url: str, headers: dict[str, str], cap: int, target: Path | None) -> AsyncHttpResponse:
+    async def _fetch(self, url: str, headers: dict[str, str], cap: int, target: Path | None, *, method: str = "GET", payload: dict | None = None) -> AsyncHttpResponse:
         host = urlsplit(url).hostname or ""
         host_semaphore = self._hosts.setdefault(host, asyncio.Semaphore(self._host_limit))
         await self._acquire(host_semaphore)
@@ -256,16 +275,20 @@ class AsyncHttpClient:
                 await self._gate()
                 self._network_requests += 1
                 if self.transport is not None:
+                    request_options = {"timeout": self.timeout, "headers": headers}
+                    if method != "GET":
+                        request_options.update(method=method, json=payload)
                     if inspect.iscoroutinefunction(self.transport) or inspect.iscoroutinefunction(getattr(self.transport, "__call__", None)):
-                        raw = await self._wait(self.transport(url, timeout=self.timeout, headers=headers), timeout=self.timeout)
+                        raw = await self._wait(self.transport(url, **request_options), timeout=self.timeout)
                     else:
                         loop = asyncio.get_running_loop()
-                        raw = await self._wait(loop.run_in_executor(self._executor, lambda: self.transport(url, timeout=self.timeout, headers=headers)), timeout=self.timeout)
+                        raw = await self._wait(loop.run_in_executor(self._executor, lambda: self.transport(url, **request_options)), timeout=self.timeout)
                     return await self._from_injected(raw, url, cap, target)
                 if self._client is None:
                     self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, trust_env=self.trust_env)
                     self._client._cookies = _NoCookieJar()
-                context = self._client.stream("GET", url, headers=headers, follow_redirects=False)
+                context = self._client.stream(method, url, headers=headers, follow_redirects=False,
+                                              **({"json": payload} if method != "GET" else {}))
                 raw = await self._wait(context.__aenter__(), timeout=self.timeout)
                 try:
                     return await self._from_stream(raw, url, cap, target)

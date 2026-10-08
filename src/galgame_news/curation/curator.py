@@ -13,6 +13,8 @@ from .gallery_evidence import inherit_gallery_evidence, reset_selection
 from .ranker import ImageRanker
 from .source_policy import SourceTrustPolicy
 from .visual_analysis import VisualAnalysisService, create_local_openclip_analyzer
+from ..delivery.helpers import section_prefix, section_label
+from ..localization.policy import LocalizationImagePolicy
 
 
 class ImageCurator:
@@ -103,6 +105,34 @@ class ImageCurator:
             priority_x_photo = False
             candidate.selection_reasons.clear()
             try:
+                host = (urlsplit(candidate.source_url).hostname or "").casefold()
+                localization_candidate = item is not None and section_prefix(section_label(item)) == "h" and (
+                    candidate.localization_provenance is not None
+                    or host in {"vndb.org", "www.vndb.org", "store.steampowered.com"}
+                ) and not x_api_photo
+                if localization_candidate:
+                    linked = self._source_linked(item, candidate)
+                    decision = LocalizationImagePolicy().evaluate(item, candidate, linked)
+                    candidate.image_type = decision.image_type
+                    candidate.image_type_confidence = decision.confidence
+                    candidate.selection_reasons.extend(decision.reasons)
+                    candidate.signals.update(
+                        auto_select=decision.auto_select,
+                        localization_qualified=decision.auto_select,
+                        localization_rank_priority=decision.rank_priority,
+                        source_linked=linked, source_officiality=0.85,
+                        entity_match=decision.entity_confirmed,
+                        entity_match_confidence=1.0 if decision.entity_confirmed else 0.0,
+                        game_match=1.0 if decision.entity_confirmed else 0.0,
+                        type_match=1.0 if decision.auto_select else 0.5,
+                    )
+                    if candidate.signals.get("invalid_reason"):
+                        candidate.curation_status = ImageCurationStatus.INVALID
+                        candidate.signals["auto_select"] = False
+                    if not candidate.signals["auto_select"] and ReviewReason.IMAGE_TYPE_REVIEW not in candidate.review_reasons:
+                        candidate.review_reasons.append(ReviewReason.IMAGE_TYPE_REVIEW)
+                    eligible.append(candidate)
+                    continue
                 if item is None:
                     typed = ImageTypeResult(ImageType.UNKNOWN, 0.0, ("news_not_found",))
                     decision = ImageTypeDecision(True, requires_review=True, auto_select=False, type_match=0.1)
@@ -282,6 +312,7 @@ class ImageCurator:
                 candidate.selected = False
         ranked = sorted(deduped.unique, key=lambda c: (
             not (c.signals.get("x_api_photo") is True or c.signals.get("socialdata_photo") is True),
+            -int(c.signals.get("localization_rank_priority", 0)),
             -(c.score.total if c.score else 0.0),
             -(c.score.source_trust if c.score else 0.0),
             -((c.width or 0) * (c.height or 0)),

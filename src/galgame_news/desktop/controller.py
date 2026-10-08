@@ -7,9 +7,11 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtWidgets import QMessageBox
 
 from ..pipeline import CancellationToken, PipelineRunner, ProgressEvent, TaskRequest
 from ..review import ReviewSession
+from ..delivery.asset_paths import resolve_review_index_root
 from ..settings import CredentialStore, InMemoryCredentialBackend, SettingsStore
 from ..tasks import TaskRecord, TaskStore
 from .history_page import HistoryPage
@@ -74,7 +76,7 @@ class DesktopController(QObject):
         self.history_page = HistoryPage(self.task_store)
         self.settings_page = SettingsPage(self.settings_store, self.credential_store)
         self.new_task_page.start_requested.connect(self._start_from_page)
-        self.new_task_page.import_requested.connect(self.import_output)
+        self.new_task_page.import_requested.connect(self._import_from_page)
         self.progress_page.pause_requested.connect(self.pause_task)
         self.progress_page.resume_requested.connect(self.resume_current_task)
         self.progress_page.stop_requested.connect(self.cancel_task)
@@ -125,6 +127,7 @@ class DesktopController(QObject):
         no_videos: bool = False,
         use_socialdata_x: bool = False,
         selected_sections: list[str] | None = None,
+        images_only: bool = False,
         resume: bool = False,
         task_dir: Path | str | None = None,
         task_id: str | None = None,
@@ -147,6 +150,7 @@ class DesktopController(QObject):
                 offline=offline,
                 no_videos=no_videos,
                 use_socialdata_x=use_socialdata_x,
+                images_only=images_only,
                 selected_sections=(
                     ["x", "h", "z"] if selected_sections is None else selected_sections
                 ),
@@ -198,7 +202,7 @@ class DesktopController(QObject):
             return self.resume_current_task()
         if not isinstance(record, TaskRecord) or self.is_running:
             return False
-        if record.input_path is None:
+        if record.input_path is None or record.images_only:
             return False
         input_path = Path(record.input_path)
         output_dir = Path(record.task_root).parent
@@ -211,6 +215,10 @@ class DesktopController(QObject):
             no_videos=bool(options.get("no_videos", False)),
             use_socialdata_x=bool(options.get("use_socialdata_x", False)),
             selected_sections=options.get("selected_sections", ["x", "h", "z"]),
+            # Older request_options.json files may contain images_only=true.
+            # The option is retained for reading compatibility but must never
+            # cause an existing task to discard its recovery data on resume.
+            images_only=False,
             config_path=options.get("config_path"),
             history_db=options.get("history_db"),
             max_images=options.get("max_images"),
@@ -225,6 +233,16 @@ class DesktopController(QObject):
     @Slot(object)
     def _on_event(self, event: object) -> None:
         if isinstance(event, ProgressEvent):
+            if event.kind == "task_workspace_ready" and self.current_record is not None and self.current_request is not None:
+                root = Path(event.payload.get("task_dir", ""))
+                if (event.task_id == self.current_record.task_id and root.is_absolute()
+                        and root.resolve().is_relative_to(self.current_request.output_dir.resolve())
+                        and root.is_dir()):
+                    updated = self.task_store.update_task_root(self.current_record, root, materialize=False)
+                    if updated is not None:
+                        self.current_record = updated
+                        if not updated.images_only:
+                            self._save_request_options(updated, self.current_request)
             self.progress_page.handle_event(event)
             self.progress_event.emit(event)
             self.progressEvent.emit(event)
@@ -234,6 +252,9 @@ class DesktopController(QObject):
         self.last_result = result
         self._bind_result_task_dir(result)
         self.progress_page.set_finished("Completed")
+        self.progress_page.log.appendPlainText(
+            "任务目录保留 raw、索引、检查点、缓存、审核状态和 final 图片交付。"
+        )
         self.new_task_page.set_busy(False)
         self.task_finished.emit(result)
         self.taskFinished.emit(result)
@@ -346,21 +367,43 @@ class DesktopController(QObject):
         self.load_review(record)
         return record
 
+    def _import_from_page(self, path: str) -> None:
+        try:
+            self.import_output(path)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self.new_task_page, "无法导入图片结果", str(exc))
+
     def load_review(self, record: object) -> ReviewSession | None:
         if not isinstance(record, TaskRecord):
             return None
         self.review_record = record
+        if record.images_only:
+            self.review_page.set_session(None)
+            self.review_record = None
+            self.progress_page.log.appendPlainText("此任务仅保留图片，请从历史任务打开图片目录人工选择；不支持审核或续跑。")
+            return None
         source = record.source_output_path
         if source is None:
             raw = record.root_path / "raw"
             source = raw if raw.is_dir() else record.root_path
         try:
+            source = resolve_review_index_root(source)
+            # Pipeline indexes live in raw; review export belongs to that
+            # same E:/... task, independently of the AppData catalog/state.
+            export_root = record.root_path
+            if source.name.casefold() == "raw":
+                export_root = source.parent
+            elif record.imported:
+                export_root = source.parent / f"{source.name}_审核结果"
             session = ReviewSession.from_output(
                 source,
-                task_root=record.root_path,
+                task_root=export_root,
                 state_path=record.review_state_path,
             )
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError) as exc:
+            self.review_page.set_session(None)
+            self.review_record = None
+            QMessageBox.warning(self.review_page, "无法打开图片审核", str(exc))
             return None
         self.review_page.set_session(session)
         self.review_loaded.emit(session)
@@ -372,13 +415,16 @@ class DesktopController(QObject):
         if record is None or task_dir is None:
             return
         try:
-            updated = self.task_store.update_task_root(record.task_id, Path(task_dir))
+            if getattr(result, "images_only", False):
+                updated = self.task_store.update_task_root(record.task_id, Path(task_dir), materialize=False)
+            else:
+                updated = self.task_store.update_task_root(record.task_id, Path(task_dir))
         except (OSError, TypeError, ValueError):
             return
         if updated is None:
             return
         self.current_record = updated
-        if self.current_request is not None:
+        if self.current_request is not None and not getattr(result, "images_only", False):
             self._save_request_options(updated, self.current_request)
         if self.review_record is not None and self.review_record.task_id == updated.task_id:
             self.review_record = updated
@@ -396,6 +442,7 @@ class DesktopController(QObject):
                 "no_videos": request.no_videos,
                 "use_socialdata_x": request.use_socialdata_x,
                 "selected_sections": list(request.selected_sections),
+                "images_only": request.images_only,
                 "config_path": str(request.config_path) if request.config_path else None,
                 "history_db": str(request.history_db) if request.history_db else None,
                 "max_images": request.max_images,

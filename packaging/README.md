@@ -25,6 +25,12 @@ If the target executable is in use, publication fails before copying files.
 After a successful Windows build, `00_启动工具箱.lnk` points to the bundle
 executable with the repository root as its working directory.
 
+Completed toolbox tasks retain their full task directory, including `raw/`,
+indexes, checkpoints, caches, review state, logs, and `final/` image delivery.
+The history page can therefore reopen review state or resume recoverable work.
+Older tasks that were already compacted remain image-only: missing internal
+data is not reconstructed from `final/images`.
+
 The spec keeps PySide6 as the only Qt binding and explicitly excludes PyQt5,
 PyQt6, PySide2, tkinter, test/notebook/documentation modules, and unused
 scientific stacks such as NumPy and Matplotlib. These packages are not imported
@@ -49,7 +55,9 @@ After building, run the executable from PowerShell:
 ```
 
 Confirm the five pages open, create a three-news offline fixture task, safely
-stop and resume it, open the review page, and export reviewed media. Also check
+stop and resume it, open the review page, and export reviewed media. Confirm
+the completed task retains its `raw/`, checkpoint, cache, review-state, and
+`final/` directories. Also check
 that Settings reports the bundled FFmpeg/ffprobe paths when `bin/ffmpeg.exe`
 and `bin/ffprobe.exe` were included.
 

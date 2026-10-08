@@ -153,9 +153,21 @@ class SafeHttpClient:
             return response
         raise UnsafeUrlError("too many HTTP redirects")
 
-    def _fetch(self, url: str, headers: dict[str, str]) -> Any:
+    def post_json(self, url: str, payload: dict) -> Any:
+        if urlsplit(url).hostname != "api.vndb.org" or not url.startswith("https://api.vndb.org/kana/"):
+            raise UnsafeUrlError("unsupported public JSON API endpoint")
+        self.validate_url(url)
+        response = self._fetch(url, {"user-agent": self.user_agent, "content-type": "application/json"}, method="POST", payload=payload)
+        if 300 <= int(response.status_code) < 400:
+            raise UnsafeUrlError("public JSON API redirect refused")
+        return response
+
+    def _fetch(self, url: str, headers: dict[str, str], *, method: str = "GET", payload: dict | None = None) -> Any:
         if self.transport is not None:
-            response = self.transport(url, timeout=self.timeout, headers=headers)
+            kwargs = {"timeout": self.timeout, "headers": headers}
+            if method != "GET":
+                kwargs.update(method=method, json=payload)
+            response = self.transport(url, **kwargs)
             self.validate_url(str(getattr(response, "url", url) or url))
             self._check_length(getattr(response, "headers", {}))
             content = getattr(response, "content", b"") or b""
@@ -167,8 +179,9 @@ class SafeHttpClient:
             return response
 
         with httpx.stream(
-            "GET", url, timeout=self.timeout, headers=headers,
+            method, url, timeout=self.timeout, headers=headers,
             follow_redirects=False, trust_env=self.trust_env,
+            **({"json": payload} if method != "GET" else {}),
         ) as response:
             self.validate_url(str(response.url))
             self._check_length(response.headers)

@@ -177,6 +177,23 @@ class IssueDraft(ContractModel):
     _published_at_aware = field_validator("published_at")(_aware)
 
 
+class LocalizationContext(ContractModel):
+    """Explicit work identities discovered for one translation news item."""
+    vndb_ids: list[str] = Field(default_factory=list)
+    steam_app_ids: list[str] = Field(default_factory=list)
+    source_urls: list[str] = Field(default_factory=list)
+
+
+class LocalizationProvenance(ContractModel):
+    source: str = ""
+    work_id: str = ""
+    binding: str = "uncertain"
+    resolution: str = "unknown"
+    screenshot: bool = False
+    native: bool = False
+    source_chain: list[str] = Field(default_factory=list)
+
+
 class NewsItem(ContractModel):
     id: str | None = None
     issue_id: str = Field(min_length=1)
@@ -194,6 +211,7 @@ class NewsItem(ContractModel):
     source_urls: list[str] = Field(default_factory=list)
     importance: float = Field(default=0.0, ge=0.0, le=1.0)
     image_need: ImageNeed = ImageNeed.UNKNOWN
+    localization_context: LocalizationContext | None = None
 
     @model_validator(mode="after")
     def assign_stable_id(self) -> "NewsItem":
@@ -252,6 +270,7 @@ class ImageEvidence(ContractModel):
 
 
 class ImageCandidate(ContractModel):
+    localization_provenance: LocalizationProvenance | None = None
     id: str | None = None
     news_id: str = Field(min_length=1)
     image_url: str = Field(min_length=1)

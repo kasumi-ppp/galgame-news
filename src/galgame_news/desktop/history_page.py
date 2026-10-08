@@ -47,7 +47,7 @@ class HistoryPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 12, 8, 12)
         layout.setSpacing(14)
-        layout.addWidget(page_header("历史任务", "从上次进度继续，或回到配图审核。历史结果与原件始终保留。"))
+        layout.addWidget(page_header("历史任务", "失败任务可继续抓取；任务输出保留在原目录，可继续审核或恢复。"))
         layout.addWidget(self.search_edit)
         layout.addWidget(self.empty_label)
         layout.addWidget(self.task_list)
@@ -71,6 +71,8 @@ class HistoryPage(QWidget):
             label = f"第 {record.issue_id} 期    ·    {created}"
             if record.imported:
                 label += "    ·    已导入"
+            elif record.images_only:
+                label += "    ·    仅图片"
             label += f"\n{record.task_id}"
             item = self.task_list.addItem(label)
             _ = item
@@ -83,7 +85,11 @@ class HistoryPage(QWidget):
         selected = self.selected_record()
         for button in (self.review_button, self.open_button, self.remove_button):
             button.setEnabled(selected is not None)
-        self.resume_button.setEnabled(selected is not None and not selected.imported)
+        compact = selected is not None and selected.images_only
+        self.resume_button.setEnabled(selected is not None and not selected.imported and not compact)
+        self.review_button.setText("打开图片" if compact else "查看图片")
+        self.review_button.setToolTip("此历史任务已精简，内部数据缺失；只能在文件夹中人工选择图片，无法重建审核或恢复数据。" if compact else "")
+        self.resume_button.setToolTip("此历史任务已精简，缺少检查点和恢复数据，无法续跑。" if compact else "")
 
     def selected_record(self) -> TaskRecord | None:
         row = self.task_list.currentRow()
@@ -91,13 +97,16 @@ class HistoryPage(QWidget):
 
     def resume_selected(self) -> None:
         record = self.selected_record()
-        if record:
+        if record and not record.images_only:
             self.resume_requested.emit(record)
 
     def review_selected(self) -> None:
         record = self.selected_record()
         if record:
-            self.review_requested.emit(record)
+            if record.images_only:
+                self.open_selected()
+            else:
+                self.review_requested.emit(record)
 
     def open_selected(self) -> None:
         record = self.selected_record()
@@ -108,7 +117,9 @@ class HistoryPage(QWidget):
         source = record.source_output_path
         candidates = [root / "final" / "images"]
         if source is not None:
-            candidates.append(source / "images")
+            if source.name.casefold() == "raw":
+                candidates.insert(0, source.parent / "final" / "images")
+            candidates.extend((source / "final" / "images", source / "images", source))
         candidates.extend((root / "raw" / "images", root))
         target = next((path for path in candidates if path.is_dir()), root)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))

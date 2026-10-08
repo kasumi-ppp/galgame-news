@@ -136,12 +136,15 @@ class PipelineRunner:
             pass
         runtime = TaskNetworkRuntime(self, token)
         self._network_runtime = runtime
+        self._localization_service = None
         try:
-            return await self._run_async_body(request, event_sink, token)
+            result = await self._run_async_body(request, event_sink, token)
         finally:
             self.network_metrics = runtime.stats()
             await runtime.close()
             self._network_runtime = None
+        # Full assets and indexes remain available for review and recovery.
+        return result
 
     async def _resolve_async(self, news, request):
         resolver = self._resolver_for(request)
@@ -187,7 +190,12 @@ class PipelineRunner:
             self._ensure_history(request)
             input_hash = self._sha256(request.input_path)
             config_hash = self._config_hash(config, request)
+            if resumed:
+                from .compact_output import recover_interrupted_compaction
+                recover_interrupted_compaction(task_dir, task_id=task_id)
             self._prepare_task_dir(task_dir, request)
+            self._emit(sink, failures, self._event("task_workspace_ready", task_id, request.issue_id,
+                payload={"task_dir": str(task_dir)}, message="任务目录已建立"))
             if resumed:
                 checkpoint = self._load_checkpoint(checkpoint_path)
                 self._validate_checkpoint(checkpoint, request, input_hash, config_hash, task_id)
@@ -766,6 +774,7 @@ class PipelineRunner:
             root_url=str(official_url),
         )
         collection = self._collect(news, source)
+        self._bind_localization_context(news, collection.candidates)
         failures = list(collection.failures)
         attempt_id = f"attempt-{uuid.uuid4().hex[:12]}"
         attempt_root = root / "retries" / str(news_id) / attempt_id
@@ -818,6 +827,20 @@ class PipelineRunner:
             self.resolver = self._make_resolver(config)
 
     def _collect(self, news, source, *, request=None):
+        # Translation-specific sources never change x/z collection behavior.
+        host = (urlsplit(source.url).hostname or "").casefold()
+        if self.adapter_factory is None and section_prefix(section_label(news)) == "h" and host in {"vndb.org", "www.vndb.org", "store.steampowered.com"}:
+            from ..localization.service import LocalizationImageService
+            # Initialize on the coordinator before parallel source collection.
+            service = getattr(self, "_localization_service", None)
+            if service is None:
+                service = LocalizationImageService(self._page_client())
+                self._localization_service = service
+            return service.collect(news, source, CollectionContext(
+                timeout_seconds=self.config.network.timeout_seconds,
+                max_candidates=self.config.search.max_candidates_per_source,
+                now=datetime.now(timezone.utc),
+            ))
         if self.adapter_factory is not None:
             try:
                 adapter = self.adapter_factory(news, source, self.config)
@@ -833,6 +856,26 @@ class PipelineRunner:
                 now=datetime.now(timezone.utc),
             ),
         )
+
+    @staticmethod
+    def _bind_localization_context(news, candidates):
+        if section_prefix(section_label(news)) != "h":
+            return
+        from ..domain import LocalizationContext
+        context = news.localization_context or LocalizationContext(source_urls=list(news.source_urls))
+        for candidate in candidates:
+            proof = candidate.localization_provenance
+            if proof is None or proof.binding != "confirmed":
+                continue
+            if not ImageCurator._source_linked(news, candidate):
+                continue
+            target = context.vndb_ids if proof.source == "vndb" else context.steam_app_ids if proof.source == "steam" else None
+            # An established identity is never replaced by a discovered page.
+            if target and proof.work_id not in target:
+                continue
+            if target is not None and proof.work_id not in target:
+                target.append(proof.work_id)
+        news.localization_context = context
 
     def _default_adapter(self, source, *, request=None):
         if source.source_type is SourceType.VIDEO:

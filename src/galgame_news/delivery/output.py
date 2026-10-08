@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..domain import FailureRecord, FailureStage, ImageCandidate, ImageCurationStatus, OutputManifest, PipelineResult, ReviewReason, VideoStatus
+from ..curation.review_filter import is_low_resolution, reviewable_pending_images
 from .image_conversion import ImageConversionError, ImageConverter
 from .helpers import atomic_json_write, item_names as canonical_item_names, safe_video_name, section_label, section_prefix
 
@@ -223,8 +224,13 @@ class OutputManager:
                 files.append(str(Path(candidate.local_path).relative_to(root)))
         all_candidates = result.all_candidates
         exported_failed: set[int] = set()
+        internally_reviewable: set[int] = set()
+        accepted = [
+            candidate for candidate in all_candidates
+            if candidate.selected and candidate.curation_status is not ImageCurationStatus.INVALID
+        ]
         for news_id in sorted({candidate.news_id for candidate in all_candidates}):
-            failed = sorted(
+            pending = sorted(
                 (
                     candidate
                     for candidate in all_candidates
@@ -232,9 +238,26 @@ class OutputManager:
                 ),
                 key=self._failed_candidate_sort_key,
             )
-            rank = 0
+            failed = reviewable_pending_images(pending, accepted=accepted)
+            failed_ids = {id(candidate) for candidate in failed}
             for candidate in failed:
-                rank += 1
+                candidate.signals.pop("pending_hidden_reason", None)
+            # Keep filtered images available to downstream review tooling, while
+            # keeping them out of the user-facing 未候选 directory.
+            for candidate in pending:
+                if id(candidate) in failed_ids:
+                    continue
+                candidate.signals["pending_hidden_reason"] = (
+                    "low_resolution" if is_low_resolution(candidate) else "confirmed_duplicate"
+                )
+                source_path = self._image_source(candidate)
+                if source_path is None:
+                    continue
+                target = root / "review_assets" / candidate.news_id / f"{candidate.id}.png"
+                if self._save_review_image(candidate, source_path, root, target):
+                    internally_reviewable.add(id(candidate))
+                    files.append(str(Path(candidate.local_path).relative_to(root)))
+            for rank, candidate in enumerate(failed, 1):
                 readable = re.sub(r"[\\/:*?\"<>|]", "_", item_names.get(news_id, news_id))
                 target_dir = image_root / readable / self._UNSELECTED_CANDIDATE_DIR
                 target = target_dir / f"{readable}.u{rank:02d}.png"
@@ -279,7 +302,7 @@ class OutputManager:
                 shutil.copyfile(source_path, original)
                 candidate.original_path = str(original)
                 candidate.original_sha256 = hashlib.sha256(original.read_bytes()).hexdigest()
-            if not candidate.selected and id(candidate) not in exported_failed:
+            if not candidate.selected and id(candidate) not in exported_failed and id(candidate) not in internally_reviewable:
                 candidate.local_path = None
             conversion_error = candidate.signals.get("conversion_error")
             already_recorded = any(

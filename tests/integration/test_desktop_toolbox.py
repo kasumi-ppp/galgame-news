@@ -543,7 +543,8 @@ def test_import_251_style_fixture_is_read_only_and_exports_xhz_names(qtbot, tmp_
             if path.is_file()
         }
         assert after == before
-        with Image.open(record.root_path / "final" / "images" / "x1" / "x1.01.png") as image:
+        assert session.task_root.parent == fixture.parent
+        with Image.open(session.task_root / "final" / "images" / "x1" / "x1.01.png") as image:
             assert image.format == "PNG" and image.size == (800, 600)
     finally:
         controller.close()

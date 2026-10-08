@@ -160,6 +160,9 @@ class TaskRequest:
     checkpoint_path: Path | str | None = None
     task_id: str | None = None
     selected_sections: list[Literal["x", "h", "z"]] = field(default_factory=lambda: ["x", "h", "z"])
+    # Deprecated compatibility field: older serialized requests may still
+    # supply it, but a request can no longer opt into deleting task internals.
+    images_only: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.selected_sections, (list, tuple, set, frozenset)):
@@ -181,6 +184,9 @@ class TaskRequest:
             self.checkpoint_path = Path(self.checkpoint_path)
         if not self.issue_id.strip():
             raise ValueError("issue_id must not be empty")
+        # Keep accepting the legacy keyword so older callers and request files
+        # remain readable, while ensuring it cannot trigger output cleanup.
+        self.images_only = False
 
 
 @dataclass(slots=True)
@@ -191,9 +197,10 @@ class TaskResult:
     task_id: str
     task_dir: Path
     output_dir: Path
-    checkpoint_path: Path
+    checkpoint_path: Path | None
     pipeline_result: PipelineResult
     resumed: bool = False
+    images_only: bool = False
 
     @property
     def result(self) -> PipelineResult:

@@ -42,6 +42,27 @@ REASONS = {
     "type_limit_or_minimum_score": "达到类型数量上限或未达到入选评分",
     "review_image_conversion_failed": "审阅图片转换失败，保留原件",
     "download_failed": "图片下载失败", "conversion_failed": "审阅图片转换失败",
+    "not_localization_section": "本项不属于汉化新闻分节",
+    "localization_work_not_confirmed": "作品绑定尚未确认为当前作品",
+    "localization_binding_uncertain": "作品绑定待确认",
+    "localization_reference_only": "这是关联参考作品，仅供人工复核",
+    "localization_binding_conflict": "作品绑定存在冲突",
+    "localization_non_game_image_role": "标志或装饰素材不作为游戏画面",
+    "localization_source_unlinked": "汉化图片来源未与本条新闻建立关联",
+    "localization_image_not_screenshot": "缺少图片级游戏截图证据",
+    "localization_image_not_native": "缺少原生图片证据",
+    "localization_not_full_resolution": "当前为缩略图或非完整分辨率",
+    "localization_image_not_downloaded_or_decoded": "图片未成功下载或解码",
+    "localization_dimensions_missing": "缺少已解码的图片尺寸",
+    "localization_expected_dimensions_mismatch": "实际图片尺寸与来源标注不符",
+    "localization_below_native_resolution_floor": "图片未达到原生分辨率门槛",
+    "localization_manual_review_required": "保留此图供人工复核，不自动入选",
+    "localization_review_required": "汉化图片信息不足，需人工复核",
+    "localization_full_native_screenshot": "已确认当前作品的原图游戏截图",
+    "image_local_event_cg": "图片级证据标明为作品事件 CG",
+    "localization_work_confirmed": "已确认属于当前作品",
+    "source_linked": "来源已关联本条新闻",
+    "decoded_image_valid": "图片已下载并完成解码校验",
 }
 STAGES = {"parse": "读取文档", "analyze": "分析新闻", "resolve": "查找来源", "collect": "采集媒体",
           "download": "下载媒体", "curate": "筛选图片", "output": "保存结果", "history": "更新历史",
@@ -75,6 +96,8 @@ def event_summary(kind: str) -> str:
     exact = {"news_skipped": "已从检查点恢复本条新闻", "checkpoint_saved": "进度已保存",
              "source_found": "已发现媒体来源", "candidate_found": "已发现图片候选",
              "x_media_stats": "X 媒体进度已更新"}
+    exact["task_workspace_ready"] = "任务目录已建立"
+    exact["output_cleanup_failed"] = "图片已导出，内部文件整理未完成，请查看技术详情"
     if kind in exact:
         return exact[kind]
     stage, _, action = kind.rpartition("_")
