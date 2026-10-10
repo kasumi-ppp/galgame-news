@@ -140,14 +140,14 @@ class SocialDataTweetTransport:
         return payload
 
 
-def create_x_adapter(*, public_transport=None, public_resolver=None, use_socialdata: bool = False, response_cache=None, socialdata_transport=None):
+def create_x_adapter(*, public_transport=None, public_resolver=None, use_socialdata: bool = False, response_cache=None, socialdata_transport=None, credential_store=None):
     """Build the X adapter with the configured structured-media backend."""
 
     from .adapters.x import XAdapter
 
     if use_socialdata:
         try:
-            token = CredentialStore().get_socialdata_api_key() or None
+            token = (credential_store or CredentialStore()).get_socialdata_api_key() or None
         except Exception:
             token = None
         transport = socialdata_transport or SocialDataTweetTransport(response_cache=response_cache)

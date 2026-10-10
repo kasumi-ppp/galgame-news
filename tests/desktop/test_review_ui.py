@@ -23,11 +23,26 @@ def session_at(root: Path, count: int = 3) -> ReviewSession:
         candidates.append({"id": f"image-{row}", "news_id": "news-1" if row % 2 == 0 else "news-2",
                            "image_url": f"https://example.test/{row}.jpg", "source_url": "https://official.test/page",
                            "source_type": "official_site", "local_path": f"{row}.jpg",
-                           "width": 420, "height": 320, "image_type": "game_cg", "score": {"total": 80 - row % 80}})
+                           "width": 1024, "height": 768, "image_type": "game_cg", "score": {"total": 80 - row % 80}})
     (root / "image_index.json").write_text(json.dumps({
         "news_items": [{"news_id": "news-1", "title": "第一条新闻"}, {"news_id": "news-2", "title": "第二条新闻"}],
         "candidates": candidates}), encoding="utf-8")
-    return ReviewSession.from_output(root, state_path=root.parent / f"{root.name}-state.json")
+    session = ReviewSession.from_output(root, state_path=root.parent / f"{root.name}-state.json")
+    for sequence, item in enumerate(session.news_items, start=1):
+        item["sequence"] = sequence
+    return session
+
+
+def select_news(page: ReviewPage, news_id: str) -> None:
+    root = page.news_list.topLevelItem(0)
+    for section_index in range(root.childCount()):
+        section = root.child(section_index)
+        for index in range(section.childCount()):
+            child = section.child(index)
+            if child.data(0, Qt.ItemDataRole.UserRole) == ("news", news_id):
+                page.news_list.setCurrentItem(child)
+                return
+    raise AssertionError(f"missing news item {news_id}")
 
 
 def test_chinese_grid_and_news_filter_keep_tab_mapping(qtbot, tmp_path):
@@ -40,10 +55,29 @@ def test_chinese_grid_and_news_filter_keep_tab_mapping(qtbot, tmp_path):
     assert page.media_list.viewMode() is page.media_list.ViewMode.IconMode
     assert page.media_list.selectionMode() is QAbstractItemView.SelectionMode.ExtendedSelection
     assert page.media_list.count() == 3
-    page.news_list.setCurrentRow(2)
+    select_news(page, "news-2")
     assert [candidate.news_id for candidate in page._items] == ["news-2"]
-    page.news_list.setCurrentRow(0)
+    page.news_list.setCurrentItem(page.news_list.topLevelItem(0))
     assert page.media_list.count() == 3
+
+
+def test_news_tree_section_filter_and_sequence_preservation(qtbot, tmp_path):
+    page = ReviewPage()
+    qtbot.addWidget(page)
+    page.set_session(session_at(tmp_path / "tree"))
+    root = page.news_list.topLevelItem(0)
+    assert root.text(0).startswith("全部新闻")
+    assert [root.child(i).text(0) for i in range(3)] == ["新作", "汉化", "周边"]
+    assert root.child(2).child(0).text(0).startswith("1  ")
+    assert root.child(2).child(1).text(0).startswith("2  ")
+    second = root.child(2).takeChild(1)
+    root.child(1).addChild(second)
+    page._news["news-2"]["section"] = "汉化"
+    page.news_list.setCurrentItem(root.child(1))
+    assert {item.news_id for item in page._items} == {"news-2"}
+    assert {str(item.id) for item in page._items} == {str(item.id) for item in page.session.pending_images() if item.news_id == "news-2"}
+    page.tabs.setCurrentIndex(3)
+    assert page.media_list.count() == 0
 
 
 def test_grid_focus_shortcuts_apply_to_multiple_selected_items(qtbot, tmp_path):
@@ -210,6 +244,39 @@ def test_retry_url_validation_autofill_and_result_message(qtbot, tmp_path):
     assert "network traceback" in page.raw_details.toPlainText()
 
 
+def test_supplement_url_validation_busy_and_result(qtbot, tmp_path):
+    page = ReviewPage()
+    qtbot.addWidget(page)
+    page.set_session(session_at(tmp_path / "supplement", 1))
+    assert not page.supplement_button.isEnabled()  # all-news is not a concrete item
+    select_news(page, "news-1")
+    assert page.supplement_button.isEnabled()
+    requested = []
+    canceled = []
+    page.supplement_requested.connect(lambda *args: requested.append(args))
+    page.supplement_cancel_requested.connect(lambda: canceled.append(True))
+    page.supplement_url_edit.setText("file:///tmp/not-http")
+    page.request_supplement()
+    assert requested == []
+    assert "HTTP 或 HTTPS" in page.operation_status.text()
+    page.supplement_url_edit.setText("https://example.test/gallery")
+    page.request_supplement()
+    assert requested == [("news-1", "https://example.test/gallery")]
+    assert page._supplement_busy and not page.supplement_button.isEnabled()
+    assert not page.supplement_url_edit.isEnabled()
+    page.supplement_cancel_button.click()
+    assert canceled == [True]
+    page.show_supplement_result({"added_count": 2, "success_count": 2, "failed_count": 0,
+                                 "status": "partial", "failures": [{"source": "source-a", "error": "fetch failed"}]})
+    assert not page._supplement_busy and page.supplement_url_edit.isEnabled()
+    assert "部分完成" in page.operation_status.text() and "失败 1 项" in page.operation_status.text()
+    assert "source-a" in page.raw_details.toPlainText()
+    select_news(page, "news-2")
+    assert page.supplement_url_edit.text() == ""
+    page.show_supplement_failure("network error")
+    assert "network error" in page.raw_details.toPlainText()
+
+
 def test_retry_url_belongs_to_selected_news_and_clears_on_session_change(qtbot, tmp_path):
     session = session_at(tmp_path / "output", 2)
     object.__setattr__(session.images[0], "source_url", "https://official.test/news-a")
@@ -229,7 +296,7 @@ def test_retry_url_belongs_to_selected_news_and_clears_on_session_change(qtbot, 
     assert page.retry_url() == ""
     page.retry_selected()
     assert seen[-1] == ("news-2", "https://official.test/news-b")
-    page.news_list.setCurrentRow(1)
+    select_news(page, "news-1")
     assert page.retry_url() == ""
     page.retry_selected()
     assert seen[-1] == ("news-1", "https://official.test/news-a")
@@ -243,9 +310,16 @@ def test_empty_news_can_retry_with_official_url_and_editor_keeps_typing(qtbot, t
     page = ReviewPage()
     qtbot.addWidget(page)
     page.set_session(session)
-    page.news_list.setCurrentRow(2)
+    select_news(page, "news-2")
     assert page.media_list.count() == 0
     assert page.retry_button.isEnabled()
+    assert page.supplement_button.isEnabled()
+    page.supplement_url_edit.setText("https://example.test/second")
+    supplement_requests = []
+    page.supplement_requested.connect(lambda *args: supplement_requests.append(args))
+    page.request_supplement()
+    assert supplement_requests == [("news-2", "https://example.test/second")]
+    page.set_supplement_busy(False)
     seen = []
     page.retry_requested.connect(seen.append)
     page.retry_selected()

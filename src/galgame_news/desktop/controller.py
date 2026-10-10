@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -20,7 +21,7 @@ from .progress_page import ProgressPage
 from .review_page import ReviewPage
 from .settings_page import SettingsPage
 from .theme import apply_theme
-from .worker import PipelineWorker
+from .worker import PipelineWorker, SupplementWorker
 
 
 class DesktopController(QObject):
@@ -37,6 +38,8 @@ class DesktopController(QObject):
     review_loaded = Signal(object)
     retry_finished = Signal(object)
     retry_failed = Signal(object)
+    supplement_finished = Signal(object)
+    supplement_failed = Signal(object)
     history_changed = Signal()
 
     # Camel-case aliases are useful to Qt-oriented callers while snake-case is
@@ -85,11 +88,18 @@ class DesktopController(QObject):
         self.review_page.retry_requested.connect(self._retry_from_page)
         self.retry_finished.connect(lambda *_: self.review_page.show_retry_result(True))
         self.retry_failed.connect(self.review_page.show_retry_failure)
+        self.review_page.supplement_requested.connect(self.supplement_news)
+        self.review_page.supplement_cancel_requested.connect(self.cancel_supplement)
         self.settings_page.theme_changed.connect(self.apply_theme)
 
         self._thread: QThread | None = None
         self._worker: PipelineWorker | None = None
         self._token: CancellationToken | None = None
+        self._supplement_thread = None
+        self._supplement_worker = None
+        self._supplement_token = None
+        self._supplement_context = None
+        self._supplement_active = False
         self.current_request: TaskRequest | None = None
         self.current_record: TaskRecord | None = None
         self.review_record: TaskRecord | None = None
@@ -112,6 +122,10 @@ class DesktopController(QObject):
     def is_paused(self) -> bool:
         return bool(self._token is not None and self._token.is_paused)
 
+    @property
+    def is_supplement_running(self) -> bool:
+        return self._supplement_active
+
     def _start_from_page(self, payload: object) -> bool:
         values = dict(payload) if isinstance(payload, dict) else {}
         return self.start_task(**values)
@@ -132,7 +146,7 @@ class DesktopController(QObject):
         task_dir: Path | str | None = None,
         task_id: str | None = None,
     ) -> bool:
-        if self.is_running:
+        if self.is_running or self.is_supplement_running:
             return False
         if request is None:
             if input_path is None or issue_id is None or output_dir is None:
@@ -374,6 +388,8 @@ class DesktopController(QObject):
             QMessageBox.warning(self.new_task_page, "无法导入图片结果", str(exc))
 
     def load_review(self, record: object) -> ReviewSession | None:
+        if self.is_supplement_running:
+            return self.review_page.session
         if not isinstance(record, TaskRecord):
             return None
         self.review_record = record
@@ -400,7 +416,10 @@ class DesktopController(QObject):
                 task_root=export_root,
                 state_path=record.review_state_path,
             )
-        except (OSError, ValueError, TypeError) as exc:
+            session.retry_root = record.root_path / "retries"
+            for attempt in self.task_store.list_retry_attempts(record):
+                session.merge_retry_attempt(attempt, force_pending=attempt.kind == "supplement")
+        except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
             self.review_page.set_session(None)
             self.review_record = None
             QMessageBox.warning(self.review_page, "无法打开图片审核", str(exc))
@@ -454,6 +473,9 @@ class DesktopController(QObject):
     def retry_news(self, news_id: object, official_url: str | None = None) -> bool:
         """Retry one news item into an isolated attempt and merge its data."""
 
+        if self.is_running or self.is_supplement_running:
+            self.retry_failed.emit(RuntimeError("已有抓取操作正在运行，请稍后重试"))
+            return False
         if isinstance(news_id, dict):
             official_url = str(news_id.get("official_url") or official_url or "")
             news_id = news_id.get("news_id") or news_id.get("id")
@@ -499,9 +521,105 @@ class DesktopController(QObject):
             self.review_page.refresh()
             self.retry_finished.emit(merged)
             return True
-        except (OSError, TypeError, ValueError, KeyError, RuntimeError) as exc:
+        except (OSError, TypeError, ValueError, KeyError, RuntimeError, sqlite3.Error) as exc:
             self.retry_failed.emit(exc)
             return False
+
+    @Slot(str, str)
+    def supplement_news(self, news_id: str, source_url: str) -> bool:
+        """Start one background addition, bound to the current review task."""
+        if self.is_running or self.is_supplement_running or self.review_page.exporter.session is not None:
+            self.review_page.show_supplement_failure(RuntimeError("已有抓取或导出操作正在运行，请稍后再补抓"))
+            if self.is_supplement_running:
+                self.review_page.set_supplement_busy(True)
+            return False
+        record, session = self.review_record, self.review_page.session
+        if record is None or session is None:
+            return False
+        news = next((n for n in session.news_items if str(n.get("news_id")) == str(news_id)), None)
+        if news is None:
+            self.review_page.show_supplement_failure(ValueError("请先选择一条具体新闻"))
+            return False
+        try:
+            options = self.task_store.load_request_options(record)
+            request = TaskRequest(input_path=record.input_path or record.root_path / "input.docx",
+                issue_id=record.issue_id, output_dir=record.root_path, task_id=record.task_id,
+                no_videos=True, offline=bool(options.get("offline", False)),
+                use_socialdata_x=bool(options.get("use_socialdata_x", False)),
+                selected_sections=options.get("selected_sections", ["x", "h", "z"]),
+                config_path=options.get("config_path"), max_images=options.get("max_images"))
+            runner = self.runner_factory()
+            self._configure_runner_browser(runner)
+            runner._supplement_credential_store = self.credential_store
+            self._supplement_token = CancellationToken()
+            self._supplement_worker = SupplementWorker(runner, {
+                "task_root": record.root_path, "task_id": record.task_id,
+                "issue_id": record.issue_id, "news_id": str(news_id),
+                "source_url": source_url, "news_item": dict(news), "request": request,
+            }, self._supplement_token)
+            self._supplement_context = (record, session)
+            self._supplement_thread = QThread(self)
+            self._supplement_worker.moveToThread(self._supplement_thread)
+            self._supplement_thread.started.connect(self._supplement_worker.run)
+            self._supplement_worker.event.connect(self._on_supplement_event)
+            self._supplement_worker.finished.connect(self._on_supplement_finished)
+            self._supplement_worker.failed.connect(self._on_supplement_failed)
+            self._supplement_worker.finished.connect(self._supplement_thread.quit, Qt.ConnectionType.DirectConnection)
+            self._supplement_worker.failed.connect(self._supplement_thread.quit, Qt.ConnectionType.DirectConnection)
+            self._supplement_thread.finished.connect(self._supplement_worker.deleteLater)
+            self._supplement_thread.finished.connect(self._on_supplement_thread_finished)
+            self._supplement_thread.finished.connect(self._supplement_thread.deleteLater)
+            self._supplement_active = True
+            self.review_page.set_supplement_busy(True)
+            self.new_task_page.set_busy(True)
+            self._supplement_thread.start()
+            return True
+        except Exception as exc:
+            self._on_supplement_failed(exc)
+            return False
+
+    @Slot(object)
+    def _on_supplement_event(self, event):
+        self.review_page.operation_status.setText(str(event.message))
+
+    @Slot(object)
+    def _on_supplement_finished(self, result):
+        try:
+            record, session = self._supplement_context
+            if result.path.is_dir():
+                attempt = self.task_store.merge_retry_attempt(record, result.news_id, result.attempt_id)
+                merged = session.merge_retry_attempt(attempt, force_pending=True)
+                self.review_page.refresh(preserve_position=True)
+                summary = {"added_count": len(merged.added_image_ids), "success_count": result.success_count,
+                           "failed_count": result.failed_count, "status": result.status,
+                           "failures": [f.model_dump(mode="json") for f in result.failures]}
+            else:
+                summary = {"added_count": 0, "success_count": 0, "failed_count": 0, "status": result.status}
+            self.review_page.show_supplement_result(summary)
+            self.supplement_finished.emit(summary)
+        except Exception as exc:
+            self._on_supplement_failed(exc)
+
+    @Slot(object)
+    def _on_supplement_failed(self, error):
+        self.review_page.show_supplement_failure(error)
+        self.supplement_failed.emit(error)
+        if self._supplement_thread is None or not self._supplement_thread.isRunning():
+            self._on_supplement_thread_finished()
+
+    @Slot()
+    def cancel_supplement(self):
+        if self._supplement_token is not None:
+            self._supplement_token.cancel()
+            self.review_page.operation_status.setText("正在取消补抓，保留已下载图片…")
+
+    @Slot()
+    def _on_supplement_thread_finished(self):
+        self._supplement_active = False
+        self._supplement_thread = self._supplement_worker = self._supplement_token = None
+        self._supplement_context = None
+        self.review_page.set_supplement_busy(False)
+        self.new_task_page.set_busy(False)
 
     @Slot(str)
     def _retry_from_page(self, news_id: str) -> bool:
@@ -543,6 +661,11 @@ class DesktopController(QObject):
         self.history_page.refresh()
 
     def close(self, timeout_ms: int = 1000) -> bool:
+        if self.is_supplement_running:
+            self.cancel_supplement()
+            if self._supplement_thread is not None and not self._supplement_thread.wait(timeout_ms):
+                self.persist_state()
+                return False
         if self.is_running:
             self.cancel_task()
             if not self.wait_for_task(timeout_ms):

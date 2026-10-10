@@ -72,9 +72,9 @@ QPushButton:disabled { color: #938caa; background: palette(alternate-base); }
 QCheckBox { spacing: 9px; padding: 7px 0; }
 QCheckBox::indicator { width: 17px; height: 17px; border: 1px solid palette(mid); border-radius: 4px; background: palette(base); }
 QCheckBox::indicator:checked { background: #9680d5; border: 3px solid #cbbbed; }
-QListWidget { background: palette(base); border: 1px solid palette(mid); border-radius: 12px; padding: 6px; outline: none; }
-QListWidget::item { padding: 10px; border-radius: 8px; }
-QListWidget::item:selected { background: palette(alternate-base); color: palette(text); border: 1px solid #b5a4df; }
+QListWidget, QTreeWidget { background: palette(base); border: 1px solid palette(mid); border-radius: 12px; padding: 6px; outline: none; }
+QListWidget::item, QTreeWidget::item { padding: 10px; border-radius: 8px; }
+QListWidget::item:selected, QTreeWidget::item:selected { background: palette(alternate-base); color: palette(text); border: 1px solid #b5a4df; }
 QListWidget#navigation { background: transparent; border: none; padding: 0; }
 QListWidget#navigation::item { padding: 15px 10px; margin: 4px 0; }
 QTabWidget::pane { border: none; }

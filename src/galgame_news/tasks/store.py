@@ -111,6 +111,7 @@ class RetryAttempt:
     images: list[dict[str, Any]]
     videos: list[dict[str, Any]]
     failures: list[dict[str, Any]]
+    kind: str = "retry"
 
     @property
     def candidates(self) -> list[dict[str, Any]]:
@@ -209,6 +210,29 @@ class TaskStore:
                 "INSERT INTO task_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 values.items(),
             )
+            connection.commit()
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _ensure_task_state_schema(path: Path) -> None:
+        """Upgrade older managed task state files before retry access."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path)
+        try:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS task_meta (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS retry_attempts (
+                    news_id TEXT NOT NULL, attempt_id TEXT NOT NULL, path TEXT NOT NULL,
+                    created_at TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'retry',
+                    PRIMARY KEY(news_id, attempt_id));
+                CREATE TABLE IF NOT EXISTS review_decisions (
+                    media_id TEXT PRIMARY KEY, decision TEXT NOT NULL, updated_at TEXT NOT NULL);
+            """)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(retry_attempts)")}
+            if "kind" not in columns:
+                connection.execute("ALTER TABLE retry_attempts ADD COLUMN kind TEXT NOT NULL DEFAULT 'retry'")
             connection.commit()
         finally:
             connection.close()
@@ -474,6 +498,8 @@ class TaskStore:
         record = task if isinstance(task, TaskRecord) else self.get_task(str(task))
         if record is None:
             raise KeyError(f"unknown task: {task}")
+        state_path = Path(record.state_path or Path(record.task_root) / "task_state.sqlite3")
+        self._ensure_task_state_schema(state_path)
         retries = Path(record.task_root) / "retries"
         attempt = self._confined(retries / str(news_id) / str(attempt_id), retries)
         if not attempt.is_dir():
@@ -483,6 +509,8 @@ class TaskStore:
         images = self._items(image_payload, ("candidates", "images", "image_candidates"))
         videos = self._items(video_payload, ("videos", "video_candidates", "candidates"))
         failures = self._items(image_payload, ("failures",)) + self._items(video_payload, ("failures",))
+        manifest = image_payload if isinstance(image_payload, dict) else {}
+        kind = str(manifest.get("kind") or manifest.get("attempt_kind") or "retry")
         retry = RetryAttempt(
             task_id=record.task_id,
             news_id=str(news_id),
@@ -491,18 +519,77 @@ class TaskStore:
             images=images,
             videos=videos,
             failures=failures,
+            kind=kind,
         )
-        state_path = Path(record.state_path or Path(record.task_root) / "task_state.sqlite3")
         connection = sqlite3.connect(state_path)
         try:
             connection.execute(
-                "INSERT OR REPLACE INTO retry_attempts(news_id, attempt_id, path, created_at) VALUES (?, ?, ?, ?)",
-                (retry.news_id, retry.attempt_id, str(attempt), datetime.now(timezone.utc).isoformat()),
+                "INSERT INTO retry_attempts(news_id, attempt_id, path, created_at, kind) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(news_id, attempt_id) DO UPDATE SET path=excluded.path, kind=excluded.kind",
+                (retry.news_id, retry.attempt_id, str(attempt), datetime.now(timezone.utc).isoformat(), kind),
             )
             connection.commit()
         finally:
             connection.close()
         return retry
+
+    def list_retry_attempts(self, task: TaskRecord | str) -> list[RetryAttempt]:
+        """Reload every registered retry batch in stable creation order."""
+        record = task if isinstance(task, TaskRecord) else self.get_task(str(task))
+        if record is None:
+            raise KeyError(f"unknown task: {task}")
+        state_path = Path(record.state_path or Path(record.task_root) / "task_state.sqlite3")
+        self._ensure_task_state_schema(state_path)
+        # A run can be interrupted after publishing its manifest but before the
+        # GUI registers the completed batch. Recover only valid supplement
+        # manifests directly under this task's confined retries directory.
+        retries_root = (Path(record.task_root) / "retries").resolve()
+        if retries_root.is_dir():
+            for index_path in sorted(retries_root.glob("*/*/image_index.json")):
+                attempt = self._confined(index_path.parent, retries_root)
+                payload = _read_json(index_path, {})
+                if not isinstance(payload, dict) or str(payload.get("kind") or payload.get("attempt_kind") or "") != "supplement":
+                    continue
+                directory_news_id = attempt.parent.name
+                news_rows = payload.get("news_items")
+                manifest_ids = {
+                    str(item.get("news_id")) for item in news_rows
+                    if isinstance(item, dict) and item.get("news_id") is not None
+                } if isinstance(news_rows, list) else set()
+                candidates = self._items(payload, ("candidates", "images", "image_candidates"))
+                video_payload = _read_json(attempt / "video_index.json", {})
+                candidates.extend(self._items(video_payload, ("videos", "video_candidates", "candidates")))
+                if manifest_ids != {directory_news_id} or any(
+                    str(candidate.get("news_id") or candidate.get("newsId") or "") != directory_news_id
+                    for candidate in candidates
+                ) or not isinstance(news_rows, list) or len(news_rows) != 1:
+                    continue
+                with sqlite3.connect(state_path) as connection:
+                    registered = connection.execute(
+                        "SELECT 1 FROM retry_attempts WHERE news_id=? AND attempt_id=?",
+                        (directory_news_id, attempt.name),
+                    ).fetchone()
+                if registered is None:
+                    self.merge_retry_attempt(record, directory_news_id, attempt.name)
+        with sqlite3.connect(state_path) as connection:
+            rows = connection.execute(
+                "SELECT news_id, attempt_id, path, kind FROM retry_attempts ORDER BY created_at, attempt_id"
+            ).fetchall()
+        result = []
+        for news_id, attempt_id, raw_path, kind in rows:
+            attempt = self._confined(Path(raw_path), retries_root)
+            if not attempt.is_dir():
+                continue
+            image_payload = _read_json(attempt / "image_index.json", {})
+            video_payload = _read_json(attempt / "video_index.json", {})
+            result.append(RetryAttempt(
+                record.task_id, str(news_id), str(attempt_id), attempt,
+                self._items(image_payload, ("candidates", "images", "image_candidates")),
+                self._items(video_payload, ("videos", "video_candidates", "candidates")),
+                self._items(image_payload, ("failures",)) + self._items(video_payload, ("failures",)),
+                str(kind or "retry"),
+            ))
+        return result
 
     def read_retry_attempt(self, task: TaskRecord | str, news_id: str, attempt_id: str) -> RetryAttempt:
         return self.merge_retry_attempt(task, news_id, attempt_id)

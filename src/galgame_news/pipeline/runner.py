@@ -124,6 +124,18 @@ class PipelineRunner:
             return asyncio.run(self.run_async(request, event_sink, cancellation_token))
         raise RuntimeError("Use await runner.run_async() from an active event loop")
 
+    def supplement_news(self, **kwargs):
+        """Collect a reviewer's extra source without rerunning the document."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.supplement_news_async(**kwargs))
+        raise RuntimeError("Use await runner.supplement_news_async() from an active event loop")
+
+    async def supplement_news_async(self, **kwargs):
+        from .supplement import collect_supplement
+        return await collect_supplement(self, **kwargs)
+
     async def run_async(self, request, event_sink=None, cancellation_token=None) -> TaskResult:
         from .network_runtime import TaskNetworkRuntime
         if self._network_runtime is not None:
@@ -827,9 +839,11 @@ class PipelineRunner:
             self.resolver = self._make_resolver(config)
 
     def _collect(self, news, source, *, request=None):
-        # Translation-specific sources never change x/z collection behavior.
+        # Explicit review additions can reuse the work-aware adapters in any
+        # section; ordinary x/z collection retains its existing behavior.
         host = (urlsplit(source.url).hostname or "").casefold()
-        if self.adapter_factory is None and section_prefix(section_label(news)) == "h" and host in {"vndb.org", "www.vndb.org", "store.steampowered.com"}:
+        use_work_adapter = section_prefix(section_label(news)) == "h" or getattr(self, "_supplement_mode", False)
+        if self.adapter_factory is None and use_work_adapter and host in {"vndb.org", "www.vndb.org", "store.steampowered.com"}:
             from ..localization.service import LocalizationImageService
             # Initialize on the coordinator before parallel source collection.
             service = getattr(self, "_localization_service", None)
@@ -898,6 +912,7 @@ class PipelineRunner:
                 public_transport=self.source_transport,
                 use_socialdata=bool(request and request.use_socialdata_x),
                 response_cache=self._socialdata_response_cache,
+                credential_store=getattr(self, "_supplement_credential_store", None),
                 **kwargs,
             )
             if runtime is not None:

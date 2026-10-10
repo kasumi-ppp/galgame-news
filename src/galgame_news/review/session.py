@@ -151,6 +151,7 @@ class ReviewSession:
     ):
         self.output_dir = output_dir
         self.task_root = task_root or state_path.parent
+        self.retry_root: Path | None = None
         self.state_path = state_path
         self.images = images
         self.videos = videos
@@ -161,6 +162,7 @@ class ReviewSession:
         self._failed_ids = failed_ids
         self._ambiguous_image_ids = ambiguous_image_ids or set()
         self._decisions: dict[str, ReviewDecision] = {}
+        self._manual_decisions: set[str] = set()
         self._image_by_id = {str(item.id): item for item in images}
         self._video_by_id = {str(item.id): item for item in videos}
 
@@ -483,6 +485,9 @@ class ReviewSession:
         for candidate in self.videos:
             self._decisions[str(candidate.id)] = self._initial_video_decision(candidate)
         persisted = self._read_state()
+        state_payload = _read_json(self.state_path, {})
+        if isinstance(state_payload, dict) and isinstance(state_payload.get("manual_decisions"), list):
+            self._manual_decisions = {str(value) for value in state_payload["manual_decisions"]}
         for media_id, value in persisted.items():
             if media_id in self._decisions and media_id not in self._ambiguous_image_ids:
                 try:
@@ -527,12 +532,24 @@ class ReviewSession:
 
     def _persist(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = _read_json(self.state_path, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        saved = existing.get("decisions", existing)
+        decisions = dict(saved) if isinstance(saved, dict) else {}
+        # A review session may load retry batches one at a time. Preserve
+        # decisions for IDs from batches that have not been merged yet.
+        decisions.update({key: value.value for key, value in self._decisions.items()})
+        manual = existing.get("manual_decisions", [])
+        manual_decisions = set(map(str, manual)) if isinstance(manual, list) else set()
+        manual_decisions.update(self._manual_decisions)
         atomic_json_write(
             self.state_path,
             {
                 "schema_version": 1,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-                "decisions": {key: value.value for key, value in sorted(self._decisions.items())},
+                "decisions": {str(key): str(value) for key, value in sorted(decisions.items())},
+                "manual_decisions": sorted(manual_decisions),
             },
         )
 
@@ -544,12 +561,14 @@ class ReviewSession:
         if media_id not in self._decisions:
             raise KeyError(media_id)
         self._decisions[media_id] = decision if isinstance(decision, ReviewDecision) else ReviewDecision(decision)
+        self._manual_decisions.add(media_id)
         self._persist()
 
     def _sorted_pending(self, values: Iterable[ImageCandidate]) -> list[ImageCandidate]:
         def key(candidate: ImageCandidate):
             score = candidate.score
             return (
+                not (candidate.signals.get("x_api_photo") is True or candidate.signals.get("socialdata_photo") is True),
                 -(score.total if score else 0.0),
                 -(score.source_trust if score else 0.0),
                 -((candidate.width or 0) * (candidate.height or 0)),
@@ -589,15 +608,15 @@ class ReviewSession:
     def _confined_retry_path(self, news_id: str, attempt_id: str) -> Path:
         """Resolve a retry path while rejecting traversal and symlink escapes."""
 
-        if self.task_root is None:
+        if self.task_root is None and self.retry_root is None:
             raise ValueError("retry merge requires a task_root")
         components = (str(news_id), str(attempt_id))
         for component in components:
             value = Path(component)
             if not component or value.is_absolute() or value.name != component or component in {".", ".."}:
                 raise ValueError("retry path must be a single confined component")
-        retries_root = (Path(self.task_root) / "retries").resolve()
-        lexical = Path(self.task_root) / "retries" / components[0] / components[1]
+        retries_root = Path(self.retry_root).resolve() if self.retry_root is not None else (Path(self.task_root) / "retries").resolve()
+        lexical = retries_root / components[0] / components[1]
         resolved = lexical.resolve()
         try:
             resolved.relative_to(retries_root)
@@ -605,7 +624,7 @@ class ReviewSession:
             raise ValueError("retry path escapes task_root/retries") from exc
         return resolved
 
-    def merge_retry_attempt(self, retry_or_news_id: Any, attempt_id: str | None = None) -> RetryMergeResult:
+    def merge_retry_attempt(self, retry_or_news_id: Any, attempt_id: str | None = None, *, force_pending: bool = False) -> RetryMergeResult:
         """Merge one retry attempt in memory while retaining raw indexes.
 
         ``retry_or_news_id`` may be an attempt directory, a ``RetryAttempt``
@@ -633,7 +652,7 @@ class ReviewSession:
                 if raw_path.is_absolute():
                     raise ValueError("retry path must be relative to task_root/retries")
                 root = raw_path.resolve()
-                retries_root = (Path(self.task_root) / "retries").resolve()
+                retries_root = Path(self.retry_root).resolve() if self.retry_root is not None else (Path(self.task_root) / "retries").resolve()
                 try:
                     root.relative_to(retries_root)
                 except ValueError as exc:
@@ -647,33 +666,122 @@ class ReviewSession:
 
         added_images: list[str] = []
         added_videos: list[str] = []
+        changed = False
+        recovered_ids: set[str] = set()
+        supplement = force_pending or getattr(retry_data, "kind", "retry") == "supplement"
+        image_urls = {(str(item.news_id), str(item.image_url)) for item in self.images}
         for raw in image_items:
             candidate, stable_id = self._coerce_image(raw)
-            if candidate is None or stable_id in self._image_by_id:
+            if candidate is None or str(candidate.news_id) != news_id:
                 continue
+            old = self._image_by_id.get(stable_id)
+            source = self._resolve_image_path(candidate, root)
+            source = self._confine_retry_asset(source)
+            if source is not None:
+                expected_hash = candidate.output_sha256 or candidate.sha256
+                if expected_hash:
+                    try:
+                        if hashlib.sha256(source.read_bytes()).hexdigest().casefold() != str(expected_hash).casefold():
+                            source = None
+                    except OSError:
+                        source = None
+                if source is not None:
+                    try:
+                        with Image.open(source) as image:
+                            image.verify()
+                        with Image.open(source) as image:
+                            image.load()
+                    except Exception:
+                        source = None
+            if source is None:
+                object.__setattr__(candidate, "local_path", None)
+                object.__setattr__(candidate, "original_path", None)
+            if old is not None:
+                old_source = self._source_paths.get(stable_id)
+                # Repair failed assets while retaining only decisions explicitly
+                # made by a reviewer; initial auto-rejections are reconsidered.
+                if source is not None and (old_source is None or not old_source.is_file()):
+                    index = self.images.index(old)
+                    self.images[index] = candidate
+                    self._image_by_id[stable_id] = candidate
+                    self._raw_types[stable_id] = str(raw.get("image_type", "")).casefold()
+                    self._source_paths[stable_id] = source
+                    object.__setattr__(candidate, "local_path", str(source))
+                    recovered_ids.add(stable_id)
+                    changed = True
+                    if supplement and stable_id not in self._manual_decisions:
+                        self._decisions[stable_id] = ReviewDecision.PENDING
+                continue
+            if (str(candidate.news_id), str(candidate.image_url)) in image_urls:
+                continue
+            image_urls.add((str(candidate.news_id), str(candidate.image_url)))
             self.images.append(candidate)
             self._image_by_id[stable_id] = candidate
             self._raw_types[stable_id] = str(raw.get("image_type", "")).casefold()
-            source = self._source_path(raw.get("local_path"), root)
             if source is not None:
+                object.__setattr__(candidate, "local_path", str(source))
                 self._source_paths[stable_id] = source
             self._review_ids.add(stable_id)
-            self._decisions[stable_id] = self._initial_image_decision(candidate)
+            saved = self._read_state().get(stable_id)
+            self._decisions[stable_id] = (ReviewDecision(saved) if saved in {item.value for item in ReviewDecision}
+                                          else ReviewDecision.PENDING if supplement and source is not None
+                                          else self._initial_image_decision(candidate))
             added_images.append(stable_id)
+            changed = True
         for raw in video_items:
             candidate, stable_id = self._coerce_video(raw)
-            if candidate is None or stable_id in self._video_by_id:
+            if candidate is None or str(candidate.news_id) != news_id:
+                continue
+            old = self._video_by_id.get(stable_id)
+            source = self._resolve_asset_path(raw.get("local_path") or raw.get("original_path"), root,
+                                              getattr(candidate, "sha256", None))
+            source = self._confine_retry_asset(source)
+            if source is None:
+                object.__setattr__(candidate, "local_path", None)
+            if old is not None:
+                old_source = self._source_paths.get(stable_id)
+                if source is not None and source.is_file() and (old_source is None or not old_source.is_file()):
+                    self.videos[self.videos.index(old)] = candidate
+                    self._video_by_id[stable_id] = candidate
+                    self._source_paths[stable_id] = source
+                    object.__setattr__(candidate, "local_path", str(source))
+                    recovered_ids.add(stable_id)
+                    changed = True
                 continue
             self.videos.append(candidate)
             self._video_by_id[stable_id] = candidate
-            source = self._source_path(raw.get("local_path"), root)
             if source is not None:
+                object.__setattr__(candidate, "local_path", str(source))
                 self._source_paths[stable_id] = source
-            self._decisions[stable_id] = self._initial_video_decision(candidate)
+            saved = self._read_state().get(stable_id)
+            self._decisions[stable_id] = (ReviewDecision(saved) if saved in {item.value for item in ReviewDecision}
+                                          else ReviewDecision.PENDING if supplement and source is not None
+                                          else self._initial_video_decision(candidate))
             added_videos.append(stable_id)
-        if added_images or added_videos:
+            changed = True
+        failures = getattr(retry_data, "failures", []) if retry_data is not None else []
+        for failure in failures:
+            failed_id = failure.get("candidate_id") or failure.get("id") or failure.get("media_id")
+            if failed_id is not None:
+                self._failed_ids.add(str(failed_id))
+        self._failed_ids.difference_update(recovered_ids)
+        if changed:
             self._persist()
         return RetryMergeResult(news_id, resolved_attempt_id, added_images, added_videos)
+
+    def _confine_retry_asset(self, source: Path | None) -> Path | None:
+        if source is None:
+            return None
+        asset_root = (Path(self.retry_root).resolve().parent if self.retry_root is not None
+                      else Path(self.task_root).resolve() if self.task_root is not None else None)
+        if asset_root is None:
+            return None
+        try:
+            resolved = source.resolve()
+            resolved.relative_to(asset_root)
+        except (OSError, ValueError):
+            return None
+        return resolved
 
     def _folder_names(self) -> dict[str, str]:
         # Use the same canonical naming policy as raw output.  Manifest order

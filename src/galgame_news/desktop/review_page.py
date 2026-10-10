@@ -7,7 +7,7 @@ from typing import Any
 from PySide6.QtCore import QEvent, QPoint, QSize, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QDesktopServices, QIcon, QImage, QKeyEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QAbstractItemView, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
     QPushButton, QScrollArea, QSplitter, QTabWidget, QTextEdit, QToolButton,
     QVBoxLayout, QWidget,
 )
@@ -18,11 +18,14 @@ from .async_images import AsyncImages, ImageRequest
 from .i18n import code, image_type_label, reason_label, status_label
 from .thumbnail_cache import ThumbnailCache
 from .ui import page_header
+from ..delivery.helpers import section_prefix
 
 
 class ReviewPage(QWidget):
     decision_changed = Signal(str, str)
     retry_requested = Signal(str)
+    supplement_requested = Signal(str, str)
+    supplement_cancel_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -37,6 +40,8 @@ class ReviewPage(QWidget):
         self._current_pixmap = QPixmap()
         self._preview_key = ""
         self._retry_context: tuple[int, str] | None = None
+        self._supplement_busy = False
+        self._supplement_context: tuple[int, str] | None = None
         self.zoom_factor = 1.0
         self._export_requested_count = 0
         self.images = AsyncImages(self)
@@ -47,12 +52,13 @@ class ReviewPage(QWidget):
         self._thumbnail_timer.setSingleShot(True)
         self._thumbnail_timer.setInterval(35)
         self._thumbnail_timer.timeout.connect(self._load_visible)
-        self.news_list = QListWidget()
+        self.news_list = QTreeWidget()
+        self.news_list.setHeaderHidden(True)
         self.news_list.setObjectName("reviewNewsList")
         self.news_list.setMinimumWidth(170)
         self.news_list.setWordWrap(True)
         self.news_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.news_list.currentRowChanged.connect(lambda _: self.refresh())
+        self.news_list.currentItemChanged.connect(self._news_item_changed)
         self.tabs = QTabWidget()
         self.tabs.setObjectName("reviewTabs")
         for label in ("已选", "未候选／待复核", "已排除", "视频"):
@@ -109,6 +115,14 @@ class ReviewPage(QWidget):
         self.retry_url_edit.setObjectName("retryOfficialUrlEdit")
         self.retry_url_edit.setPlaceholderText("重试官网地址（选填）")
         self.official_url_edit = self.retry_url_edit
+        self.supplement_url_edit = QLineEdit()
+        self.supplement_url_edit.setObjectName("supplementUrlEdit")
+        self.supplement_url_edit.setPlaceholderText("补充图片网页地址（选填）")
+        self.supplement_button = QPushButton("抓取补充图片")
+        self.supplement_cancel_button = QPushButton("取消补充")
+        self.supplement_cancel_button.setEnabled(False)
+        self.supplement_button.clicked.connect(self.request_supplement)
+        self.supplement_cancel_button.clicked.connect(self.supplement_cancel_requested.emit)
         self.accept_button = QPushButton("已选  A")
         self.accept_button.setObjectName("primaryButton")
         self.accept_button.setProperty("primary", True)
@@ -192,6 +206,11 @@ class ReviewPage(QWidget):
         retry_row.addWidget(self.retry_url_edit, 1)
         retry_row.addWidget(self.retry_button)
         details.addLayout(retry_row)
+        supplement_row = QHBoxLayout()
+        supplement_row.addWidget(self.supplement_url_edit, 1)
+        supplement_row.addWidget(self.supplement_button)
+        details.addLayout(supplement_row)
+        details.addWidget(self.supplement_cancel_button)
         details.addWidget(self.operation_status)
         for widget in (left, grid, right):
             self.splitter.addWidget(widget)
@@ -218,6 +237,11 @@ class ReviewPage(QWidget):
 
     def set_session(self, session: ReviewSession | None) -> None:
         self.session = session
+        self._supplement_busy = False
+        self._supplement_context = None
+        self.supplement_url_edit.clear()
+        self.supplement_url_edit.setEnabled(True)
+        self.supplement_cancel_button.setEnabled(False)
         self._retry_context = None
         self.retry_url_edit.clear()
         self.images.invalidate()
@@ -234,22 +258,40 @@ class ReviewPage(QWidget):
         self.news_list.blockSignals(True)
         self.news_list.clear()
         self._news = {str(item["news_id"]): item for item in session.news_items} if session else {}
-        all_news = QListWidgetItem(f"全部新闻（{len(self._news)}）")
-        all_news.setData(Qt.ItemDataRole.UserRole, None)
-        self.news_list.addItem(all_news)
+        all_news = QTreeWidgetItem([f"全部新闻（{len(self._news)}）"])
+        all_news.setData(0, Qt.ItemDataRole.UserRole, None)
+        self.news_list.addTopLevelItem(all_news)
+        categories = {prefix: QTreeWidgetItem([label]) for prefix, label in (("x", "新作"), ("h", "汉化"), ("z", "周边"))}
+        for prefix, node in categories.items():
+            node.setData(0, Qt.ItemDataRole.UserRole, ("section", prefix))
+            all_news.addChild(node)
         for news_id, news in self._news.items():
             title = str(news.get("title") or news_id)
-            item = QListWidgetItem(f"{news.get('sequence', '')}  {title[:90]}" + ("…" if len(title) > 90 else ""))
-            item.setToolTip(title)
-            item.setData(Qt.ItemDataRole.UserRole, news_id)
-            self.news_list.addItem(item)
-        self.news_list.setCurrentRow(0)
+            item = QTreeWidgetItem([f"{news.get('sequence', '')}  {title[:90]}" + ("…" if len(title) > 90 else "")])
+            item.setToolTip(0, title)
+            item.setData(0, Qt.ItemDataRole.UserRole, ("news", news_id))
+            categories[section_prefix(str(news.get("section", "")))].addChild(item)
+        self.news_list.expandAll()
+        self.news_list.setCurrentItem(all_news)
         self.news_list.blockSignals(False)
         self.refresh()
 
     def _news_filter(self) -> str | None:
         item = self.news_list.currentItem()
-        return item.data(Qt.ItemDataRole.UserRole) if item else None
+        value = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        return value[1] if isinstance(value, tuple) and value[0] == "news" else None
+
+    def _selected_section(self) -> str | None:
+        item = self.news_list.currentItem()
+        value = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        return value[1] if isinstance(value, tuple) and value[0] == "section" else None
+
+    def _news_item_changed(self, *_args: Any) -> None:
+        context = (id(self.session), str(self._news_filter() or ""))
+        if context != self._supplement_context:
+            self.supplement_url_edit.clear()
+            self._supplement_context = context
+        self.refresh()
 
     def failed_candidates(self, news_id: str | None = None) -> list[Any]:
         return list(self.session.failed_images(news_id)) if self.session else []
@@ -258,6 +300,20 @@ class ReviewPage(QWidget):
         if self.session is None:
             return []
         index, news_id = self.tabs.currentIndex(), self._news_filter()
+        section = self._selected_section()
+        if section:
+            allowed = {key for key, news in self._news.items() if section_prefix(str(news.get("section", ""))) == section}
+            if index == 0:
+                candidates = self.session.accepted_images()
+                return [c for c in candidates if str(c.news_id) in allowed]
+            if index == 2:
+                candidates = self.session.rejected_images()
+                return [c for c in candidates if str(c.news_id) in allowed]
+            if index == 3:
+                candidates = [*self.session.accepted_videos(), *self.session.pending_videos()]
+                return [c for c in candidates if str(c.news_id) in allowed]
+            candidates = self.session.pending_images()
+            return [c for c in candidates if str(c.news_id) in allowed]
         if index == 0:
             return list(self.session.accepted_images(news_id))
         if index == 2:
@@ -309,7 +365,8 @@ class ReviewPage(QWidget):
         parts.extend((binding_label, resolution_label))
         return " · ".join(parts)
 
-    def refresh(self, preserve_scroll: bool = False) -> None:
+    def refresh(self, preserve_scroll: bool = False, preserve_position: bool = False) -> None:
+        preserve_scroll = preserve_scroll or preserve_position
         self._refresh_generation += 1
         refresh_generation = self._refresh_generation
         session = self.session
@@ -373,7 +430,8 @@ class ReviewPage(QWidget):
         self.raw_details.clear()
         for button in (self.source_button, self.official_button, self.original_button, self.play_button, self.retry_button, self.accept_button, self.reject_button, self.pending_button, self.zoom_in_button, self.zoom_out_button, self.zoom_reset_button):
             button.setEnabled(False)
-        self.retry_button.setEnabled(bool(self.session and self._news_filter()) and self.exporter.session is not self.session)
+        self.supplement_button.setEnabled(bool(self.session and self._news_filter()) and not self._supplement_busy and self.exporter.session is not self.session)
+        self.retry_button.setEnabled(bool(self.session and self._news_filter()) and not self._supplement_busy and self.exporter.session is not self.session)
 
     def _select_row(self, row: int) -> None:
         candidate = self._items[row] if 0 <= row < len(self._items) else None
@@ -419,6 +477,8 @@ class ReviewPage(QWidget):
         self.original_button.setEnabled(bool(getattr(candidate, "image_url", None)))
         self.play_button.setEnabled(bool(path and is_video))
         self.retry_button.setEnabled(bool(candidate.news_id) and self.exporter.session is not self.session)
+        self.supplement_button.setEnabled(bool(self._news_filter()) and not self._supplement_busy and self.exporter.session is not self.session)
+        self.retry_button.setEnabled(bool(candidate.news_id) and not self._supplement_busy and self.exporter.session is not self.session)
         for button in (self.accept_button, self.reject_button, self.pending_button):
             button.setEnabled(self.exporter.session is not self.session)
         for button in (self.zoom_in_button, self.zoom_out_button, self.zoom_reset_button):
@@ -578,6 +638,8 @@ class ReviewPage(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def retry_selected(self) -> None:
+        if self._supplement_busy:
+            return
         if self.exporter.session is self.session and self.session is not None:
             self.operation_status.setText("正在导出，请等待完成后重试")
             return
@@ -617,17 +679,69 @@ class ReviewPage(QWidget):
     def retry_url(self) -> str:
         return self.retry_url_edit.text().strip()
 
+    def request_supplement(self) -> None:
+        if self._supplement_busy or not self.session:
+            return
+        news_id = self._news_filter()
+        if news_id is None:
+            return
+        url = QUrl(self.supplement_url_edit.text().strip())
+        if url.scheme().casefold() not in {"http", "https"} or not url.host():
+            self.operation_status.setText("请输入有效的 HTTP 或 HTTPS 网页地址，再抓取补充图片")
+            self.supplement_url_edit.setFocus()
+            return
+        self.operation_status.setText("正在抓取补充图片…")
+        self.set_supplement_busy(True)
+        self.supplement_requested.emit(str(news_id), url.toString())
+
+    def set_supplement_busy(self, busy: bool) -> None:
+        self._supplement_busy = bool(busy)
+        self.supplement_url_edit.setEnabled(not self._supplement_busy)
+        candidate = self._selected()
+        can_act = bool(self.session and self._news_filter() and not self._supplement_busy and self.exporter.session is not self.session)
+        self.supplement_button.setEnabled(can_act)
+        self.retry_button.setEnabled(bool(self.session and (candidate or self._news_filter())) and not self._supplement_busy and self.exporter.session is not self.session)
+        self.export_button.setEnabled(bool(self.session and not self._supplement_busy and self.exporter.session is None))
+        self.supplement_cancel_button.setEnabled(self._supplement_busy)
+
+    def show_supplement_result(self, result: Any) -> None:
+        self.set_supplement_busy(False)
+        if isinstance(result, dict):
+            added = int(result.get("added_count", 0) or 0)
+            success = int(result.get("success_count", 0) or 0)
+            failures = result.get("failures") or []
+            failed = max(int(result.get("failed_count", 0) or 0), len(failures))
+            status = {"completed": "已完成", "partial": "部分完成", "cancelled": "已取消", "failed": "失败"}.get(
+                str(result.get("status") or "").casefold(), str(result.get("status") or "")
+            )
+            self.operation_status.setText(f"补充图片{status or '完成'}：新增 {added} 项，成功 {success} 项，失败 {failed} 项")
+            self.refresh(preserve_position=True)
+            failures = result.get("failures") or []
+            if failures:
+                self.raw_details.setPlainText(json.dumps(failures, ensure_ascii=False, indent=2, default=str))
+                self.raw_toggle.setChecked(True)
+        else:
+            self.operation_status.setText(f"补充图片抓取完成：{result}")
+            self.refresh(preserve_position=True)
+
+    def show_supplement_failure(self, error: Any) -> None:
+        self.set_supplement_busy(False)
+        self.operation_status.setText("补充图片抓取失败，请展开技术详情查看原因")
+        self.raw_details.setPlainText(str(error))
+        self.raw_toggle.setChecked(True)
+
     def export_final(self) -> None:
-        if self.session is None or not self.exporter.start(self.session):
+        if self._supplement_busy or self.session is None or not self.exporter.start(self.session):
             return
         self._export_requested_count = len(self.session.accepted_images()) + len(self.session.accepted_videos())
         self.export_button.setEnabled(False)
         self.export_status.setText("正在导出已选媒体；未候选项目将保留为备选…")
         for button in (self.accept_button, self.reject_button, self.pending_button, self.retry_button):
             button.setEnabled(False)
+        self.supplement_button.setEnabled(False)
 
     def _export_done(self, session: ReviewSession, manifest: dict | None, error: str) -> None:
-        self.export_button.setEnabled(self.session is not None)
+        self.export_button.setEnabled(self.session is not None and not self._supplement_busy)
         if session is not self.session:
             return
         if manifest is not None:
@@ -648,6 +762,7 @@ class ReviewPage(QWidget):
         if self._selected():
             for button in (self.accept_button, self.reject_button, self.pending_button, self.retry_button):
                 button.setEnabled(True)
+        self.set_supplement_busy(self._supplement_busy)
 
     def _toggle_raw(self, checked: bool) -> None:
         self.raw_details.setVisible(checked)

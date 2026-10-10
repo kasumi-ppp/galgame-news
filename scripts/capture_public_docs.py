@@ -127,7 +127,7 @@ def main() -> None:
                                                     total_news=2, message=message))
             review = controller.review_page
             review.tabs.setCurrentIndex(0)
-            review.news_list.setCurrentRow(0)
+            review.news_list.setCurrentItem(review.news_list.topLevelItem(0))
             review.media_list.setCurrentRow(0)
             review.retry_url_edit.setText("https://example.test/news/demo")
 
@@ -140,7 +140,7 @@ def main() -> None:
                 window.navigation.setCurrentRow(index)
                 if name == "review.png":
                     review.tabs.setCurrentIndex(0)
-                    review.news_list.setCurrentRow(0)
+                    review.news_list.setCurrentItem(review.news_list.topLevelItem(0))
                     review.media_list.setCurrentRow(0)
                 pump(app, .6 if name == "review.png" else .25)
                 window.grab().save(str(destination / name))

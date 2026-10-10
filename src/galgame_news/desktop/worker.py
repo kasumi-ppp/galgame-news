@@ -73,4 +73,26 @@ class PipelineWorker(QObject):
 
 TaskWorker = PipelineWorker
 
+
+class SupplementWorker(QObject):
+    """Image-only review addition; the GUI coordinator owns persistence."""
+
+    event = Signal(object)
+    finished = Signal(object)
+    failed = Signal(object)
+
+    def __init__(self, runner, kwargs, token):
+        super().__init__()
+        self.runner, self.kwargs, self.token = runner, kwargs, token
+
+    @Slot()
+    def run(self):
+        try:
+            value = self.runner.supplement_news(**self.kwargs, event_sink=self.event.emit,
+                                                cancellation_token=self.token)
+        except BaseException as exc:
+            self.failed.emit(exc)
+        else:
+            self.finished.emit(value)
+
 __all__ = ["PipelineWorker", "TaskWorker"]

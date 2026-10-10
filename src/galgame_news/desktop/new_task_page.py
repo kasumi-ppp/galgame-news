@@ -60,7 +60,7 @@ class NewTaskPage(QWidget):
         self.section_checkboxes = {
             "x": QCheckBox("新作"),
             "h": QCheckBox("汉化"),
-            "z": QCheckBox("周报"),
+            "z": QCheckBox("周边"),
         }
         self._busy = False
         section_row = QHBoxLayout()
